@@ -1,0 +1,13 @@
+{
+    "reportInvalidTypeForm": false,
+    "reportAttributeAccessIssue": false,
+    "reportPossiblyUnboundVariable": false,
+    "reportOptionalMemberAccess": false,
+    "reportGeneralTypeIssues": false,
+    "reportAssignmentType": false,
+    "reportArgumentType": false,
+    "reportOperatorIssue": false,
+    "reportUnknownMemberType": false,
+    "reportUnknownArgumentType": false,
+    "reportUnknownVariableType": false
+}
