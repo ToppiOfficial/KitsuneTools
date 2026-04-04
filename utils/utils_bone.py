@@ -11,9 +11,12 @@ bonename_direction_map = {
 
 # Only when KitsuneSrcTool is installed
 def get_bone_exportname(bone: Bone | PoseBone | None, for_write=False) -> str:
-    if is_addon_enabled("io_scene_valvesource"):
-        from ...io_scene_valvesource.utils import get_bone_exportname as _get_bone_exportname # pyright: ignore
-        return _get_bone_exportname(bone, for_write=for_write)
+    if is_addon_enabled("kitsune_source_tools"):
+        try:
+            from ...kitsune_source_tools.utils import get_bone_exportname as _get_bone_exportname # pyright: ignore
+            return _get_bone_exportname(bone, for_write=for_write)
+        except (ModuleNotFoundError, ImportError):
+            pass
     
     if bone is None:
         return "None"
