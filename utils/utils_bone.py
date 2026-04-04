@@ -1,13 +1,18 @@
-import bpy, mathutils
+import bpy, mathutils, re
 from bpy.types import Bone, PoseBone, Object
 from .utils_contextmanagers import is_addon_enabled, selfreport, report, preserve_context_mode, preserve_armature_state
 from .utils_object import is_armature, get_armature
 from .utils_armature import get_armature_meshes
 
+bonename_direction_map = {
+    '.L': '.R', '_L': '_R', 'Left': 'Right', '_Left': '_Right', '.Left': '.Right', 'L_': 'R_', 'L.': 'R.', 'L ': 'R ',
+    '.R': '.L', '_R': '_L', 'Right': 'Left', '_Right': '_Left', '.Right': '.Left', 'R_': 'L_', 'R.': 'L.', 'R ': 'L '
+}
+
 # Only when KitsuneSrcTool is installed
 def get_bone_exportname(bone: Bone | PoseBone | None, for_write=False) -> str:
     if is_addon_enabled("io_scene_valvesource"):
-        from ...io_scene_valvesource.kitsunetools.boneutils import get_bone_exportname as _get_bone_exportname
+        from ...io_scene_valvesource.utils import get_bone_exportname as _get_bone_exportname # pyright: ignore
         return _get_bone_exportname(bone, for_write=for_write)
     
     if bone is None:

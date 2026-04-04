@@ -1,12 +1,7 @@
 import bpy
 from bpy.types import Object, Bone, PoseBone, ArmatureBones, CurveMapping
 from .utils_object import get_armature, get_armature_meshes
-
-
-direction_naming_map = {
-    '.L': '.R', '_L': '_R', 'Left': 'Right', '_Left': '_Right', '.Left': '.Right', 'L_': 'R_', 'L.': 'R.', 'L ': 'R ',
-    '.R': '.L', '_R': '_L', 'Right': 'Left', '_Right': '_Left', '.Right': '.Left', 'R_': 'L_', 'R.': 'L.', 'R ': 'L '
-}
+from .utils_bone import bonename_direction_map
 
 
 def get_used_vertexgroups(mesh: Object, vertex_groups: set[int] | None = None,
@@ -32,7 +27,7 @@ def get_used_vertexgroups(mesh: Object, vertex_groups: set[int] | None = None,
                 continue
             vg_name = vgroups[idx].name
             
-            for left_suffix, right_suffix in direction_naming_map.items():
+            for left_suffix, right_suffix in bonename_direction_map.items():
                 if left_suffix in vg_name:
                     opposite_name = vg_name.replace(left_suffix, right_suffix)
                     opposite_vg = vgroups.get(opposite_name)

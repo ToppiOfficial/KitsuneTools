@@ -4,7 +4,7 @@ from ..utils.utils_panels import (
     get_label_with_bone_name,
     get_label_with_vertex_group_name
 )
-from ..utils.utils_object import has_selected_bones, get_armature, is_armature, is_mesh
+from ..utils.utils_object import has_selected_bones, is_armature, is_mesh
 from ..op.ops_armature import (
     ARMATURE_OT_ApplyPoseAsRestPose,
     ARMATURE_OT_ApplyPoseAsShapekey, 
@@ -61,6 +61,8 @@ class TOOLS_PT_KitsuneTool_Panel(Panel):
 
 
 class TOOLS_PT_KitsuneTool_Armature(TOOLS_PT_KitsuneTool_Panel):
+    bl_options = set()
+
     def draw_header(self, context):
         self.layout.label(text=get_label_with_object_name('Armature', context.active_object, 'ARMATURE'))
 
@@ -97,6 +99,8 @@ class TOOLS_PT_KitsuneTool_Armature(TOOLS_PT_KitsuneTool_Panel):
 
 
 class TOOLS_PT_KitsuneTool_Bone(TOOLS_PT_KitsuneTool_Panel):
+    bl_options = set()
+
     def draw_header(self, context):
         self.layout.label(text=get_label_with_bone_name('Bone', context.active_bone))
 
