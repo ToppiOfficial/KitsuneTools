@@ -9,6 +9,8 @@ from ..utils.utils_bone import remove_bone
 
 
 class _apply_pose:
+    selected_only : BoolProperty(name='Selected Bones Only', default=False)
+
     def execute(self, context : Context) -> set:
         as_shapekey = hasattr(self, 'as_shapekey')
         
@@ -18,16 +20,16 @@ class _apply_pose:
             
             for armature in armatures:
                 try:
+                    if self.selected_only:
+                        selected_bones = get_selected_bones(armature=armature, bone_type='POSEBONE')
+                        
+                        for posebone in armature.pose.bones:
+                            if posebone.name in {pb.name for pb in selected_bones}: continue
+                            posebone.matrix_basis.identity()
+
                     if as_shapekey:
                         apply_current_pose_shapekey(armature=armature, shapekey_name=self.shapekey_name.strip())
                     else:
-                        if self.selected_only:
-                            selected_bones = get_selected_bones(armature=armature, bone_type='POSEBONE')
-                            
-                            for posebone in armature.pose.bones:
-                                if posebone.name in {pb.name for pb in selected_bones}: continue
-                                posebone.matrix_basis.identity()
-                        
                         apply_current_pose_as_restpose(armature=armature)
 
                     success_count += 1
@@ -54,8 +56,6 @@ class ARMATURE_OT_ApplyPoseAsRestPose(_apply_pose, Operator):
     bl_label = "Apply Pose As Restpose"
     bl_options = {'REGISTER', 'UNDO'}
     
-    selected_only : BoolProperty(name='Selected Only', default=False)
-    
     @classmethod
     def poll(cls, context):
         active_object = context.active_object
@@ -78,10 +78,11 @@ class ARMATURE_OT_ApplyPoseAsShapekey(_apply_pose, Operator):
         return bool(is_armature(context.active_object) and context.mode in {'POSE', 'OBJECT'})
     
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=150)
+        return context.window_manager.invoke_props_dialog(self, width=200)
         
     def draw(self, context):
         layout = self.layout
+        layout.prop(self, 'selected_only')
         layout.prop(self, 'shapekey_name')
 
 
@@ -106,8 +107,11 @@ class ARMATURE_OT_MergeArmatures(Operator):
     def draw(self, context):
         layout = self.layout
         layout.prop(self, 'match_posture')
+
+        if not self.match_posture:
+            layout.prop(self, 'apply_pose')
+
         layout.prop(self, 'clean_bones')
-        layout.prop(self, 'apply_pose')
         layout.prop(self, 'use_anchor_bone')
 
         if self.use_anchor_bone:
@@ -117,6 +121,7 @@ class ARMATURE_OT_MergeArmatures(Operator):
     def execute(self, context : Context) -> set:
         active_object = context.active_object
         original_active = context.view_layer.objects.active
+        self.apply_pose = self.match_posture if self.match_posture else self.apply_pose
         
         if active_object is None: return {'CANCELLED'}
         

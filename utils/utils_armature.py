@@ -4,6 +4,7 @@ from bpy.types import Object, Bone, PoseBone, EditBone
 from .utils_object import get_armature_meshes, is_armature
 from .utils_contextmanagers import selfreport, preserve_armature_state, preserve_context_mode, unhide_all_objects, report
 from .utils_object import op_override, apply_armature_to_mesh_without_shape_keys, apply_armature_to_mesh_with_shapekeys, reevaluate_bone_parented_empty_matrix
+from .utils_vertexgroup import get_used_vertexgroups
 
 
 def sort_bones_by_hierarchy(bones: list[Bone]) -> list[Bone]:
@@ -146,80 +147,79 @@ def get_visible_bones(armature: bpy.types.Object | None, bone_type: str = 'BONE'
 
 
 @selfreport
-def apply_current_pose_as_restpose(armature: Object | None):
-    if armature is None: return False
+def apply_current_pose_as_restpose(armature: Object | None, only_selected : bool = False):
+    if armature is None: return
     
-    with preserve_armature_state(armature, reset_pose=False):
+    with preserve_armature_state(armature, reset_pose=False), unhide_all_objects():
         try:
-            with unhide_all_objects():
-                mesh_objs = get_armature_meshes(armature)
-                selected_objects = bpy.context.selected_objects
-                active_object = bpy.context.view_layer.objects.active
-                
-                objects_to_transform = set()
-                objects_to_transform.add(armature)
-                
-                for ob in armature.children:
-                    if ob.type not in {"EMPTY", "CURVE"}:
-                        objects_to_transform.add(ob)
-                
-                for mesh_obj in mesh_objs:
-                    objects_to_transform.add(mesh_obj)
-                
-                empty_snapshot = {}
-                for obj in armature.children:
-                    if obj.type == 'EMPTY' and obj.parent_type == 'BONE':
-                        empty_snapshot[obj.name] = {
-                            'location': obj.matrix_world.to_translation().copy(),
-                            'rotation_matrix': obj.matrix_world.to_3x3().copy(),
-                            'scale': obj.matrix_world.to_scale().copy()
-                        }
-                
-                bpy.ops.object.select_all(action='DESELECT')
-                for ob in objects_to_transform:
-                    try:
-                        ob.select_set(True)
-                    except RuntimeError:
-                        continue
+            mesh_objs = get_armature_meshes(armature)
+            selected_objects = bpy.context.selected_objects
+            active_object = bpy.context.view_layer.objects.active
+            
+            objects_to_transform = set()
+            objects_to_transform.add(armature)
+            
+            for ob in armature.children:
+                if ob.type not in {"EMPTY", "CURVE"}:
+                    objects_to_transform.add(ob)
+            
+            for mesh_obj in mesh_objs:
+                objects_to_transform.add(mesh_obj)
+            
+            empty_snapshot = {}
+            for obj in armature.children:
+                if obj.type == 'EMPTY' and obj.parent_type == 'BONE':
+                    empty_snapshot[obj.name] = {
+                        'location': obj.matrix_world.to_translation().copy(),
+                        'rotation_matrix': obj.matrix_world.to_3x3().copy(),
+                        'scale': obj.matrix_world.to_scale().copy()
+                    }
+            
+            bpy.ops.object.select_all(action='DESELECT')
+            for ob in objects_to_transform:
+                try:
+                    ob.select_set(True)
+                except RuntimeError:
+                    continue
 
-                bpy.ops.object.transform_apply(location=True, scale=True, rotation=True)
-                bpy.ops.object.mode_set(mode='POSE')
+            bpy.ops.object.transform_apply(location=True, scale=True, rotation=True)
+            bpy.ops.object.mode_set(mode='POSE')
 
-                for mesh_obj in mesh_objs:
-                    me = mesh_obj.data
-                    if not me:
-                        continue
+            for mesh_obj in mesh_objs:
+                me = mesh_obj.data
+                if not me:
+                    continue
 
-                    if me.shape_keys and me.shape_keys.key_blocks:
-                        key_blocks = me.shape_keys.key_blocks
-                        if len(key_blocks) == 1:
-                            original_basis_name = key_blocks[0].name
-                            mesh_obj.shape_key_remove(key_blocks[0])
-                            apply_armature_to_mesh_without_shape_keys(armature, mesh_obj)
-                            mesh_obj.shape_key_add(name=original_basis_name)
-                        else:
-                            apply_armature_to_mesh_with_shapekeys(armature, mesh_obj, bpy.context)
-                    else:
+                if me.shape_keys and me.shape_keys.key_blocks:
+                    key_blocks = me.shape_keys.key_blocks
+                    if len(key_blocks) == 1:
+                        original_basis_name = key_blocks[0].name
+                        mesh_obj.shape_key_remove(key_blocks[0])
                         apply_armature_to_mesh_without_shape_keys(armature, mesh_obj)
+                        mesh_obj.shape_key_add(name=original_basis_name)
+                    else:
+                        apply_armature_to_mesh_with_shapekeys(armature, mesh_obj, bpy.context)
+                else:
+                    apply_armature_to_mesh_without_shape_keys(armature, mesh_obj)
 
-                op_override(bpy.ops.pose.armature_apply, {'active_object': armature})
-                bpy.ops.object.mode_set(mode='OBJECT')
+            op_override(bpy.ops.pose.armature_apply, {'active_object': armature})
+            bpy.ops.object.mode_set(mode='OBJECT')
 
-                fixed_count = reevaluate_bone_parented_empty_matrix(
-                    armature=armature,
-                    preserve_rotation=True,
-                    pre_transform_snapshot=empty_snapshot
-                )
-                if fixed_count > 0:
-                    report('INFO', f"Fixed {fixed_count} empty object(s)")
+            fixed_count = reevaluate_bone_parented_empty_matrix(
+                armature=armature,
+                preserve_rotation=True,
+                pre_transform_snapshot=empty_snapshot
+            )
+            if fixed_count > 0:
+                report('INFO', f"Fixed {fixed_count} empty object(s)")
 
-                bpy.ops.object.select_all(action='DESELECT')
-                for obj in selected_objects:
-                    try:
-                        obj.select_set(True)
-                    except RuntimeError:
-                        continue
-                bpy.context.view_layer.objects.active = active_object
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in selected_objects:
+                try:
+                    obj.select_set(True)
+                except RuntimeError:
+                    continue
+            bpy.context.view_layer.objects.active = active_object
 
         except Exception as e:
             report('ERROR', 'Failed to apply armature pose: {}'.format(str(e)))
@@ -231,28 +231,24 @@ def apply_current_pose_as_restpose(armature: Object | None):
 
 @selfreport
 def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = ""):
-    from .utils_object import get_used_vertexgroups
-
     if not is_armature(armature): return
-    
-    meshes = get_armature_meshes(armature)
-    if not meshes: return
-    
-    success_count = 0
-    posebones = set()
 
-    for pbone in armature.pose.bones:
-        # Subtracting identity from the matrix; a rest bone results in a zero matrix
-        diff_matrix = pbone.matrix_basis - Matrix.Identity(4)
+    with preserve_armature_state(armature, reset_pose=False) , unhide_all_objects():
+        meshes = get_armature_meshes(armature)
+        if not meshes: return
         
-        # Sum the absolute values of all 16 slots in the 4x4 matrix
-        total_diff = sum(abs(val) for row in diff_matrix for val in row)
+        success_count = 0
+        posebones = set()
 
-        if total_diff > 1e-4:
-            posebones.add(pbone.name)
-    
-    with preserve_context_mode(armature, 'OBJECT'), unhide_all_objects():
+        for pbone in armature.pose.bones:
+            diff_matrix = pbone.matrix_basis - Matrix.Identity(4)
+            total_diff = sum(abs(val) for row in diff_matrix for val in row)
+            if total_diff > 1e-4:
+                posebones.add(pbone.name)
+
+        bpy.context.view_layer.update() 
         bpy.ops.object.select_all(action='DESELECT')
+
         for mesh in meshes:
             arm_mod = next((mod for mod in mesh.modifiers if mod.type == 'ARMATURE' and mod.object == armature), None)
             
@@ -380,7 +376,7 @@ def merge_armatures(source_arm: bpy.types.Object, target_arm: bpy.types.Object, 
 
     print(f"Merging '{target_arm.name}' into '{source_arm.name}'...")
 
-    with preserve_armature_state(source_arm, target_arm, reset_pose=True), unhide_all_objects():
+    with preserve_armature_state(source_arm, reset_pose=True), preserve_armature_state(target_arm, reset_pose=False), unhide_all_objects():
         try:
             target_meshes = get_armature_meshes(target_arm)
             print(f"  Found {len(target_meshes)} mesh(es) attached to target armature")
@@ -397,7 +393,7 @@ def merge_armatures(source_arm: bpy.types.Object, target_arm: bpy.types.Object, 
 
             if apply_pose:
                 apply_current_pose_as_restpose(target_arm)
-                print("  Applied pose as rest pose")
+                print(f"  Applied pose for '{target_arm.name}' as rest pose")
 
             source_bone_names = {b.name for b in source_arm.data.bones}
             source_export_map = {get_bone_exportname(b): b.name for b in source_arm.data.bones if get_bone_exportname(b)}
