@@ -1,4 +1,4 @@
-import bpy, bmesh, mathutils
+import bpy, bmesh, mathutils, collections, math
 from bpy.types import Operator, Context, Object
 from bpy.props import StringProperty, EnumProperty, BoolProperty, IntProperty, FloatProperty
 from bpy.props import EnumProperty, BoolProperty, FloatProperty, IntProperty
@@ -579,3 +579,270 @@ class MESH_OT_CleanDuplicateMaterials(Operator):
 
         self.report({'INFO'}, f"Remapped {materials_remapped} duplicate material(s)")
         return {'FINISHED'}
+    
+
+class MESH_OT_convex_hull_selection(bpy.types.Operator):
+    bl_idname = "kitsunetools.convex_hull_selection"
+    bl_label = "Convex Hull from Selection"
+    bl_description = "Separate selected faces into a new object and apply convex hull"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    keep_original: bpy.props.BoolProperty(
+        name="Keep Original",
+        description="Duplicate the selection before separating, preserving the original mesh",
+        default=True
+    )
+    delete_unused_verts: bpy.props.BoolProperty(
+        name="Delete Unused",
+        description="Delete vertices not used by the convex hull",
+        default=True
+    )
+    use_existing_faces: bpy.props.BoolProperty(
+        name="Use Existing Faces",
+        description="Reuse existing faces within the hull",
+        default=True
+    )
+    make_holes: bpy.props.BoolProperty(
+        name="Make Holes",
+        description="Leave holes in the original mesh where faces were removed",
+        default=False
+    )
+    join_triangles: bpy.props.BoolProperty(
+        name="Join Triangles",
+        description="Merge adjacent triangles into quads",
+        default=True
+    )
+    face_threshold: bpy.props.FloatProperty(
+        name="Max Face Angle",
+        description="Face angle threshold for joining triangles",
+        default=0.698132,
+        min=0.0,
+        max=3.14159,
+        subtype='ANGLE'
+    )
+    shape_threshold: bpy.props.FloatProperty(
+        name="Max Shape Angle",
+        description="Shape angle threshold for joining triangles",
+        default=0.698132,
+        min=0.0,
+        max=3.14159,
+        subtype='ANGLE'
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.active_object is not None
+            and context.active_object.type == 'MESH'
+            and context.mode == 'EDIT_MESH'
+        )
+
+    def execute(self, context) -> set:
+        original_obj = context.active_object
+
+        with preserve_context_mode(original_obj, 'EDIT'):
+            if self.keep_original:
+                bpy.ops.mesh.duplicate()
+
+            bpy.ops.mesh.separate(type='SELECTED')
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+            new_obj = next(
+                obj for obj in context.selected_objects if obj != original_obj
+            )
+
+            bpy.ops.object.select_all(action='DESELECT')
+            new_obj.select_set(True)
+            context.view_layer.objects.active = new_obj
+
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.convex_hull(
+                delete_unused=self.delete_unused_verts,
+                use_existing_faces=self.use_existing_faces,
+                make_holes=self.make_holes,
+                join_triangles=self.join_triangles,
+                face_threshold=self.face_threshold,
+                shape_threshold=self.shape_threshold
+            )
+
+        self.report({'INFO'}, f"Convex hull created: {new_obj.name}")
+        return {'FINISHED'}
+
+
+class MESH_OT_replace_verts_with_spheres(bpy.types.Operator):
+    bl_idname = "kitsunetools.replace_verts_with_spheres"
+    bl_label = "Replace Vertices with Spheres"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    sphere_radius: bpy.props.FloatProperty(name="Radius", default=0.2, min=0.001, max=10.0)
+    segments: bpy.props.IntProperty(name="Segments", default=6, min=3, max=64)
+    rings: bpy.props.IntProperty(name="Rings", default=6, min=3, max=64)
+
+    weight_mode: bpy.props.EnumProperty(
+        name="Weight Mode",
+        items=[
+            ('HIGHEST', "Highest", "Assign the vertex group with the highest total weight"),
+            ('AVERAGE', "Average", "Distribute averaged weights across all vertex groups"),
+        ],
+        default='AVERAGE'
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context) -> set:
+        obj = context.active_object
+
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Please select a mesh object")
+            return {'CANCELLED'}
+
+        with preserve_context_mode(obj, 'EDIT'):
+            bm = bmesh.from_edit_mesh(obj.data)
+
+            uv_layer = bm.loops.layers.uv.active
+            deform_layer = bm.verts.layers.deform.active
+
+            selected_verts = [v for v in bm.verts if v.select]
+
+            if not selected_verts:
+                self.report({'WARNING'}, "No vertices selected")
+                return {'CANCELLED'}
+
+            overlapping_groups = collections.defaultdict(list)
+            for v in selected_verts:
+                coord_key = (round(v.co.x, 5), round(v.co.y, 5), round(v.co.z, 5))
+                overlapping_groups[coord_key].append(v)
+
+            groups_to_process = [
+                (verts, mathutils.Vector(coord)) for coord, verts in overlapping_groups.items()
+            ]
+
+            # Collect dominant vertex group per position before removing verts
+            group_data = {}
+            if deform_layer:
+                for verts, center in groups_to_process:
+                    group_weight_totals = collections.defaultdict(float)
+                    for v in verts:
+                        for group_index, weight in v[deform_layer].items():
+                            group_weight_totals[group_index] += weight
+                    if group_weight_totals:
+                        coord_key = (round(center.x, 5), round(center.y, 5), round(center.z, 5))
+                        if self.weight_mode == 'HIGHEST':
+                            group_data[coord_key] = max(group_weight_totals, key=group_weight_totals.get)  # pyright: ignore
+                        else:
+                            total = sum(group_weight_totals.values())
+                            group_data[coord_key] = {idx: w / total for idx, w in group_weight_totals.items()}
+
+            verts_to_remove = {v for verts, _ in groups_to_process for v in verts}
+
+            sphere_vert_map = []  # list of (sphere_verts, center)
+            for verts, center in groups_to_process:
+                sphere_verts = self._create_sphere(bm, center, uv_layer)
+                sphere_vert_map.append((sphere_verts, center))
+
+            for v in verts_to_remove:
+                if v.is_valid:
+                    for face in list(v.link_faces):
+                        if face.is_valid:
+                            bm.faces.remove(face)
+
+            for v in verts_to_remove:
+                if v.is_valid:
+                    bm.verts.remove(v)
+
+            bm.verts.ensure_lookup_table()
+
+            if deform_layer and group_data:
+                for sphere_verts, center in sphere_vert_map:
+                    coord_key = (round(center.x, 5), round(center.y, 5), round(center.z, 5))
+                    data = group_data.get(coord_key)
+                    if data is None:
+                        continue
+                    for v in sphere_verts:
+                        if not v.is_valid:
+                            continue
+                        if self.weight_mode == 'HIGHEST':
+                            v[deform_layer][data] = 1.0  # pyright: ignore
+                        else:
+                            for group_index, weight in data.items():
+                                v[deform_layer][group_index] = weight  # pyright: ignore
+
+            bm.normal_update()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            bm.verts.index_update()
+            bm.edges.index_update()
+            bm.faces.index_update()
+
+            bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        self.report({'INFO'}, f"Created {len(groups_to_process)} UV spheres")
+        return {'FINISHED'}
+
+    def _create_sphere(self, bm, center, uv_layer):
+        segments = self.segments
+        rings = self.rings
+        radius = self.sphere_radius
+
+        verts_grid = []
+        all_verts = []
+        for i in range(rings + 1):
+            lat = math.pi * i / rings - math.pi / 2
+            ring_verts = []
+            for j in range(segments):
+                lon = 2 * math.pi * j / segments
+                pos = center + mathutils.Vector((
+                    radius * math.cos(lat) * math.cos(lon),
+                    radius * math.cos(lat) * math.sin(lon),
+                    radius * math.sin(lat)
+                ))
+                v = bm.verts.new(pos)
+                ring_verts.append(v)
+                all_verts.append(v)
+            verts_grid.append(ring_verts)
+
+        for i in range(rings):
+            for j in range(segments):
+                j_next = (j + 1) % segments
+
+                if i == 0:
+                    face_verts = [verts_grid[i][j], verts_grid[i + 1][j], verts_grid[i + 1][j_next]]
+                elif i == rings - 1:
+                    face_verts = [verts_grid[i][j], verts_grid[i][j_next], verts_grid[i + 1][j]]
+                else:
+                    face_verts = [verts_grid[i][j], verts_grid[i + 1][j], verts_grid[i + 1][j_next], verts_grid[i][j_next]]
+
+                try:
+                    face = bm.faces.new(face_verts)
+                except ValueError:
+                    continue
+
+                if not uv_layer:
+                    continue
+
+                angle1 = 2 * math.pi * j / segments
+                angle2 = 2 * math.pi * (j + 1) / segments
+                lat_top = math.pi * i / rings - math.pi / 2
+                lat_bot = math.pi * (i + 1) / rings - math.pi / 2
+                r_top = math.cos(lat_top) * 0.5
+                r_bot = math.cos(lat_bot) * 0.5
+
+                uvs = [
+                    (0.5 + r_top * math.cos(angle1), 0.5 + r_top * math.sin(angle1)),
+                    (0.5 + r_bot * math.cos(angle1), 0.5 + r_bot * math.sin(angle1)),
+                    (0.5 + r_bot * math.cos(angle2), 0.5 + r_bot * math.sin(angle2)),
+                ]
+                if len(face_verts) == 4:
+                    uvs.append((0.5 + r_top * math.cos(angle2), 0.5 + r_top * math.sin(angle2)))
+
+                for loop, uv in zip(face.loops, uvs):
+                    loop[uv_layer].uv = mathutils.Vector(uv)
+
+        return all_verts

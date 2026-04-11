@@ -103,8 +103,8 @@ def get_selected_bones(armature : Object | None, bone_type : str = 'BONE', sort_
     else: return [armature.data.bones.get(b) for b in selectedBones]
 
 
-def get_visible_bones(armature: bpy.types.Object | None, bone_type: str = 'BONE', sort_type: str | None = 'TO_LAST',
-                      exclude_active: bool = False) -> list[bpy.types.Bone | bpy.types.PoseBone | bpy.types.EditBone | None]:
+def get_visible_bones(armature: Object | None, bone_type: str = 'BONE', sort_type: str | None = 'TO_LAST',
+                      exclude_active: bool = False) -> list[Bone | PoseBone | EditBone | None]:
     
     if not is_armature(armature): return []
 
@@ -150,7 +150,7 @@ def get_visible_bones(armature: bpy.types.Object | None, bone_type: str = 'BONE'
 def apply_current_pose_as_restpose(armature: Object | None, only_selected : bool = False):
     if armature is None: return
     
-    with preserve_armature_state(armature, reset_pose=False), unhide_all_objects():
+    with unhide_all_objects(), preserve_armature_state(armature, reset_pose=False):
         try:
             mesh_objs = get_armature_meshes(armature)
             selected_objects = bpy.context.selected_objects
@@ -233,7 +233,7 @@ def apply_current_pose_as_restpose(armature: Object | None, only_selected : bool
 def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = ""):
     if not is_armature(armature): return
 
-    with preserve_armature_state(armature, reset_pose=False) , unhide_all_objects():
+    with unhide_all_objects(), preserve_armature_state(armature, reset_pose=False):
         meshes = get_armature_meshes(armature)
         if not meshes: return
         
@@ -368,16 +368,21 @@ def copy_armature_visual_pose(base_armature: Object, target_armature: Object, co
             bpy.context.view_layer.update()
 
 
-def merge_armatures(source_arm: bpy.types.Object, target_arm: bpy.types.Object, match_posture=True, anchor_bone: str = "", apply_pose : bool = True):
+def merge_armatures( source_arm: Object, target_arm: Object, match_posture: bool = True, anchor_bone: str = "",
+                    apply_pose: bool = True, group_bone_collections: bool = False):
+    
     from .utils_bone import get_bone_exportname
 
-    if not source_arm or not target_arm: return
-    if source_arm.type != 'ARMATURE' or target_arm.type != 'ARMATURE': return
+    if not source_arm or not target_arm:
+        return
+    if source_arm.type != 'ARMATURE' or target_arm.type != 'ARMATURE':
+        return
 
     print(f"Merging '{target_arm.name}' into '{source_arm.name}'...")
 
-    with preserve_armature_state(source_arm, reset_pose=True), preserve_armature_state(target_arm, reset_pose=False), unhide_all_objects():
+    with unhide_all_objects(), preserve_armature_state(source_arm, reset_pose=True), preserve_armature_state(target_arm, reset_pose=False):
         try:
+            target_arm_name = target_arm.name
             target_meshes = get_armature_meshes(target_arm)
             print(f"  Found {len(target_meshes)} mesh(es) attached to target armature")
 
@@ -386,9 +391,8 @@ def merge_armatures(source_arm: bpy.types.Object, target_arm: bpy.types.Object, 
                     copy_armature_visual_pose(source_arm, target_arm, 'ANGLES')
                     copy_armature_visual_pose(source_arm, target_arm, 'ORIGIN')
                 except Exception as e:
-                    print('Error matching and applying posture for {} armature: {}'.format(target_arm.name, str(e)))
+                    print(f"  Error matching posture for '{target_arm.name}': {e}")
                     return
-                
                 print("  Matched target posture to source")
 
             if apply_pose:
@@ -396,102 +400,109 @@ def merge_armatures(source_arm: bpy.types.Object, target_arm: bpy.types.Object, 
                 print(f"  Applied pose for '{target_arm.name}' as rest pose")
 
             source_bone_names = {b.name for b in source_arm.data.bones}
-            source_export_map = {get_bone_exportname(b): b.name for b in source_arm.data.bones if get_bone_exportname(b)}
+            source_export_map = {
+                get_bone_exportname(b): b.name
+                for b in source_arm.data.bones
+                if get_bone_exportname(b)
+            }
 
             target_root_bones = {b.name for b in target_arm.data.bones if not b.parent}
 
             bone_name_map = {}
+            target_bones_without_collection = set()
             renamed_count = 0
             for target_bone in target_arm.data.bones:
-                old_name = target_bone.name
+                orig_name = target_bone.name
 
-                if old_name in source_bone_names:
-                    target_bone.name += ".temp_merge"
-                    bone_name_map[target_bone.name] = old_name
+                if orig_name in source_bone_names:
+                    target_bone.name = orig_name + ".temp_merge"
+                    bone_name_map[target_bone.name] = orig_name
                     renamed_count += 1
                     continue
-
-                target_export = get_bone_exportname(target_bone)
-                matched_source_name = source_export_map.get(target_export)
-
-                if matched_source_name:
-                    new_name = matched_source_name + ".temp_merge"
-                    target_bone.name = new_name
-                    renamed_count += 1
                 
-                bone_name_map[target_bone.name] = old_name
+                target_export = get_bone_exportname(target_bone)
+                matched_source = source_export_map.get(target_export)
+                if matched_source:
+                    target_bone.name = matched_source + ".temp_merge"
+                    bone_name_map[target_bone.name] = matched_source
+                    renamed_count += 1
+                    continue
+                
+                bone_name_map[orig_name] = orig_name
+                if len(target_bone.collections) == 0:
+                    target_bones_without_collection.add(orig_name)
 
             if renamed_count > 0:
                 print(f"  Prepared {renamed_count} bone(s) for merging")
 
-            stored_parents = {}
-            for ob in target_arm.children:
-                stored_parents[ob.name] = {
-                    'parent_type': ob.parent_type,
-                    'parent_bone': ob.parent_bone
-                }
+            stored_parents = {
+                ob.name: {'parent_type': ob.parent_type, 'parent_bone': ob.parent_bone}
+                for ob in target_arm.children
+            }
 
-            stored_constraints = []
-            for pb in target_arm.pose.bones:
-                for con in pb.constraints:
-                    if getattr(con, 'target', None) == target_arm:
-                        stored_constraints.append({
-                            'owner': pb.name,
-                            'constraint': con.name,
-                            'subtarget': getattr(con, 'subtarget', None)
-                        })
+            stored_constraints = [
+                {
+                    'owner': pb.name,
+                    'constraint': con.name,
+                    'subtarget': getattr(con, 'subtarget', None)
+                }
+                for pb in target_arm.pose.bones
+                for con in pb.constraints
+                if getattr(con, 'target', None) == target_arm
+            ]
+
+            source_collection_names_before = {c.name for c in source_arm.data.collections}
 
             bpy.ops.object.select_all(action='DESELECT')
             for ob in target_meshes:
-                if not ob.select_get():
-                    ob.select_set(True)
-                if not ob.visible_get():
-                    ob.select_set(True)
-
+                ob.select_set(True)
             bpy.ops.object.transform_apply(rotation=True, location=True, scale=True)
-            bpy.ops.object.select_all(action='DESELECT')
 
+            bpy.ops.object.select_all(action='DESELECT')
             source_arm.select_set(True)
             target_arm.select_set(True)
             bpy.context.view_layer.objects.active = source_arm
             bpy.ops.object.join()
             print("  Joined armatures")
 
-            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.object.mode_set(mode='EDIT')
 
             bones_to_remove = set()
             for bone in source_arm.data.edit_bones:
-                if ".temp_merge" in bone.name:
-                    orig_name = bone.name.removesuffix(".temp_merge")
-                    source_bone = source_arm.data.edit_bones.get(orig_name)
-                    if source_bone:
-                        for child in bone.children:
-                            child.parent = source_bone
-                    bones_to_remove.add(bone)
-            
+                if ".temp_merge" not in bone.name:
+                    continue
+                orig_name = bone.name.removesuffix(".temp_merge")
+                source_bone = source_arm.data.edit_bones.get(orig_name)
+                if source_bone:
+                    for child in bone.children:
+                        child.parent = source_bone
+                bones_to_remove.add(bone)
+
             for bone in bones_to_remove:
                 source_arm.data.edit_bones.remove(bone)
 
-            if len(bones_to_remove) > 0:
+            if bones_to_remove:
                 print(f"  Merged {len(bones_to_remove)} duplicate bone(s)")
 
             if anchor_bone:
                 anchor = source_arm.data.edit_bones.get(anchor_bone)
                 if anchor:
                     anchored_count = 0
-                    for bone_name in target_root_bones:
-                        resolved_name = next(
-                            (v for k, v in bone_name_map.items() if v == bone_name and k.endswith(".temp_merge")),
-                            bone_name
+                    for orig_bone_name in target_root_bones:
+                        final_name = next(
+                            (src for temp, src in bone_name_map.items()
+                             if src == orig_bone_name and temp.endswith(".temp_merge")),
+                            orig_bone_name
                         )
-                        edit_bone = source_arm.data.edit_bones.get(resolved_name) or source_arm.data.edit_bones.get(bone_name)
+                        edit_bone = (source_arm.data.edit_bones.get(final_name)
+                                     or source_arm.data.edit_bones.get(orig_bone_name))
                         if edit_bone and edit_bone.parent is None and edit_bone != anchor:
                             edit_bone.parent = anchor
                             anchored_count += 1
                     if anchored_count > 0:
                         print(f"  Anchored {anchored_count} root bone(s) to '{anchor_bone}'")
 
-            bpy.ops.object.mode_set(mode="OBJECT")
+            bpy.ops.object.mode_set(mode='OBJECT')
 
             for ob_name, info in stored_parents.items():
                 ob = bpy.data.objects.get(ob_name)
@@ -500,14 +511,12 @@ def merge_armatures(source_arm: bpy.types.Object, target_arm: bpy.types.Object, 
                 ob.parent = source_arm
                 ob.parent_type = info['parent_type']
                 if info['parent_type'] == 'BONE' and info['parent_bone']:
-                    mapped_bone = bone_name_map.get(info['parent_bone'])
-                    if mapped_bone and mapped_bone in source_arm.data.bones:
-                        ob.parent_bone = mapped_bone
+                    mapped = bone_name_map.get(info['parent_bone'], info['parent_bone'])
+                    if mapped in source_arm.data.bones:
+                        ob.parent_bone = mapped
 
             for con_info in stored_constraints:
-                owner_name = bone_name_map.get(con_info['owner'])
-                if not owner_name:
-                    continue
+                owner_name = bone_name_map.get(con_info['owner'], con_info['owner'])
                 owner_bone = source_arm.pose.bones.get(owner_name)
                 if not owner_bone:
                     continue
@@ -516,9 +525,9 @@ def merge_armatures(source_arm: bpy.types.Object, target_arm: bpy.types.Object, 
                     continue
                 con.target = source_arm
                 if con_info['subtarget']:
-                    mapped_subtarget = bone_name_map.get(con_info['subtarget'])
-                    if mapped_subtarget and mapped_subtarget in source_arm.data.bones:
-                        con.subtarget = mapped_subtarget
+                    mapped = bone_name_map.get(con_info['subtarget'], con_info['subtarget'])
+                    if mapped in source_arm.data.bones:
+                        con.subtarget = mapped
 
             for ob in target_meshes:
                 for mod in ob.modifiers:
@@ -528,23 +537,257 @@ def merge_armatures(source_arm: bpy.types.Object, target_arm: bpy.types.Object, 
 
             vg_cleaned = 0
             for mesh in target_meshes:
-                if mesh.vertex_groups:
-                    for vg in mesh.vertex_groups:
-                        if ".temp_merge" in vg.name:
-                            vg.name = vg.name.removesuffix(".temp_merge")
-                            vg_cleaned += 1
-            
+                for vg in mesh.vertex_groups:
+                    if ".temp_merge" in vg.name:
+                        vg.name = vg.name.removesuffix(".temp_merge")
+                        vg_cleaned += 1
             if vg_cleaned > 0:
-                print(f"  Merged {vg_cleaned} vertex group(s)")
+                print(f"  Cleaned {vg_cleaned} vertex group(s)")
 
-            print(f"Successfully merged '{target_arm.name}' into '{source_arm.name}'")
-            return
+            if group_bone_collections:
+                arm_data = source_arm.data
+                parent_coll = arm_data.collections.new(target_arm_name)
+
+                all_new_collections = [
+                    c for c in arm_data.collections_all
+                    if c.name not in source_collection_names_before
+                    and c.name != target_arm_name
+                ]
+                new_coll_names = {c.name for c in all_new_collections}
+
+                for coll in all_new_collections:
+                    parent_is_new = coll.parent is not None and coll.parent.name in new_coll_names
+                    if not parent_is_new:
+                        coll.parent = parent_coll
+
+                uncollected = 0
+                for bone in arm_data.bones:
+                    if bone.name in target_bones_without_collection:
+                        parent_coll.assign(bone)
+                        uncollected += 1
+
+                print(f"  Grouped target bone collections under '{target_arm_name}'"
+                      f" ({len(all_new_collections)} collection(s), {uncollected} uncollected bone(s))")
+
+            print(f"Successfully merged '{target_arm_name}' into '{source_arm.name}'")
 
         except Exception as e:
-            error_msg = f"Merge failed: {str(e)}"
-            print(error_msg)
-            return
+            print(f"  Merge failed: {e}")
 
         finally:
             bpy.context.view_layer.update()
             bpy.context.view_layer.depsgraph.update()
+
+# TODO: Use this for KitsuneSourceTool for copying .vs properties
+# Can these be simplified??
+def _copy_property_group(src, dst, _visited=None):
+    if _visited is None:
+        _visited = set()
+    src_id = id(src)
+    if src_id in _visited:
+        return
+    _visited.add(src_id)
+
+    for prop in src.bl_rna.properties:
+        if prop.identifier in ('rna_type', 'name'):
+            continue
+        if prop.is_readonly:
+            continue
+        if prop.type == 'COLLECTION':
+            continue
+
+        try:
+            src_val = getattr(src, prop.identifier)
+            dst_val = getattr(dst, prop.identifier, None)
+        except Exception:
+            continue
+
+        if prop.type == 'POINTER':
+            if src_val is not None and dst_val is not None and hasattr(src_val, 'bl_rna'):
+                _copy_property_group(src_val, dst_val, _visited)
+            continue
+
+        try:
+            if hasattr(src_val, 'copy'):
+                setattr(dst, prop.identifier, src_val.copy())
+            elif prop.is_array:
+                setattr(dst, prop.identifier, src_val[:])
+            else:
+                setattr(dst, prop.identifier, src_val)
+        except Exception:
+            pass
+
+    if isinstance(src, bpy.types.PropertyGroup):
+        for key, value in src.items():
+            if key.startswith('_'):
+                continue
+            try:
+                dst[key] = value
+            except Exception:
+                pass
+
+def _copy_addon_properties(src, dst, _visited=None):
+    if _visited is None:
+        _visited = set()
+    src_id = id(src)
+    if src_id in _visited:
+        return
+    _visited.add(src_id)
+
+    for attr in dir(src):
+        if attr.startswith('_'):
+            continue
+        try:
+            src_val = getattr(src, attr)
+            dst_val = getattr(dst, attr, None)
+        except Exception:
+            continue
+
+        if dst_val is None:
+            continue
+        if not isinstance(src_val, bpy.types.PropertyGroup):
+            continue
+
+        _copy_property_group(src_val, dst_val, _visited)
+
+
+def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, bone_filter: set = None, data_mode: str = 'ALL', sync_bone_collections: bool = False):
+    from .utils_bone import get_bone_exportname
+
+    if not source_arm or not target_arms:
+        return
+    if source_arm.type != 'ARMATURE':
+        return
+
+    targets = [t for t in target_arms if t and t.type == 'ARMATURE' and t != source_arm]
+    if not targets:
+        return
+
+    print(f"Transferring bone data from '{source_arm.name}' to {len(targets)} armature(s)...")
+
+    with preserve_armature_state(source_arm, reset_pose=True), unhide_all_objects():
+        source_export_map = {
+            get_bone_exportname(b): b.name
+            for b in source_arm.data.bones
+            if get_bone_exportname(b)
+        }
+
+        for target_arm in targets:
+            print(f"  Updating '{target_arm.name}'...")
+
+            with preserve_armature_state(target_arm, reset_pose=True):
+                shared = {}
+                for target_bone in target_arm.data.bones:
+                    if target_bone.name in source_arm.data.bones:
+                        source_name = target_bone.name
+                    else:
+                        export_name = get_bone_exportname(target_bone)
+                        source_name = source_export_map.get(export_name)
+
+                    if not source_name:
+                        continue
+                    if bone_filter is not None and source_name not in bone_filter:
+                        continue
+
+                    shared[target_bone.name] = source_name
+
+                if not shared:
+                    print(f"    No shared bones found, skipping")
+                    continue
+
+                if data_mode in ('ALL', 'TRANSFORMS'):
+                    bpy.context.view_layer.objects.active = source_arm
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    source_edit_bones = {
+                        b.name: {
+                            'head': b.head.copy(),
+                            'tail': b.tail.copy(),
+                            'roll': b.roll,
+                            'envelope_distance': b.envelope_distance,
+                            'envelope_weight': b.envelope_weight,
+                            'head_radius': b.head_radius,
+                            'tail_radius': b.tail_radius,
+                            'bbone_segments': b.bbone_segments,
+                            'bbone_x': b.bbone_x,
+                            'bbone_z': b.bbone_z,
+                            'use_connect': b.use_connect,
+                            'use_local_location': b.use_local_location,
+                            'use_inherit_rotation': b.use_inherit_rotation,
+                            'inherit_scale': b.inherit_scale,
+                            'parent': b.parent.name if b.parent else None,
+                        }
+                        for b in source_arm.data.edit_bones
+                    }
+                    bpy.ops.object.mode_set(mode='OBJECT')
+
+                    bpy.context.view_layer.objects.active = target_arm
+                    bpy.ops.object.mode_set(mode='EDIT')
+
+                    for target_name, source_name in shared.items():
+                        src = source_edit_bones.get(source_name)
+                        dst = target_arm.data.edit_bones.get(target_name)
+                        if not src or not dst:
+                            continue
+                        for attr, value in src.items():
+                            if attr == 'parent':
+                                continue
+                            setattr(dst, attr, value)
+
+                    for target_name, source_name in shared.items():
+                        src = source_edit_bones.get(source_name)
+                        dst = target_arm.data.edit_bones.get(target_name)
+                        if not src or not dst:
+                            continue
+                        src_parent_name = src.get('parent')
+                        if src_parent_name is None:
+                            dst.parent = None
+                            continue
+                        resolved_parent = next(
+                            (t for t, s in shared.items() if s == src_parent_name),
+                            src_parent_name
+                        )
+                        parent_edit_bone = target_arm.data.edit_bones.get(resolved_parent)
+                        if parent_edit_bone:
+                            dst.parent = parent_edit_bone
+
+                    bpy.ops.object.mode_set(mode='OBJECT')
+
+                if data_mode in ('ALL', 'PROPERTIES'):
+                    if sync_bone_collections:
+                        source_collection_map = {
+                            col.name: col
+                            for col in source_arm.data.collections
+                        }
+                        for target_name, source_name in shared.items():
+                            src_b = source_arm.data.bones.get(source_name)
+                            dst_b = target_arm.data.bones.get(target_name)
+                            if not src_b or not dst_b:
+                                continue
+                            src_collection_names = {col.name for col in src_b.collections}
+                            dst_collection_names = {col.name for col in dst_b.collections}
+                            if src_collection_names == dst_collection_names:
+                                continue
+                            for col in list(dst_b.collections):
+                                col.unassign(dst_b)
+                            for col_name in src_collection_names:
+                                dst_col = target_arm.data.collections.get(col_name)
+                                if dst_col is None:
+                                    dst_col = target_arm.data.collections.new(col_name)
+                                dst_col.assign(dst_b)
+
+                    for target_name, source_name in shared.items():
+                        src_pb = source_arm.pose.bones.get(source_name)
+                        dst_pb = target_arm.pose.bones.get(target_name)
+                        if src_pb and dst_pb:
+                            _copy_property_group(src_pb, dst_pb)
+                            _copy_addon_properties(src_pb, dst_pb)
+
+                        src_b = source_arm.data.bones.get(source_name)
+                        dst_b = target_arm.data.bones.get(target_name)
+                        if src_b and dst_b:
+                            _copy_property_group(src_b, dst_b)
+                            _copy_addon_properties(src_b, dst_b)
+
+                print(f"    Updated {len(shared)} shared bone(s)")
+
+    print(f"Transfer complete")

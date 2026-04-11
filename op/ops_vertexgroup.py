@@ -1,6 +1,6 @@
 import bpy, bmesh
 from bpy.types import Operator, PoseBone
-from bpy.props import FloatProperty, BoolProperty, StringProperty
+from bpy.props import FloatProperty, BoolProperty, StringProperty, EnumProperty
 from ..utils.utils_object import is_armature, is_mesh, get_armature_meshes, get_armature
 from ..utils.utils_armature import get_selected_bones
 from ..utils.utils_contextmanagers import preserve_context_mode, preserve_armature_state
@@ -559,3 +559,105 @@ class VERTEXGROUP_OT_multi_weight_paint_cancel(Operator):
 
         self.report({'INFO'}, "Cancelled multi-object weight paint. Changes discarded.")
         return {'FINISHED'}
+    
+
+class VERTEXGROUP_OT_TransferSelectedGroup(Operator):
+    bl_idname = "kitsunetools.transfer_selected_group"
+    bl_label = "Transfer Selected Group"
+    bl_description = (
+        "Select: source mesh, receiver mesh, receiver's armature (active). "
+        "In Pose Mode, select a bone — copies its vertex group from source to receiver by topology."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj is not None
+            and obj.type == 'ARMATURE'
+            and context.mode == 'POSE'
+            and len(context.selected_pose_bones) > 0
+        )
+
+    def execute(self, context) -> set:
+        armature = context.active_object
+
+        # Collect selected objects excluding the armature
+        selected_meshes = [
+            o for o in context.selected_objects
+            if o.type == 'MESH' and o != armature
+        ]
+
+        if len(selected_meshes) != 2:
+            self.report({'ERROR'}, "Select exactly one source mesh and one receiver mesh.")
+            return {'CANCELLED'}
+
+        # Determine which mesh is parented/bound to the armature (receiver)
+        def is_bound_to_armature(mesh_obj, arm_obj):
+            for mod in mesh_obj.modifiers:
+                if mod.type == 'ARMATURE' and mod.object == arm_obj:
+                    return True
+            return mesh_obj.parent == arm_obj
+
+        bound = [m for m in selected_meshes if is_bound_to_armature(m, armature)]
+        unbound = [m for m in selected_meshes if not is_bound_to_armature(m, armature)]
+
+        if len(bound) != 1 or len(unbound) != 1:
+            self.report({'ERROR'},
+                "Could not determine source/receiver. Ensure the receiver has an Armature modifier "
+                "pointing to the selected armature, or is parented to it.")
+            return {'CANCELLED'}
+
+        receiver = bound[0]
+        source = unbound[0]
+
+        if len(source.data.vertices) != len(receiver.data.vertices):
+            self.report({'ERROR'},
+                f"Topology mismatch: source has {len(source.data.vertices)} verts, "
+                f"receiver has {len(receiver.data.vertices)} verts.")
+            return {'CANCELLED'}
+
+        bones = context.selected_pose_bones
+        transferred = []
+        skipped = []
+
+        for bone in bones:
+            name = bone.name
+
+            src_vg = source.vertex_groups.get(name)
+            if src_vg is None:
+                skipped.append(name)
+                continue
+
+            # Ensure the group exists on receiver
+            dst_vg = receiver.vertex_groups.get(name)
+            if dst_vg is None:
+                dst_vg = receiver.vertex_groups.new(name=name)
+
+            # Copy weights vertex-by-vertex by index (topology transfer)
+            for vert in source.data.vertices:
+                weight = None
+                for g in vert.groups:
+                    if g.group == src_vg.index:
+                        weight = g.weight
+                        break
+
+                if weight is not None:
+                    dst_vg.add([vert.index], weight, 'REPLACE')
+                else:
+                    # Explicitly zero out if source has no weight for this vert
+                    dst_vg.add([vert.index], 0.0, 'REPLACE')
+
+            transferred.append(name)
+
+        if transferred:
+            self.report({'INFO'},
+                f"Transferred: {', '.join(transferred)}"
+                + (f" | Skipped (not in source): {', '.join(skipped)}" if skipped else ""))
+        else:
+            self.report({'WARNING'},
+                f"No groups transferred. Skipped: {', '.join(skipped)}")
+
+        return {'FINISHED'}
+    

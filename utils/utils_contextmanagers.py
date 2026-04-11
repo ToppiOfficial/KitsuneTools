@@ -29,6 +29,8 @@ EDIT_MODE_MAP = (
 
 _undo_depth = 0
 
+addon_keymaps = []
+
 #
 #   MODULES
 #
@@ -40,6 +42,18 @@ def is_addon_enabled(module_name: str) -> bool:
 def make_pointer(prop_type):
         return PointerProperty(name='Kitsune Tools settings',type=prop_type)
 
+
+def register_keymap(name, space_type, idname, type, ctrl=False, shift=False, alt=False, properties=None, region_type='WINDOW'):
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if not kc:
+        return
+    km = kc.keymaps.new(name=name, space_type=space_type, region_type=region_type)
+    kmi = km.keymap_items.new(idname, type=type, value='PRESS', ctrl=ctrl, shift=shift, alt=alt)
+    if properties:
+        for key, value in properties.items():
+            setattr(kmi.properties, key, value)
+    addon_keymaps.append((km, kmi))
+    
 #
 #   CONTEXT & SCENE MANAGERS
 #

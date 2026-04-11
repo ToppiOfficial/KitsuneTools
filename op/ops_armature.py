@@ -1,7 +1,7 @@
 import bpy, re
 from bpy.types import Object, Operator, Context, PoseBone
 from bpy.props import BoolProperty, StringProperty, EnumProperty, FloatProperty
-from ..utils.utils_armature import apply_current_pose_as_restpose, apply_current_pose_shapekey, get_selected_bones, copy_armature_visual_pose, merge_armatures
+from ..utils.utils_armature import apply_current_pose_as_restpose, apply_current_pose_shapekey, get_selected_bones, copy_armature_visual_pose, merge_armatures, transfer_armature_bonedata
 from ..utils.utils_contextmanagers import preserve_context_mode
 from ..utils.utils_object import get_armature, is_armature, get_armature_meshes
 from ..utils.utils_vertexgroup import remove_unused_vertexgroups
@@ -59,7 +59,7 @@ class ARMATURE_OT_ApplyPoseAsRestPose(_apply_pose, Operator):
     @classmethod
     def poll(cls, context):
         active_object = context.active_object
-        return is_armature(active_object) and not active_object.mode == 'EDIT'
+        return is_armature(active_object) and not active_object.mode == 'EDIT' and not active_object.hide_get()
     
     def draw(self, context):
         layout = self.layout
@@ -75,7 +75,7 @@ class ARMATURE_OT_ApplyPoseAsShapekey(_apply_pose, Operator):
     
     @classmethod
     def poll(cls, context : Context) -> bool:
-        return bool(is_armature(context.active_object) and context.mode in {'POSE', 'OBJECT'})
+        return bool(is_armature(context.active_object) and context.mode in {'POSE', 'OBJECT'}) and not context.active_object.hide_get()
     
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self, width=200)
@@ -96,6 +96,7 @@ class ARMATURE_OT_MergeArmatures(Operator):
     use_anchor_bone : BoolProperty(name='Anchor Root Bones', default=False)
     anchor_bone : StringProperty(name='Anchor Bone', default="")
     apply_pose : BoolProperty(name='Apply Pose', default=True)
+    group_bone_collections : BoolProperty(name='Group Bone Collections', default=False)
     
     @classmethod
     def poll(cls, context : Context) -> bool:
@@ -106,6 +107,7 @@ class ARMATURE_OT_MergeArmatures(Operator):
     
     def draw(self, context):
         layout = self.layout
+        layout.prop(self, 'group_bone_collections')
         layout.prop(self, 'match_posture')
 
         if not self.match_posture:
@@ -145,7 +147,7 @@ class ARMATURE_OT_MergeArmatures(Operator):
                             arm.select_set(True)
                             bpy.ops.kitsunetools.clean_unweighted_bones('EXEC_DEFAULT', cleaning_mode='FULL_CLEAN', remove_empty_vertex_groups=True)
                     
-                        merge_armatures(active_object, arm, match_posture=self.match_posture, anchor_bone=resolved_anchor, apply_pose=self.apply_pose)
+                        merge_armatures(active_object, arm, match_posture=self.match_posture, anchor_bone=resolved_anchor, apply_pose=self.apply_pose, group_bone_collections=self.group_bone_collections)
                         success_count += 1
                     except Exception as e:
                         self.report({'ERROR'}, f"Failed to merge '{arm.name}': {str(e)}")
@@ -460,3 +462,109 @@ class ARMATURE_OT_CleanUnWeightedBones(Operator):
             if obj.parent == armature and obj.parent_type == 'BONE' and obj.parent_bone:
                 bones_with_children.add(obj.parent_bone)
         return bones_with_children
+
+
+class ARMATURE_OT_TransferBoneData(Operator):
+    bl_idname = "kitsunetools.reevaluate_armatures"
+    bl_label = "Re-evaluate Armatures"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Bone Selection",
+        items=[
+            ('ALL', "All Matching Bones", "Match all bones shared between armatures"),
+            ('COLLECTION', "All Matching Bones of Collection", "Match bones from a specific bone collection"),
+            ('SELECTED', "Selected Pose Bones", "Only match currently selected pose bones on the active armature"),
+        ],
+        default='ALL',
+    )
+
+    data_mode: EnumProperty(
+        name="Data",
+        items=[
+            ('ALL', "All", "Copy bone transforms and custom properties"),
+            ('TRANSFORMS', "Transforms Only", "Copy only head, tail, roll and bone settings"),
+            ('PROPERTIES', "Properties Only", "Copy only custom properties"),
+        ],
+        default='ALL',
+    )
+
+    sync_bone_collections: BoolProperty(
+        name="Sync Bone Collections",
+        description="Assign matched bones to the same bone collections as the source, creating collections if missing",
+        default=False,
+    )
+
+    collection_name: StringProperty(name="Bone Collection", default="")
+    include_child_collections: BoolProperty(name="Include Child Collections", default=False)
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        return bool(
+            is_armature(context.active_object)
+            and {ob for ob in context.selected_objects if is_armature(ob) and ob != context.active_object}
+        )
+
+    def invoke(self, context: Context, event) -> set:
+        if self.mode == 'SELECTED' and context.mode != 'POSE':
+            self.report({'WARNING'}, "Must be in Pose Mode to use 'Selected Pose Bones'.")
+            return {'CANCELLED'}
+
+        if self.mode == 'COLLECTION':
+            return context.window_manager.invoke_props_dialog(self)
+
+        return self.execute(context)
+
+    def draw(self, context: Context):
+        layout = self.layout
+        layout.prop_search(self, "collection_name", context.active_object.data, "collections", text="Collection")
+        layout.prop(self, "include_child_collections")
+        layout.prop(self, "data_mode")
+        if self.data_mode in ('ALL', 'PROPERTIES'):
+            layout.prop(self, "sync_bone_collections")
+
+    def execute(self, context: Context) -> set:
+        active_object = context.active_object
+        if active_object is None:
+            return {'CANCELLED'}
+
+        targets = [ob for ob in context.selected_objects if ob != active_object and is_armature(ob)]
+        if not targets:
+            self.report({'WARNING'}, "No other armatures selected to re-evaluate.")
+            return {'CANCELLED'}
+
+        bone_filter = None
+
+        if self.mode == 'SELECTED':
+            if context.mode != 'POSE':
+                self.report({'WARNING'}, "Must be in Pose Mode to use 'Selected Pose Bones'.")
+                return {'CANCELLED'}
+            bone_filter = {pb.name for pb in context.selected_pose_bones if pb.id_data == active_object}
+            if not bone_filter:
+                self.report({'WARNING'}, "No pose bones selected on the active armature.")
+                return {'CANCELLED'}
+
+        elif self.mode == 'COLLECTION':
+            collection = active_object.data.collections.get(self.collection_name)
+            if not collection:
+                self.report({'WARNING'}, f"Bone collection '{self.collection_name}' not found.")
+                return {'CANCELLED'}
+
+            collections_to_check = [collection]
+            if self.include_child_collections:
+                def collect_children(col):
+                    for child in col.children:
+                        collections_to_check.append(child)
+                        collect_children(child)
+                collect_children(collection)
+
+            bone_filter = {b.name for col in collections_to_check for b in col.bones}
+            if not bone_filter:
+                self.report({'WARNING'}, f"No bones found in collection '{self.collection_name}'.")
+                return {'CANCELLED'}
+
+        with preserve_context_mode(context.view_layer.objects.active, 'OBJECT'):
+            transfer_armature_bonedata(active_object, targets, bone_filter=bone_filter, data_mode=self.data_mode, sync_bone_collections=self.sync_bone_collections)
+            self.report({'INFO'}, f"Re-evaluated {len(targets)} armature(s) from '{active_object.name}'")
+
+        return {'FINISHED'}

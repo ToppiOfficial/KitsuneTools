@@ -1,4 +1,4 @@
-from bpy.types import Panel, UILayout
+from bpy.types import Panel, UILayout, Menu
 from ..utils.utils_panels import (
     get_label_with_object_name,
     get_label_with_bone_name,
@@ -10,7 +10,8 @@ from ..op.ops_armature import (
     ARMATURE_OT_ApplyPoseAsShapekey, 
     ARMATURE_OT_MergeArmatures,
     ARMATURE_OT_CopyVisPosture,
-    ARMATURE_OT_CleanUnWeightedBones
+    ARMATURE_OT_CleanUnWeightedBones,
+    ARMATURE_OT_TransferBoneData
 )
 from ..op.ops_bone import (
     BONE_OT_MergeBones,
@@ -21,7 +22,8 @@ from ..op.ops_bone import (
     BONE_OT_mirror_by_position,
     BONE_OT_FlipBone,
     BONE_OT_CreateCenterBone,
-    BONE_OT_SplitActiveWeightLinear
+    BONE_OT_SplitActiveWeightLinear,
+    BONE_OT_parent_bone_in_pose
 )
 from ..op.ops_mesh import (
     MESH_OT_CleanShapeKeys,
@@ -31,7 +33,9 @@ from ..op.ops_mesh import (
     MESH_OT_SelectShapekeyVets,
     MESH_OT_Select_Faces_by_ImageMask,
     MESH_OT_transfer_topology_shapekeys,
-    MESH_OT_unlock_all_vertexgroups
+    MESH_OT_unlock_all_vertexgroups,
+    MESH_OT_convex_hull_selection,
+    MESH_OT_replace_verts_with_spheres
 )
 from ..op.ops_vertexgroup import (
     VERTEXGROUP_OT_WeightMath,
@@ -39,7 +43,8 @@ from ..op.ops_vertexgroup import (
     VERTEXGROUP_OT_curve_ramp_weights,
     VERTEXGROUP_OT_multi_weight_paint_start,
     VERTEXGROUP_OT_multi_weight_paint_finish,
-    VERTEXGROUP_OT_multi_weight_paint_cancel
+    VERTEXGROUP_OT_multi_weight_paint_cancel,
+    VERTEXGROUP_OT_TransferSelectedGroup
 )
 from ..op.ops_action import (
     ACTION_OT_merge_animation_slots,
@@ -60,6 +65,18 @@ class TOOLS_PT_KitsuneTool_Panel(Panel):
     bl_options = {'DEFAULT_CLOSED'}
 
 
+class TOOLS_MT_KitsuneTool_PoseBoneTools(Menu):
+    bl_idname = 'TOOLS_MT_KitsuneTool_PoseBoneTools'
+    bl_label = 'Pose Bone Tools'
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.area and context.area.type == 'VIEW_3D')
+
+    def draw(self, context):
+        self.layout.operator(BONE_OT_parent_bone_in_pose.bl_idname, icon='BONE_DATA')
+
+
 class TOOLS_PT_KitsuneTool_Armature(TOOLS_PT_KitsuneTool_Panel):
     bl_options = set()
 
@@ -69,33 +86,44 @@ class TOOLS_PT_KitsuneTool_Armature(TOOLS_PT_KitsuneTool_Panel):
     def draw(self, context):
         l = self.layout
         bx = l.box()
-        
+
         col = bx.column(align=True)
         col.label(text='Apply Pose As Rest Pose')
-        in_pose = bool(context.mode == 'POSE')
-        
-        row = col.row(align=True)
-        row.scale_y = 1.5
-        row.operator(ARMATURE_OT_ApplyPoseAsRestPose.bl_idname,icon='POSE_HLT',text='Entire Armature').selected_only = False
-        
-        op_col = row.column(align=True)
-        op_col.enabled = has_selected_bones() and in_pose
-        op_col.operator(ARMATURE_OT_ApplyPoseAsRestPose.bl_idname,icon='POSE_HLT', text='Selected Bones').selected_only = True
+        in_pose = context.mode == 'POSE'
 
         row = col.row(align=True)
-        row.scale_y = 1
+        row.scale_y = 1.5
+        row.operator(ARMATURE_OT_ApplyPoseAsRestPose.bl_idname, icon='POSE_HLT', text='Entire Armature').selected_only = False
+
+        op_col = row.column(align=True)
+        op_col.enabled = has_selected_bones() and in_pose
+        op_col.operator(ARMATURE_OT_ApplyPoseAsRestPose.bl_idname, icon='POSE_HLT', text='Selected Bones').selected_only = True
+        
+        row = col.row(align=True)
         row.enabled = in_pose
-        row.operator(ARMATURE_OT_ApplyPoseAsShapekey.bl_idname,icon='SHAPEKEY_DATA')
+        row.operator(ARMATURE_OT_ApplyPoseAsShapekey.bl_idname, icon='SHAPEKEY_DATA')
 
         col = bx.column()
         col.label(text='Multi-Armature Tools')
-        
-        col.operator(ARMATURE_OT_MergeArmatures.bl_idname,icon='AUTOMERGE_ON')
-        col.operator(ARMATURE_OT_CleanUnWeightedBones.bl_idname,icon='GROUP_BONE')
-        
+
+        col.operator(ARMATURE_OT_MergeArmatures.bl_idname, icon='AUTOMERGE_ON')
+        col.operator(ARMATURE_OT_CleanUnWeightedBones.bl_idname, icon='GROUP_BONE')
+
+        sub = col.column(align=True)
+        sub.label(text='Transfer Armature Bone Data')
+
+        row = sub.row(align=True)
+        row.operator(ARMATURE_OT_TransferBoneData.bl_idname, icon='ARMATURE_DATA', text='All Bones').mode = 'ALL'
+
+        op_col = row.column(align=True)
+        op_col.enabled = in_pose
+        op_col.operator(ARMATURE_OT_TransferBoneData.bl_idname, icon='BONE_DATA', text='Selected Bones').mode = 'SELECTED'
+
+        sub.operator(ARMATURE_OT_TransferBoneData.bl_idname, icon='GROUP_BONE', text='By Collection').mode = 'COLLECTION'
+
         col = bx.column(align=True)
-        col.operator(ARMATURE_OT_CopyVisPosture.bl_idname,icon='POSE_HLT',text=f'{ARMATURE_OT_CopyVisPosture.bl_label} (LOCATION)').copy_type = 'ORIGIN'
-        col.operator(ARMATURE_OT_CopyVisPosture.bl_idname,icon='POSE_HLT',text=f'{ARMATURE_OT_CopyVisPosture.bl_label} (ROTATION)').copy_type = 'ANGLES'
+        col.operator(ARMATURE_OT_CopyVisPosture.bl_idname, icon='POSE_HLT', text=f'{ARMATURE_OT_CopyVisPosture.bl_label} (LOCATION)').copy_type = 'ORIGIN'
+        col.operator(ARMATURE_OT_CopyVisPosture.bl_idname, icon='POSE_HLT', text=f'{ARMATURE_OT_CopyVisPosture.bl_label} (ROTATION)').copy_type = 'ANGLES'
 
 
 class TOOLS_PT_KitsuneTool_Bone(TOOLS_PT_KitsuneTool_Panel):
@@ -160,9 +188,8 @@ class TOOLS_PT_KitsuneTool_Mesh(TOOLS_PT_KitsuneTool_Panel):
 
     def draw(self, context) -> None:
         layout = self.layout
-        box = layout.box()
 
-        box1 = box.box()
+        box1 = layout.box()
         col = box1.column(align=True)
         col.label(text='Optimization')
         col.operator(MESH_OT_CleanShapeKeys.bl_idname, icon='SHAPEKEY_DATA')
@@ -170,17 +197,19 @@ class TOOLS_PT_KitsuneTool_Mesh(TOOLS_PT_KitsuneTool_Panel):
         col.operator(MESH_OT_Delete_Faces_by_ImageMask.bl_idname, icon='UV_FACESEL')
         col.operator(MESH_OT_CleanDuplicateMaterials.bl_idname, icon='UV_FACESEL')
         
-        box1 = box.box()
+        box1 = layout.box()
         col = box1.column(align=True)
         col.label(text='Selection')
         col.operator(MESH_OT_SelectShapekeyVets.bl_idname, icon='VERTEXSEL')
         col.operator(MESH_OT_Select_Faces_by_ImageMask.bl_idname, icon='RESTRICT_SELECT_OFF')
         
-        box1 = box.box()
+        box1 = layout.box()
         col = box1.column(align=True)
         col.label(text='Modifiers')
         col.operator(MESH_OT_transfer_topology_shapekeys.bl_idname, icon='MOD_DATA_TRANSFER')
         col.operator(MESH_OT_unlock_all_vertexgroups.bl_idname, icon='UNLOCKED')
+        col.operator(MESH_OT_replace_verts_with_spheres.bl_idname, icon='SPHERE')
+        col.operator(MESH_OT_convex_hull_selection.bl_idname, icon='UV_FACESEL')
 
 
 class TOOLS_PT_KitsuneTool_VertexGroup(TOOLS_PT_KitsuneTool_Panel):
@@ -211,6 +240,7 @@ class TOOLS_PT_KitsuneTool_VertexGroup(TOOLS_PT_KitsuneTool_Panel):
         
         col.operator(VERTEXGROUP_OT_WeightMath.bl_idname, icon='LINENUMBERS_ON')
         col.operator(VERTEXGROUP_OT_SwapVertexGroups.bl_idname,icon='AREA_SWAP')
+        col.operator(VERTEXGROUP_OT_TransferSelectedGroup.bl_idname,icon='AREA_SWAP')
         col.operator(BONE_OT_SubdivideBone.bl_idname, icon='MOD_SUBSURF', text=BONE_OT_SubdivideBone.bl_label + " (Weights Only)").weights_only = True
         col.prop(context.scene.kitsunetools, 'visible_mesh_only')
         

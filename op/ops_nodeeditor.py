@@ -2,6 +2,7 @@ import bpy, os
 from bpy.types import Operator
 from PIL import Image
 from ..utils.utils_object import is_mesh
+from bpy.props import EnumProperty, StringProperty, BoolProperty
 
 
 class NODE_OT_node_bake_add(Operator):
@@ -32,10 +33,17 @@ class NODE_OT_node_bake_remove(Operator):
 
 def _setup_temp_plane(context, mat):
     prev_active = context.view_layer.objects.active
-    prev_selected = list(context.selected_objects)
+    prev_selected = [o for o in context.selected_objects]
+
     bpy.ops.object.select_all(action='DESELECT')
-    bpy.ops.mesh.primitive_plane_add(size=2)
-    temp_plane = context.active_object
+    bpy.ops.mesh.primitive_plane_add()
+    temp_plane = context.view_layer.objects.active
+
+    # Ensure it's in a selectable collection by moving it to the scene master collection
+    for col in temp_plane.users_collection:
+        col.objects.unlink(temp_plane)
+    context.scene.collection.objects.link(temp_plane)
+
     temp_plane.data.materials.append(mat)
     return temp_plane, prev_active, prev_selected
 
@@ -329,10 +337,10 @@ class NODE_OT_node_bake_all_materials(Operator):
 
 class NODE_OT_import_custom_nodes(Operator):
     bl_idname = "kitsunetools.import_custom_nodes"
-    bl_label = "Import Custom Shader Nodes"
+    bl_label = "Import Kitsune Custom Nodes"
     bl_options = {'REGISTER', 'UNDO'}
 
-    overwrite: bpy.props.BoolProperty(default=False)
+    overwrite: bpy.props.BoolProperty(default=True)
     _conflicts: set = set()
 
     @staticmethod
@@ -426,4 +434,159 @@ class NODE_OT_import_custom_nodes(Operator):
 
         action = "imported and updated" if self.overwrite else "imported"
         self.report({'INFO'}, f"Shader nodes {action} successfully.")
+        return {'FINISHED'}
+    
+
+class NODE_OT_copy_node_values(Operator):
+    bl_idname = "node.copy_node_values"
+    bl_label = "Copy Node Values"
+    bl_description = "Copy adjustable values from the active shader node to matching nodes in target materials"
+    bl_options = {'REGISTER', 'UNDO'}
+ 
+    scope: EnumProperty(
+        name="Scope",
+        items=[
+            ('ACTIVE_MATERIAL', "Active Material Only", "Copy only within the current active material"),
+            ('OBJECT_MATERIALS', "All Object Materials", "Copy to all materials on the active object"),
+            ('ALL', "All Materials in File", "Copy to every material in the blend file"),
+        ],
+        default='ALL',
+    )
+ 
+    copy_mode: EnumProperty(
+        name="Copy Mode",
+        items=[
+            ('ALL', "Copy All Settings", "Copy all adjustable values"),
+            ('SELECTED', "Copy Only Selected Input", "Copy only the chosen input value"),
+        ],
+        default='ALL',
+    )
+ 
+    selected_input: StringProperty(
+        name="Input Name",
+        description="Name of the specific input to copy when Copy Mode is 'Copy Only Selected'",
+        default="",
+    )
+ 
+    match_by_name: BoolProperty(
+        name="Match by Name",
+        description="Only match nodes whose Name matches the source node",
+        default=False,
+    )
+ 
+    match_by_label: BoolProperty(
+        name="Match by Label",
+        description="Only match nodes whose Label matches the source node",
+        default=False,
+    )
+ 
+    def _active_node(self, context):
+        space = context.space_data
+        if space and space.type == 'NODE_EDITOR' and space.tree_type == 'ShaderNodeTree':
+            return space.node_tree.nodes.active if space.node_tree else None
+        return None
+ 
+    def _copyable_inputs(self, node):
+        return [
+            inp for inp in node.inputs
+            if not inp.is_linked
+            and hasattr(inp, 'default_value')
+            and isinstance(inp.default_value, (float, int, bool))
+        ]
+ 
+    def _node_matches(self, source, candidate):
+        if candidate is source:
+            return False
+        if candidate.type != source.type:
+            return False
+        if source.type == 'GROUP' and candidate.node_tree != source.node_tree:
+            return False
+        if self.match_by_name and candidate.name != source.name:
+            return False
+        if self.match_by_label and candidate.label != source.label:
+            return False
+        return True
+ 
+    def _target_materials(self, context):
+        if self.scope == 'ACTIVE_MATERIAL':
+            mat = context.object.active_material if context.object else None
+            return [mat] if mat else []
+        if self.scope == 'OBJECT_MATERIALS':
+            obj = context.object
+            return [slot.material for slot in obj.material_slots if slot.material] if obj else []
+        return [mat for mat in bpy.data.materials if mat.use_nodes]
+ 
+    def invoke(self, context, event) -> set:
+        source = self._active_node(context)
+        if not source:
+            self.report({'WARNING'}, "No active shader node selected in the Shader Editor.")
+            return {'CANCELLED'}
+        if not self._copyable_inputs(source):
+            self.report({'WARNING'}, "Active node has no copyable float/int values.")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=340)
+ 
+    def draw(self, context):
+        layout = self.layout
+        source = self._active_node(context)
+ 
+        layout.label(text=f"Source Node: {source.name if source else 'None'}", icon='NODE')
+        layout.separator()
+        layout.prop(self, "scope")
+        layout.separator()
+        layout.prop(self, "copy_mode")
+ 
+        if self.copy_mode == 'SELECTED' and source:
+            col = layout.column()
+            col.label(text="Select Input to Copy:")
+            for inp in self._copyable_inputs(source):
+                icon = 'RADIOBUT_ON' if self.selected_input == inp.name else 'RADIOBUT_OFF'
+                col.operator(
+                    NODE_OT_set_copy_input.bl_idname,
+                    text=inp.name,
+                    icon=icon,
+                    emboss=False,
+                ).input_name = inp.name
+ 
+        layout.separator()
+        layout.prop(self, "match_by_name")
+        layout.prop(self, "match_by_label")
+ 
+    def execute(self, context) -> set:
+        source = self._active_node(context)
+        if not source:
+            self.report({'ERROR'}, "No active shader node.")
+            return {'CANCELLED'}
+ 
+        selected_input = self.selected_input if self.copy_mode == 'SELECTED' else None
+        count = 0
+ 
+        for mat in self._target_materials(context):
+            if not mat.use_nodes or not mat.node_tree:
+                continue
+            for node in mat.node_tree.nodes:
+                if not self._node_matches(source, node):
+                    continue
+                for src_inp in self._copyable_inputs(source):
+                    if selected_input and src_inp.name != selected_input:
+                        continue
+                    tgt_inp = node.inputs.get(src_inp.name)
+                    if tgt_inp and not tgt_inp.is_linked and type(tgt_inp) == type(src_inp):
+                        tgt_inp.default_value = src_inp.default_value
+                count += 1
+ 
+        self.report({'INFO'}, f"Copied values to {count} node(s).")
+        return {'FINISHED'}
+ 
+
+class NODE_OT_set_copy_input(Operator):
+    """Sets the selected input on the parent copy operator via window manager storage."""
+    bl_idname = "node.set_copy_input_selection"
+    bl_label = "Select Input"
+    bl_options = {'INTERNAL'}
+ 
+    input_name: StringProperty()
+ 
+    def execute(self, context) -> set:
+        context.window_manager['_copy_node_selected_input'] = self.input_name #pyright: ignore
         return {'FINISHED'}

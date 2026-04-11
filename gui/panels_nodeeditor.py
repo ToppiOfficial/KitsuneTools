@@ -3,11 +3,10 @@ from bpy.types import Panel, UIList
 from ..utils.utils_panels import get_label_with_material_name
 from ..utils.utils_object import is_mesh
 from ..op.ops_nodeeditor import (
-    NODE_OT_import_custom_nodes,
     NODE_OT_node_bake_add,
     NODE_OT_node_bake_all_materials,
     NODE_OT_node_bake_remove,
-    NODE_OT_node_bake_run
+    NODE_OT_node_bake_run,
 )
 
 
@@ -49,7 +48,7 @@ class NODE_UL_material_list(UIList):
             mat = item.material
 
         if mat:
-            layout.label(text=mat.name, icon_value=layout.icon(mat))
+            layout.prop(mat, "name", text="", icon_value=layout.icon(mat), emboss=False)
         else:
             layout.label(text="(empty slot)", icon='BLANK1')
 
@@ -63,14 +62,6 @@ class NODE_UL_material_list(UIList):
             flt_flags = [self.bitflag_filter_item if slot.material else 0 for slot in items]
             flt_neworder = list(range(len(items)))
         return flt_flags, flt_neworder
-
-
-class NODE_PT_KitsuneTool_custom_nodes(TOOLS_PT_KitsuneTool_Panel):
-    bl_label = "Custom Nodes"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.operator(NODE_OT_import_custom_nodes.bl_idname, icon='IMPORT')
 
 
 class NODE_PT_KitsuneTool_NodeBaker(TOOLS_PT_KitsuneTool_Panel):
@@ -179,4 +170,5 @@ class NODE_PT_KitsuneTool_NodeBaker(TOOLS_PT_KitsuneTool_Panel):
             row.operator(NODE_OT_node_bake_run.bl_idname, text="Bake Selected").all_items = False
             row.operator(NODE_OT_node_bake_run.bl_idname, text="Bake All").all_items = True
 
-            layout.operator(NODE_OT_node_bake_all_materials.bl_idname, text="Bake All Materials", icon='MATERIAL')
+            if listmode == 'ALL':
+                layout.operator(NODE_OT_node_bake_all_materials.bl_idname, text="Bake All Materials", icon='MATERIAL')

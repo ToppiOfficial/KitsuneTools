@@ -42,6 +42,22 @@ for collection in [bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.load
             collection.remove(func)
 
 #
+#   MENU
+#
+
+def draw_node_menu_items(self, context):
+    if context.space_data.tree_type != 'ShaderNodeTree':
+        return
+    self.layout.separator()
+    self.layout.operator(ops_nodeeditor.NODE_OT_copy_node_values.bl_idname, icon='COPYDOWN')
+
+def draw_add_menu_items(self, context):
+    if context.space_data.tree_type != 'ShaderNodeTree':
+        return
+    self.layout.separator()
+    self.layout.operator(ops_nodeeditor.NODE_OT_import_custom_nodes.bl_idname, icon='IMPORT')
+
+#
 #   PROPERTIES
 #
 
@@ -118,6 +134,9 @@ _classes = (
     KitsuneTool_SceneProperties,
     KitsuneTool_MaterialProperties,
 
+    # MENU
+    panels_view3d.TOOLS_MT_KitsuneTool_PoseBoneTools,
+
     # PANELS
     panels_view3d.TOOLS_PT_KitsuneTool_Armature,
     panels_view3d.TOOLS_PT_KitsuneTool_Bone,
@@ -127,7 +146,6 @@ _classes = (
     
     panels_nodeeditor.NODE_UL_nodes_to_bake,
     panels_nodeeditor.NODE_UL_material_list,
-    panels_nodeeditor.NODE_PT_KitsuneTool_custom_nodes,
     panels_nodeeditor.NODE_PT_KitsuneTool_NodeBaker,
 
     # OPERATORS
@@ -136,6 +154,7 @@ _classes = (
     ops_armature.ARMATURE_OT_CopyVisPosture,
     ops_armature.ARMATURE_OT_MergeArmatures,
     ops_armature.ARMATURE_OT_CleanUnWeightedBones,
+    ops_armature.ARMATURE_OT_TransferBoneData,
 
     ops_bone.BONE_OT_MergeBones,
     ops_bone.BONE_OT_ReAlignBones,
@@ -146,6 +165,7 @@ _classes = (
     ops_bone.BONE_OT_FlipBone,
     ops_bone.BONE_OT_CreateCenterBone,
     ops_bone.BONE_OT_SplitActiveWeightLinear,
+    ops_bone.BONE_OT_parent_bone_in_pose,
 
     ops_mesh.MESH_OT_CleanShapeKeys,
     ops_mesh.MESH_OT_RemoveUnusedVertexGroups,
@@ -155,6 +175,8 @@ _classes = (
     ops_mesh.MESH_OT_Select_Faces_by_ImageMask,
     ops_mesh.MESH_OT_transfer_topology_shapekeys,
     ops_mesh.MESH_OT_unlock_all_vertexgroups,
+    ops_mesh.MESH_OT_convex_hull_selection,
+    ops_mesh.MESH_OT_replace_verts_with_spheres,
 
     ops_vertexgroup.VERTEXGROUP_OT_WeightMath,
     ops_vertexgroup.VERTEXGROUP_OT_SwapVertexGroups,
@@ -162,6 +184,7 @@ _classes = (
     ops_vertexgroup.VERTEXGROUP_OT_multi_weight_paint_start,
     ops_vertexgroup.VERTEXGROUP_OT_multi_weight_paint_finish,
     ops_vertexgroup.VERTEXGROUP_OT_multi_weight_paint_cancel,
+    ops_vertexgroup.VERTEXGROUP_OT_TransferSelectedGroup,
 
     ops_action.ACTION_OT_merge_animation_slots,
     ops_action.ACTION_OT_merge_two_actions,
@@ -176,6 +199,8 @@ _classes = (
     ops_nodeeditor.NODE_OT_node_bake_all_materials,
     ops_nodeeditor.NODE_OT_node_bake_remove,
     ops_nodeeditor.NODE_OT_node_bake_run,
+    ops_nodeeditor.NODE_OT_copy_node_values,
+    ops_nodeeditor.NODE_OT_set_copy_input,
 )
 
 def register():
@@ -185,12 +210,26 @@ def register():
     bpy.types.Scene.kitsunetools = utils_contextmanagers.make_pointer(KitsuneTool_SceneProperties)
     bpy.types.Material.kitsunetools = utils_contextmanagers.make_pointer(KitsuneTool_MaterialProperties)
 
+    bpy.types.NODE_MT_node.append(draw_node_menu_items)
+    bpy.types.NODE_MT_add.append(draw_add_menu_items)
+
+    utils_contextmanagers.register_keymap('Node Editor', 'NODE_EDITOR', ops_nodeeditor.NODE_OT_copy_node_values.bl_idname, 'C', ctrl=True, shift=True)
+    utils_contextmanagers.register_keymap('Window', 'EMPTY', 'wm.call_menu', 'P', ctrl=True, shift=True, properties={'name': panels_view3d.TOOLS_MT_KitsuneTool_PoseBoneTools.bl_idname})
+
 def unregister():
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 
+    for km, kmi in utils_contextmanagers.addon_keymaps:
+        km.keymap_items.remove(kmi)
+    utils_contextmanagers.addon_keymaps.clear()
+
+    bpy.types.NODE_MT_node.remove(draw_node_menu_items)
+    bpy.types.NODE_MT_add.remove(draw_add_menu_items)
+
     del bpy.types.Scene.kitsunetools
     del bpy.types.Material.kitsunetools
+    
 
 if __name__ == "__main__":
     register()

@@ -293,7 +293,7 @@ class BONE_OT_SubdivideBone(Operator):
         name='Falloff', 
         min=5, 
         max=20, 
-        default=8,
+        default=10,
         description='Weight falloff curve sharpness (higher = sharper transitions)'
     )
     
@@ -1002,3 +1002,40 @@ class BONE_OT_mirror_by_position(Operator):
             self.report({"INFO"}, f"Mirrored {mirrored} bone(s)")
  
         return {"FINISHED"}
+
+
+class BONE_OT_parent_bone_in_pose(Operator):
+    bl_idname = 'kitsunetools.parent_bone_in_pose'
+    bl_label = 'Parent Bone in Pose'
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        if not is_armature(ob): return False
+        if ob.mode != 'POSE': return False
+
+        selected_bones = [pb for pb in ob.pose.bones if pb.bone.select and not pb.bone.hide]
+        return len(selected_bones) > 1 and context.active_pose_bone is not None
+    
+    def execute(self, context) -> set:
+        ob = context.active_object
+
+        if not is_armature(ob):
+            self.report({'WARNING'}, 'No armature selected')
+            return {'CANCELLED'}
+
+        active_bone = ob.data.bones[context.active_pose_bone.name]
+        sel_bones = get_selected_bones(ob, sort_type='TO_FIRST', bone_type='BONE', exclude_active=True)
+
+        if not sel_bones or active_bone.name not in ob.data.bones:
+            self.report({'WARNING'}, 'No bones selected')
+            return {'CANCELLED'}
+        
+        with preserve_context_mode(ob,'EDIT'):
+            active_editbone = ob.data.edit_bones.get(active_bone.name)
+            for bone in sel_bones:
+                editbone = ob.data.edit_bones.get(bone.name)
+                editbone.parent = active_editbone
+
+        return {'FINISHED'}
