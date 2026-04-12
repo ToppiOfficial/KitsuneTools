@@ -2,7 +2,7 @@ import bpy
 from mathutils import Matrix
 from bpy.types import Object, Bone, PoseBone, EditBone
 from .utils_object import get_armature_meshes, is_armature
-from .utils_contextmanagers import selfreport, preserve_armature_state, preserve_context_mode, unhide_all_objects, report
+from .utils_contextmanagers import selfreport, preserve_armature_state, preserve_context_mode, unhide_all_objects, report, copy_property_group, copy_addon_properties
 from .utils_object import op_override, apply_armature_to_mesh_without_shape_keys, apply_armature_to_mesh_with_shapekeys, reevaluate_bone_parented_empty_matrix
 from .utils_vertexgroup import get_used_vertexgroups
 
@@ -578,78 +578,6 @@ def merge_armatures( source_arm: Object, target_arm: Object, match_posture: bool
             bpy.context.view_layer.update()
             bpy.context.view_layer.depsgraph.update()
 
-# TODO: Use this for KitsuneSourceTool for copying .vs properties
-# Can these be simplified??
-def _copy_property_group(src, dst, _visited=None):
-    if _visited is None:
-        _visited = set()
-    src_id = id(src)
-    if src_id in _visited:
-        return
-    _visited.add(src_id)
-
-    for prop in src.bl_rna.properties:
-        if prop.identifier in ('rna_type', 'name'):
-            continue
-        if prop.is_readonly:
-            continue
-        if prop.type == 'COLLECTION':
-            continue
-
-        try:
-            src_val = getattr(src, prop.identifier)
-            dst_val = getattr(dst, prop.identifier, None)
-        except Exception:
-            continue
-
-        if prop.type == 'POINTER':
-            if src_val is not None and dst_val is not None and hasattr(src_val, 'bl_rna'):
-                _copy_property_group(src_val, dst_val, _visited)
-            continue
-
-        try:
-            if hasattr(src_val, 'copy'):
-                setattr(dst, prop.identifier, src_val.copy())
-            elif prop.is_array:
-                setattr(dst, prop.identifier, src_val[:])
-            else:
-                setattr(dst, prop.identifier, src_val)
-        except Exception:
-            pass
-
-    if isinstance(src, bpy.types.PropertyGroup):
-        for key, value in src.items():
-            if key.startswith('_'):
-                continue
-            try:
-                dst[key] = value
-            except Exception:
-                pass
-
-def _copy_addon_properties(src, dst, _visited=None):
-    if _visited is None:
-        _visited = set()
-    src_id = id(src)
-    if src_id in _visited:
-        return
-    _visited.add(src_id)
-
-    for attr in dir(src):
-        if attr.startswith('_'):
-            continue
-        try:
-            src_val = getattr(src, attr)
-            dst_val = getattr(dst, attr, None)
-        except Exception:
-            continue
-
-        if dst_val is None:
-            continue
-        if not isinstance(src_val, bpy.types.PropertyGroup):
-            continue
-
-        _copy_property_group(src_val, dst_val, _visited)
-
 
 def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, bone_filter: set = None, data_mode: str = 'ALL', sync_bone_collections: bool = False):
     from .utils_bone import get_bone_exportname
@@ -779,14 +707,14 @@ def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, 
                         src_pb = source_arm.pose.bones.get(source_name)
                         dst_pb = target_arm.pose.bones.get(target_name)
                         if src_pb and dst_pb:
-                            _copy_property_group(src_pb, dst_pb)
-                            _copy_addon_properties(src_pb, dst_pb)
+                            copy_property_group(src_pb, dst_pb)
+                            copy_addon_properties(src_pb, dst_pb)
 
                         src_b = source_arm.data.bones.get(source_name)
                         dst_b = target_arm.data.bones.get(target_name)
                         if src_b and dst_b:
-                            _copy_property_group(src_b, dst_b)
-                            _copy_addon_properties(src_b, dst_b)
+                            copy_property_group(src_b, dst_b)
+                            copy_addon_properties(src_b, dst_b)
 
                 print(f"    Updated {len(shared)} shared bone(s)")
 

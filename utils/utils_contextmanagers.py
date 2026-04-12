@@ -3,6 +3,10 @@ from bpy.props import PointerProperty
 from functools import wraps
 from contextlib import contextmanager
 
+#
+#   VARIABLES
+#
+
 MODE_MAP = {
     "OBJECT": "OBJECT",
     "EDIT_ARMATURE": "EDIT",
@@ -28,8 +32,9 @@ EDIT_MODE_MAP = (
 )
 
 _undo_depth = 0
-
-addon_keymaps = []
+_addon_keymaps = []
+_report_buffer = []
+_nesting_level = 0
 
 #
 #   MODULES
@@ -52,7 +57,7 @@ def register_keymap(name, space_type, idname, type, ctrl=False, shift=False, alt
     if properties:
         for key, value in properties.items():
             setattr(kmi.properties, key, value)
-    addon_keymaps.append((km, kmi))
+    _addon_keymaps.append((km, kmi))
     
 #
 #   CONTEXT & SCENE MANAGERS
@@ -375,8 +380,6 @@ def preserve_context_mode(obj: bpy.types.Object | None = None, mode: str = "EDIT
 #   SELF REPORT
 #
 
-_report_buffer = []
-_nesting_level = 0
 
 def report(level, message):
     _report_buffer.append((level, message))
@@ -438,3 +441,81 @@ def flush_reports(operator):
     for level, message in _report_buffer:
         operator.report({level}, message)
     _report_buffer.clear()
+
+
+#
+#   OBJECT PROPERTIES
+#
+
+# TODO: Use this for KitsuneSourceTool for copying .vs properties
+# Can these be simplified??
+def copy_property_group(src, dst, _visited=None):
+    if _visited is None:
+        _visited = set()
+    src_id = id(src)
+    if src_id in _visited:
+        return
+    _visited.add(src_id)
+
+    for prop in src.bl_rna.properties:
+        if prop.identifier in ('rna_type', 'name'):
+            continue
+        if prop.is_readonly:
+            continue
+        if prop.type == 'COLLECTION':
+            continue
+
+        try:
+            src_val = getattr(src, prop.identifier)
+            dst_val = getattr(dst, prop.identifier, None)
+        except Exception:
+            continue
+
+        if prop.type == 'POINTER':
+            if src_val is not None and dst_val is not None and hasattr(src_val, 'bl_rna'):
+                copy_property_group(src_val, dst_val, _visited)
+            continue
+
+        try:
+            if hasattr(src_val, 'copy'):
+                setattr(dst, prop.identifier, src_val.copy())
+            elif prop.is_array:
+                setattr(dst, prop.identifier, src_val[:])
+            else:
+                setattr(dst, prop.identifier, src_val)
+        except Exception:
+            pass
+
+    if isinstance(src, bpy.types.PropertyGroup):
+        for key, value in src.items():
+            if key.startswith('_'):
+                continue
+            try:
+                dst[key] = value
+            except Exception:
+                pass
+
+
+def copy_addon_properties(src, dst, _visited=None):
+    if _visited is None:
+        _visited = set()
+    src_id = id(src)
+    if src_id in _visited:
+        return
+    _visited.add(src_id)
+
+    for attr in dir(src):
+        if attr.startswith('_'):
+            continue
+        try:
+            src_val = getattr(src, attr)
+            dst_val = getattr(dst, attr, None)
+        except Exception:
+            continue
+
+        if dst_val is None:
+            continue
+        if not isinstance(src_val, bpy.types.PropertyGroup):
+            continue
+
+        copy_property_group(src_val, dst_val, _visited)

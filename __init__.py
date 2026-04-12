@@ -220,9 +220,9 @@ def unregister():
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 
-    for km, kmi in utils_contextmanagers.addon_keymaps:
+    for km, kmi in utils_contextmanagers._addon_keymaps:
         km.keymap_items.remove(kmi)
-    utils_contextmanagers.addon_keymaps.clear()
+    utils_contextmanagers._addon_keymaps.clear()
 
     bpy.types.NODE_MT_node.remove(draw_node_menu_items)
     bpy.types.NODE_MT_add.remove(draw_add_menu_items)
