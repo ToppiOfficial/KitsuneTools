@@ -563,7 +563,7 @@ class VERTEXGROUP_OT_multi_weight_paint_cancel(Operator):
 
 class VERTEXGROUP_OT_TransferSelectedGroup(Operator):
     bl_idname = "kitsunetools.transfer_selected_group"
-    bl_label = "Transfer Selected Group"
+    bl_label = "Transfer Vertex Groups (Topology & Selected Pose Bones)"
     bl_description = (
         "Select: source mesh, receiver mesh, receiver's armature (active). "
         "In Pose Mode, select a bone — copies its vertex group from source to receiver by topology."
@@ -660,4 +660,30 @@ class VERTEXGROUP_OT_TransferSelectedGroup(Operator):
                 f"No groups transferred. Skipped: {', '.join(skipped)}")
 
         return {'FINISHED'}
+
+
+class VERTEXGROUP_OT_unlock_all_vertexgroups(bpy.types.Operator):
+    bl_idname = "kitsunetools.unlock_all_vertexgroups"
+    bl_label = "Unlock All (All Selected)"
+    bl_options = {'REGISTER', 'UNDO'}
     
+    @classmethod
+    def poll(cls, context):
+        return (context.active_object is not None and 
+                context.active_object.type == 'MESH')
+    
+    def execute(self, context) -> set:
+        selected_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+
+        unlocked_count = 0
+
+        for mesh in selected_objects:
+            vgroups = mesh.vertex_groups
+            for vgroup in vgroups:
+
+                if vgroup.lock_weight:
+                    vgroup.lock_weight = False
+                    unlocked_count += 1
+                
+        self.report({'INFO'}, f"Unlocked {unlocked_count} vertex group(s)")
+        return {'FINISHED'}

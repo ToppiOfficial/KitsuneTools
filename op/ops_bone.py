@@ -1,6 +1,6 @@
 import bpy
 from bpy.types import Operator
-from bpy.props import EnumProperty, BoolProperty, FloatProperty, IntProperty
+from bpy.props import EnumProperty, BoolProperty, FloatProperty, IntProperty, StringProperty
 from mathutils import Matrix, Vector
 from ..utils.utils_object import is_armature, is_mesh, get_armature
 from ..utils.utils_armature import get_armature_meshes, preserve_context_mode, get_selected_bones, get_visible_bones
@@ -319,58 +319,48 @@ class BONE_OT_SubdivideBone(Operator):
     
     @classmethod
     def poll(cls, context) -> bool:
-        ob = context.active_object
-        if ob is None: return False
-        if is_armature(ob): return ob.mode in {'EDIT', 'POSE'}
-        if is_mesh(ob): return ob.mode == 'WEIGHT_PAINT'
+        selected_arms = [ob for ob in context.selected_objects if is_armature(ob)]
+        if selected_arms:
+            return context.mode in {'POSE', 'EDIT_ARMATURE'}
+        if is_mesh(context.active_object):
+            return context.mode == 'WEIGHT_PAINT'
         return False
-    
+
     def invoke(self, context, event) -> set:
-        ob  = context.active_object
-        if ob.mode in ['POSE', 'WEIGHT_PAINT']:
-            if any([b for b in get_armature(context.active_object).data.bones if b.select]):
-                return context.window_manager.invoke_props_dialog(self)
-        elif ob.mode == 'EDIT':
-            if any([b for b in get_armature(context.active_object).data.edit_bones if b.select]):
+        selected_arms = [ob for ob in context.selected_objects if is_armature(ob)]
+        
+        if context.mode in {'POSE', 'EDIT_ARMATURE'}:
+            has_selection = any(
+                b for arm in selected_arms
+                for b in (arm.data.bones if context.mode == 'POSE' else arm.data.edit_bones)
+                if b.select
+            )
+            if has_selection:
                 return context.window_manager.invoke_props_dialog(self)
         return {'CANCELLED'}
 
-    def draw(self, context) -> None:
-        layout = self.layout
-        
-        col = layout.column(align=True)
-        col.prop(self, 'subdivisions')
-        
-        layout.separator()
-        
-        col = layout.column(align=True)
-        col.label(text="Weight Distribution:")
-        col.prop(self, 'falloff')
-        col.prop(self, 'smoothness')
-
-        layout.separator()
-        if self.weights_only:
-            col = layout.column(align=True)
-            col.prop(self, 'skip_original_bone')
-
     def execute(self, context) -> set:
-        arm = get_armature(context.active_object)
+        selected_arms = [ob for ob in context.selected_objects if is_armature(ob)]
         
-        if arm is None: return {'CANCELLED'}
-        
-        with preserve_context_mode(context.active_object, 'OBJECT'):
-            context.view_layer.objects.active = arm
-            
-            bones = get_selected_bones(arm, bone_type='POSEBONE')
-            boneNames = [b.name for b in bones]
-            
-            if bones is None or boneNames is None:
-                return {'CANCELLED'}
-            
-            bpy.ops.object.mode_set(mode='EDIT')
-            subdivide_bone(boneNames, arm, self.subdivisions, weights_only=self.weights_only,
-                       falloff=self.falloff, smoothness=self.smoothness, skip_original_bone=self.skip_original_bone)
+        if not selected_arms:
+            return {'CANCELLED'}
 
+        original_active = context.view_layer.objects.active
+
+        for arm in selected_arms:
+            bones = get_selected_bones(arm, bone_type='POSEBONE')
+            if not bones:
+                continue
+
+            bone_names = [b.name for b in bones]
+
+            with preserve_context_mode(arm, 'OBJECT'):
+                context.view_layer.objects.active = arm
+                bpy.ops.object.mode_set(mode='EDIT')
+                subdivide_bone(bone_names, arm, self.subdivisions, weights_only=self.weights_only,
+                            falloff=self.falloff, smoothness=self.smoothness, skip_original_bone=self.skip_original_bone)
+
+        context.view_layer.objects.active = original_active
         return {'FINISHED'}
 
 
@@ -920,7 +910,7 @@ class BONE_OT_align_bone_to_axis(Operator):
 
         self.report({'INFO'}, f'Aligned {processed_bone} bones to {self.axis} axis')
         return {'FINISHED'}
-
+    
 
 class BONE_OT_mirror_by_position(Operator):
     bl_idname = "kitsunetools.mirror_by_position"
@@ -1038,4 +1028,35 @@ class BONE_OT_parent_bone_in_pose(Operator):
                 editbone = ob.data.edit_bones.get(bone.name)
                 editbone.parent = active_editbone
 
+        return {'FINISHED'}
+    
+
+class BONE_OT_RemoveBone(Operator):
+    bl_idname = 'kitsunetools.remove_bone'
+    bl_label = 'Remove Bone'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    selected_bone : StringProperty(name='Selected Bone', default='')
+
+    @classmethod
+    def poll(cls, context) -> bool:
+        return is_armature(context.active_object)
+
+    def invoke(self, context, event) -> set:
+        return context.window_manager.invoke_props_dialog(self)
+    
+    def draw(self, context):
+        self.layout.prop_search(self,'selected_bone',context.active_object.data,'bones', text='Bone')
+
+    def execute(self, context) -> set:
+        armature = get_armature(context.active_object)
+
+        if not armature:
+            self.report({'WARNING'}, 'No armature selected')
+            return {'CANCELLED'}
+
+        with preserve_context_mode(armature, 'EDIT'):
+            remove_bone(armature, self.selected_bone)
+
+        self.report({'INFO'}, f'Removed bone {self.selected_bone}')
         return {'FINISHED'}

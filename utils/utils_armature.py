@@ -623,6 +623,50 @@ def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, 
                     print(f"    No shared bones found, skipping")
                     continue
 
+                if sync_bone_collections:
+                    def find_collection(collections, name):
+                        for col in collections:
+                            if col.name == name:
+                                return col
+                            found = find_collection(col.children, name)
+                            if found:
+                                return found
+                        return None
+
+                    def ensure_collection(arm_data, src_col):
+                        existing = find_collection(arm_data.collections, src_col.name)
+                        if existing:
+                            if src_col.parent:
+                                parent = ensure_collection(arm_data, src_col.parent)
+                                if existing.parent != parent:
+                                    existing.parent = parent
+                            else:
+                                if existing.parent is not None:
+                                    existing.parent = None
+                            existing.is_visible = src_col.is_visible
+                            return existing
+
+                        new_col = arm_data.collections.new(src_col.name)
+                        new_col.is_visible = src_col.is_visible
+                        if src_col.parent:
+                            parent = ensure_collection(arm_data, src_col.parent)
+                            new_col.parent = parent
+                        return new_col
+
+                    for src_col in source_arm.data.collections:
+                        ensure_collection(target_arm.data, src_col)
+
+                    for bone in target_arm.data.bones:
+                        src_b = source_arm.data.bones.get(shared.get(bone.name, ""))
+                        if not src_b:
+                            continue
+                        for col in list(bone.collections):
+                            col.unassign(bone)
+                        for src_col in src_b.collections:
+                            dst_col = find_collection(target_arm.data.collections, src_col.name)
+                            if dst_col:
+                                dst_col.assign(bone)
+
                 if data_mode in ('ALL', 'TRANSFORMS'):
                     bpy.context.view_layer.objects.active = source_arm
                     bpy.ops.object.mode_set(mode='EDIT')
@@ -681,27 +725,6 @@ def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, 
                     bpy.ops.object.mode_set(mode='OBJECT')
 
                 if data_mode in ('ALL', 'PROPERTIES'):
-                    if sync_bone_collections:
-                        source_collection_map = {
-                            col.name: col
-                            for col in source_arm.data.collections
-                        }
-                        for target_name, source_name in shared.items():
-                            src_b = source_arm.data.bones.get(source_name)
-                            dst_b = target_arm.data.bones.get(target_name)
-                            if not src_b or not dst_b:
-                                continue
-                            src_collection_names = {col.name for col in src_b.collections}
-                            dst_collection_names = {col.name for col in dst_b.collections}
-                            if src_collection_names == dst_collection_names:
-                                continue
-                            for col in list(dst_b.collections):
-                                col.unassign(dst_b)
-                            for col_name in src_collection_names:
-                                dst_col = target_arm.data.collections.get(col_name)
-                                if dst_col is None:
-                                    dst_col = target_arm.data.collections.new(col_name)
-                                dst_col.assign(dst_b)
 
                     for target_name, source_name in shared.items():
                         src_pb = source_arm.pose.bones.get(source_name)

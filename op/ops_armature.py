@@ -510,18 +510,16 @@ class ARMATURE_OT_TransferBoneData(Operator):
             self.report({'WARNING'}, "Must be in Pose Mode to use 'Selected Pose Bones'.")
             return {'CANCELLED'}
 
-        if self.mode == 'COLLECTION':
-            return context.window_manager.invoke_props_dialog(self)
-
-        return self.execute(context)
+        return context.window_manager.invoke_props_dialog(self)
 
     def draw(self, context: Context):
         layout = self.layout
-        layout.prop_search(self, "collection_name", context.active_object.data, "collections", text="Collection")
-        layout.prop(self, "include_child_collections")
         layout.prop(self, "data_mode")
         if self.data_mode in ('ALL', 'PROPERTIES'):
             layout.prop(self, "sync_bone_collections")
+        if self.mode == 'COLLECTION':
+            layout.prop_search(self, "collection_name", context.active_object.data, "collections", text="Collection")
+            layout.prop(self, "include_child_collections")
 
     def execute(self, context: Context) -> set:
         active_object = context.active_object

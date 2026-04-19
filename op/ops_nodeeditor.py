@@ -236,12 +236,22 @@ class NODE_OT_node_bake_run(Operator):
         old_engine = scene.render.engine
         old_transform = scene.view_settings.view_transform
         old_format = scene.render.image_settings.file_format
+        old_cycles_device = scene.cycles.device
 
         scene.render.engine = 'CYCLES'
         scene.cycles.bake_type = 'EMIT'
         scene.view_settings.view_transform = 'Standard'
 
-        print(f"      Running bpy.ops.object.bake...")
+        cycles_addon = bpy.context.preferences.addons.get('cycles')
+        if cycles_addon:
+            cprefs = cycles_addon.preferences
+            cprefs.refresh_devices()
+            has_gpu = any(d.type != 'CPU' for d in cprefs.devices)
+            scene.cycles.device = 'GPU' if has_gpu else 'CPU'
+        else:
+            scene.cycles.device = 'CPU'
+
+        print(f"      Running bpy.ops.object.bake (device={scene.cycles.device})...")
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
         context.view_layer.objects.active = obj
@@ -263,6 +273,7 @@ class NODE_OT_node_bake_run(Operator):
         bpy.data.images.remove(bake_img)
 
         scene.render.engine = old_engine
+        scene.cycles.device = old_cycles_device
         scene.view_settings.view_transform = old_transform
         scene.render.image_settings.file_format = old_format
 

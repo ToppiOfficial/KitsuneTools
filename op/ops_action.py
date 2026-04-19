@@ -54,19 +54,22 @@ class ACTION_OT_merge_animation_slots(Operator):
     )
 
     def invoke(self, context, event) -> set:
-        if bpy.data.actions:
+        anim = context.active_object.animation_data if context.active_object else None
+        if anim and anim.action:
+            self.action_1 = anim.action.name
+            self.slot_1 = (anim.action_slot.name_display if anim.action_slot
+                           else (anim.action.slots[0].name_display if anim.action.slots else ""))
+        elif bpy.data.actions:
             self.action_1 = bpy.data.actions[0].name
+            act1 = bpy.data.actions[0]
+            self.slot_1 = act1.slots[0].name_display if act1.slots else ""
+
+        if bpy.data.actions:
             self.action_2 = bpy.data.actions[0].name
+            act2 = bpy.data.actions[0]
+            self.slot_2 = act2.slots[0].name_display if act2.slots else ""
             self.existing_action = bpy.data.actions[0].name
-            
-            act1 = bpy.data.actions.get(self.action_1)
-            if act1 and act1.slots:
-                self.slot_1 = act1.slots[0].name_display
-            
-            act2 = bpy.data.actions.get(self.action_2)
-            if act2 and act2.slots:
-                self.slot_2 = act2.slots[0].name_display
-        
+
         return context.window_manager.invoke_props_dialog(self, width=400)
 
     def draw(self, context) -> None:
@@ -193,6 +196,7 @@ class ACTION_OT_merge_animation_slots(Operator):
         self.report({'INFO'}, f"Merged '{act1.name}:{slot1.name_display}' + '{act2.name}:{slot2.name_display}' into '{new_action.name}:{new_slot.name_display}'")
         return {'FINISHED'}
 
+
 class ACTION_OT_convert_rotation_keyframes(Operator):
     bl_idname = 'kitsunetools.convert_rotation_keyframes'
     bl_label = 'Convert Rotation Keyframes'
@@ -223,12 +227,16 @@ class ACTION_OT_convert_rotation_keyframes(Operator):
     )
 
     def invoke(self, context, event) -> set:
-        if bpy.data.actions:
+        anim = context.active_object.animation_data if context.active_object else None
+        if anim and anim.action:
+            self.action_name = anim.action.name
+            self.slot_name = (anim.action_slot.name_display if anim.action_slot
+                              else (anim.action.slots[0].name_display if anim.action.slots else ""))
+        elif bpy.data.actions:
             self.action_name = bpy.data.actions[0].name
-            act = bpy.data.actions.get(self.action_name)
-            if act and act.slots:
-                self.slot_name = act.slots[0].name_display
-        
+            act = bpy.data.actions[0]
+            self.slot_name = act.slots[0].name_display if act.slots else ""
+
         return context.window_manager.invoke_props_dialog(self, width=400)
 
     def draw(self, context) -> None:
@@ -343,6 +351,7 @@ class ACTION_OT_convert_rotation_keyframes(Operator):
         target_type = "Quaternion" if is_to_quat else self.conversion_mode
         self.report({'INFO'}, f"Converted rotation keyframes to {target_type} in '{action.name}:{slot.name_display}'")
         return {'FINISHED'}
+
 
 class ACTION_OT_merge_two_actions(Operator):
     bl_idname = 'kitsunetools.merge_two_actions'
@@ -559,7 +568,8 @@ class ACTION_OT_merge_two_actions(Operator):
                 target_fcurve.keyframe_points.insert(frame=frame, value=new_value, options={'REPLACE'})
             else:
                 target_fcurve.keyframe_points.insert(frame=frame, value=value, options={'FAST'})
-                
+
+
 class ACTION_OT_delete_action_slot(Operator):
     bl_idname = 'kitsunetools.delete_action_slot'
     bl_label = 'Delete Action Slot'
@@ -581,10 +591,12 @@ class ACTION_OT_delete_action_slot(Operator):
     def invoke(self, context, event) -> set:
         obj = context.active_object
         action = obj.animation_data.action
-        
+
         if action and action.slots:
-            self.slot_name = action.slots[0].name_display
-        
+            anim = obj.animation_data
+            self.slot_name = (anim.action_slot.name_display if anim.action_slot
+                              else action.slots[0].name_display)
+
         return context.window_manager.invoke_props_dialog(self, width=350)
 
     def draw(self, context) -> None:
@@ -619,7 +631,8 @@ class ACTION_OT_delete_action_slot(Operator):
         
         self.report({'INFO'}, f"Deleted slot '{slot_name}' from action '{action.name}'")
         return {'FINISHED'}
-    
+
+  
 class ACTION_OT_propagate_pose_offset(Operator):
     bl_idname = 'kitsunetools.propagate_pose_offset'
     bl_label = 'Propagate Pose Offset to Keyframes'
@@ -651,11 +664,12 @@ class ACTION_OT_propagate_pose_offset(Operator):
     def invoke(self, context, event) -> set:
         obj = context.active_object
         if obj.animation_data and obj.animation_data.action:
-            action = obj.animation_data.action
+            anim = obj.animation_data
+            action = anim.action
             self.action_name = action.name
-            if action.slots:
-                self.slot_name = action.slots[0].name_display
-        
+            self.slot_name = (anim.action_slot.name_display if anim.action_slot
+                              else (action.slots[0].name_display if action.slots else ""))
+
         return context.window_manager.invoke_props_dialog(self, width=400)
 
     def draw(self, context) -> None:
@@ -818,7 +832,8 @@ class ACTION_OT_propagate_pose_offset(Operator):
         else:
             self.report({'WARNING'}, "No keyframes found for selected bones")
             return {'CANCELLED'}
-        
+
+    
 class ACTION_OT_copy_bone_keyframes(Operator):
     bl_idname = 'kitsunetools.copy_bone_keyframes'
     bl_label = 'Copy Bone Keyframes'
@@ -874,15 +889,13 @@ class ACTION_OT_copy_bone_keyframes(Operator):
 
     def invoke(self, context, event) -> set:
         obj = context.active_object
-        action = obj.animation_data.action
-        
+        anim = obj.animation_data
+        action = anim.action
+
         self.action_name = action.name
-        
-        if hasattr(obj.animation_data, 'action_slot') and obj.animation_data.action_slot:
-            self.slot_name = obj.animation_data.action_slot.name_display
-        elif action.slots:
-            self.slot_name = action.slots[0].name_display
-        
+        self.slot_name = (anim.action_slot.name_display if anim.action_slot
+                          else (action.slots[0].name_display if action.slots else ""))
+
         return context.window_manager.invoke_props_dialog(self, width=400)
 
     def draw(self, context) -> None:
@@ -895,13 +908,11 @@ class ACTION_OT_copy_bone_keyframes(Operator):
         box.label(text="Source:", icon='ACTION')
         
         row = box.row()
-        row.enabled = False
         row.prop_search(self, "action_name", bpy.data, "actions", text="Action")
         
         act = bpy.data.actions.get(self.action_name)
         if act and act.slots:
             row = box.row()
-            row.enabled = False
             row.prop_search(self, "slot_name", act, "slots", text="Slot")
         
         box.separator()
@@ -993,10 +1004,11 @@ class ACTION_OT_copy_bone_keyframes(Operator):
         else:
             self.report({'WARNING'}, "No keyframes matched the selected copy options")
             return {'CANCELLED'}
-        
+
+
 class ACTION_OT_Make_Proportion_Animation(Operator):
     bl_idname = 'tools.create_proportion_actions'
-    bl_label = 'Create Delta Proportion Pose'
+    bl_label = 'Create Delta Proportion Pose Actions'
     bl_options = {'REGISTER', 'UNDO'}
 
     ProportionName: StringProperty(name='Proportion Slot Name', default='proportion')

@@ -53,7 +53,7 @@ class MESH_OT_CleanShapeKeys(Operator):
         return {'FINISHED'}
 
 
-class MESH_OT_SelectShapekeyVets(Operator):
+class MESH_OT_SelectShapekeyVerts(Operator):
     bl_idname = 'kitsunetools.select_shapekey_vertices'
     bl_label = 'Select Shapekey Vertices'
     bl_options = {'REGISTER', 'UNDO'}
@@ -520,33 +520,6 @@ class MESH_OT_transfer_topology_shapekeys(bpy.types.Operator):
             self.report({'WARNING'}, "No shape keys transferred")
             return {'CANCELLED'}
     
-        
-class MESH_OT_unlock_all_vertexgroups(bpy.types.Operator):
-    bl_idname = "kitsunetools.unlock_all_vertexgroups"
-    bl_label = "Unlock All Vertex Groups"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    @classmethod
-    def poll(cls, context):
-        return (context.active_object is not None and 
-                context.active_object.type == 'MESH')
-    
-    def execute(self, context) -> set:
-        selected_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
-
-        unlocked_count = 0
-
-        for mesh in selected_objects:
-            vgroups = mesh.vertex_groups
-            for vgroup in vgroups:
-
-                if vgroup.lock_weight:
-                    vgroup.lock_weight = False
-                    unlocked_count += 1
-                
-        self.report({'INFO'}, f"Unlocked {unlocked_count} vertex group(s)")
-        return {'FINISHED'}
-
 
 class MESH_OT_CleanDuplicateMaterials(Operator):
     bl_idname = "kitsunetools.clean_duplicate_materials"
@@ -628,6 +601,23 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
         max=3.14159,
         subtype='ANGLE'
     )
+    decimation_factor: bpy.props.FloatProperty(
+        name="Decimation Factor",
+        description="Decimate the convex hull mesh. A value of 1.0 skips decimation",
+        default=0.22,
+        min=0.001,
+        max=1.0
+    )
+    clean_modifiers: bpy.props.BoolProperty(
+        name="Clean Modifiers",
+        description="Remove all modifiers from the physics mesh after hull conversion",
+        default=True
+    )
+    clean_vertex_groups: bpy.props.BoolProperty(
+        name="Clean Vertex Groups",
+        description="Remove all vertex groups from the physics mesh after hull conversion",
+        default=True
+    )
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
@@ -641,22 +631,38 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
         )
 
     def execute(self, context) -> set:
-        original_obj = context.active_object
+        active_obj = context.active_object
+        edit_mode_objects = set(context.objects_in_mode)
 
-        with preserve_context_mode(original_obj, 'EDIT'):
+        with preserve_context_mode(active_obj, 'EDIT'):
             if self.keep_original:
                 bpy.ops.mesh.duplicate()
 
             bpy.ops.mesh.separate(type='SELECTED')
             bpy.ops.object.mode_set(mode='OBJECT')
 
-            new_obj = next(
-                obj for obj in context.selected_objects if obj != original_obj
-            )
+            separated_objs = [obj for obj in context.selected_objects if obj not in edit_mode_objects]
+
+            if not separated_objs:
+                self.report({'WARNING'}, "No geometry was separated")
+                return {'CANCELLED'}
 
             bpy.ops.object.select_all(action='DESELECT')
-            new_obj.select_set(True)
-            context.view_layer.objects.active = new_obj
+            for obj in separated_objs:
+                obj.select_set(True)
+            context.view_layer.objects.active = separated_objs[0]
+
+            if len(separated_objs) > 1:
+                bpy.ops.object.join()
+
+            new_obj = context.active_object
+            new_obj.name = f"{active_obj.name}_physicsmesh"
+            new_obj.data.materials.clear()
+
+            if self.clean_modifiers:
+                new_obj.modifiers.clear()
+            if self.clean_vertex_groups:
+                new_obj.vertex_groups.clear()
 
             bpy.ops.object.mode_set(mode='EDIT')
             bpy.ops.mesh.select_all(action='SELECT')
@@ -668,6 +674,14 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
                 face_threshold=self.face_threshold,
                 shape_threshold=self.shape_threshold
             )
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+            if self.decimation_factor < 1.0:
+                mod = new_obj.modifiers.new(name="Decimate", type='DECIMATE')
+                mod.ratio = self.decimation_factor
+                bpy.ops.object.modifier_apply(modifier=mod.name)
+
+            bpy.ops.object.shade_smooth()
 
         self.report({'INFO'}, f"Convex hull created: {new_obj.name}")
         return {'FINISHED'}

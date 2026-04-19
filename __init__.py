@@ -1,6 +1,6 @@
 import bpy, importlib, sys
 from bpy.types import PropertyGroup, Material
-from bpy.props import EnumProperty, BoolProperty, StringProperty, IntProperty, CollectionProperty
+from bpy.props import EnumProperty, BoolProperty, StringProperty, IntProperty, CollectionProperty, FloatProperty
 
 from .gui import (
     panels_view3d,
@@ -22,7 +22,8 @@ from .utils import (
     utils_vertexgroup,
     utils_bone,
     utils_material,
-    utils_mesh
+    utils_mesh,
+    utils_pose
 )
 
 #
@@ -56,6 +57,55 @@ def draw_add_menu_items(self, context):
         return
     self.layout.separator()
     self.layout.operator(ops_nodeeditor.NODE_OT_import_custom_nodes.bl_idname, icon='IMPORT')
+
+def draw_vertex_group_menu_items(self, context):
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_unlock_all_vertexgroups.bl_idname, icon='UNLOCKED')
+    self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_TransferSelectedGroup.bl_idname, icon='MOD_DATA_TRANSFER')
+
+def draw_shapekey_menu_items(self, context):
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_mesh.MESH_OT_CleanShapeKeys.bl_idname)
+    self.layout.operator(ops_mesh.MESH_OT_SelectShapekeyVerts.bl_idname, icon='SELECT_SET')
+    self.layout.operator(ops_mesh.MESH_OT_transfer_topology_shapekeys.bl_idname, icon='MOD_DATA_TRANSFER')
+
+def draw_edit_mesh_menu_items(self, context):
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_mesh.MESH_OT_convex_hull_selection.bl_idname)
+    self.layout.operator(ops_mesh.MESH_OT_Delete_Faces_by_ImageMask.bl_idname, icon='UV_FACESEL')
+
+def draw_select_edit_mesh_menu_items(self, context):
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_mesh.MESH_OT_Select_Faces_by_ImageMask.bl_idname)
+
+def draw_object_menu_items(self, context):
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_armature.ARMATURE_OT_MergeArmatures.bl_idname)
+
+def draw_object_cleanup_menu_items(self, context):
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_armature.ARMATURE_OT_CleanUnWeightedBones.bl_idname)
+    self.layout.operator(ops_mesh.MESH_OT_RemoveUnusedVertexGroups.bl_idname)
+    self.layout.operator(ops_mesh.MESH_OT_CleanDuplicateMaterials.bl_idname)
+
+def draw_edit_bone_menu_items(self, context):
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_bone.BONE_OT_FlipBone.bl_idname)
+    self.layout.operator(ops_bone.BONE_OT_SubdivideBone.bl_idname, text='Subdivide (With Weights)').weights_only = False
+    self.layout.operator(ops_bone.BONE_OT_mirror_by_position.bl_idname, icon='MOD_MIRROR')
+    self.layout.operator(ops_bone.BONE_OT_CreateCenterBone.bl_idname)
+    self.layout.operator(ops_bone.BONE_OT_RemoveBone.bl_idname, icon='TRASH')
+
+def draw_action_menu_items(self, context):
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_action.ACTION_OT_delete_action_slot.bl_idname)
+    self.layout.operator(ops_action.ACTION_OT_merge_two_actions.bl_idname)
+    self.layout.operator(ops_action.ACTION_OT_merge_animation_slots.bl_idname)
+    self.layout.operator(ops_action.ACTION_OT_convert_rotation_keyframes.bl_idname)
+    self.layout.operator(ops_action.ACTION_OT_copy_bone_keyframes.bl_idname)
+    self.layout.operator(ops_action.ACTION_OT_propagate_pose_offset.bl_idname)
+
+
 
 #
 #   PROPERTIES
@@ -124,6 +174,16 @@ class KitsuneTool_MaterialProperties(PropertyGroup):
     node_baker_list : CollectionProperty(type=BakeNodeItem)
     node_baker_list_index : IntProperty(default=-1)
 
+
+class KitsuneTool_ArmatureProperties(PropertyGroup):
+    x_mirror_pose: BoolProperty(name="X Mirror Pose",
+        description="Automatically mirror selected bone transforms across the X axis in Pose Mode",
+        default=False)
+    
+    x_mirror_tolerance: FloatProperty(name="Mirror Tolerance",
+        description="Distance threshold for finding the opposing mirror bone",
+        default=0.001,min=0.0,precision=4,)
+
 #
 #   CLASSES
 #
@@ -133,6 +193,7 @@ _classes = (
     BakeNodeItem,
     KitsuneTool_SceneProperties,
     KitsuneTool_MaterialProperties,
+    KitsuneTool_ArmatureProperties,
 
     # MENU
     panels_view3d.TOOLS_MT_KitsuneTool_PoseBoneTools,
@@ -140,9 +201,9 @@ _classes = (
     # PANELS
     panels_view3d.TOOLS_PT_KitsuneTool_Armature,
     panels_view3d.TOOLS_PT_KitsuneTool_Bone,
-    panels_view3d.TOOLS_PT_KitsuneTool_Mesh,
+    #panels_view3d.TOOLS_PT_KitsuneTool_Mesh,
     panels_view3d.TOOLS_PT_KitsuneTool_VertexGroup,
-    panels_view3d.TOOLS_PT_KitsuneTool_Animation,
+    #panels_view3d.TOOLS_PT_KitsuneTool_Animation,
     
     panels_nodeeditor.NODE_UL_nodes_to_bake,
     panels_nodeeditor.NODE_UL_material_list,
@@ -166,15 +227,15 @@ _classes = (
     ops_bone.BONE_OT_CreateCenterBone,
     ops_bone.BONE_OT_SplitActiveWeightLinear,
     ops_bone.BONE_OT_parent_bone_in_pose,
+    ops_bone.BONE_OT_RemoveBone,
 
     ops_mesh.MESH_OT_CleanShapeKeys,
     ops_mesh.MESH_OT_RemoveUnusedVertexGroups,
     ops_mesh.MESH_OT_Delete_Faces_by_ImageMask,
     ops_mesh.MESH_OT_CleanDuplicateMaterials,
-    ops_mesh.MESH_OT_SelectShapekeyVets,
+    ops_mesh.MESH_OT_SelectShapekeyVerts,
     ops_mesh.MESH_OT_Select_Faces_by_ImageMask,
     ops_mesh.MESH_OT_transfer_topology_shapekeys,
-    ops_mesh.MESH_OT_unlock_all_vertexgroups,
     ops_mesh.MESH_OT_convex_hull_selection,
     ops_mesh.MESH_OT_replace_verts_with_spheres,
 
@@ -185,6 +246,7 @@ _classes = (
     ops_vertexgroup.VERTEXGROUP_OT_multi_weight_paint_finish,
     ops_vertexgroup.VERTEXGROUP_OT_multi_weight_paint_cancel,
     ops_vertexgroup.VERTEXGROUP_OT_TransferSelectedGroup,
+    ops_vertexgroup.VERTEXGROUP_OT_unlock_all_vertexgroups,
 
     ops_action.ACTION_OT_merge_animation_slots,
     ops_action.ACTION_OT_merge_two_actions,
@@ -207,11 +269,23 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
 
+    bpy.app.handlers.depsgraph_update_post.append(utils_pose.mirror_pose_handler)
+
     bpy.types.Scene.kitsunetools = utils_contextmanagers.make_pointer(KitsuneTool_SceneProperties)
     bpy.types.Material.kitsunetools = utils_contextmanagers.make_pointer(KitsuneTool_MaterialProperties)
+    bpy.types.Armature.kitsunetools = utils_contextmanagers.make_pointer(KitsuneTool_ArmatureProperties)
 
     bpy.types.NODE_MT_node.append(draw_node_menu_items)
     bpy.types.NODE_MT_add.append(draw_add_menu_items)
+    bpy.types.MESH_MT_vertex_group_context_menu.append(draw_vertex_group_menu_items)
+    bpy.types.MESH_MT_shape_key_context_menu.append(draw_shapekey_menu_items)
+    bpy.types.VIEW3D_MT_edit_mesh.append(draw_edit_mesh_menu_items)
+    bpy.types.VIEW3D_MT_select_edit_mesh.append(draw_select_edit_mesh_menu_items)
+    bpy.types.VIEW3D_MT_object.append(draw_object_menu_items)
+    bpy.types.VIEW3D_MT_object_cleanup.append(draw_object_cleanup_menu_items)
+    bpy.types.VIEW3D_MT_pose.append(draw_edit_bone_menu_items)
+    bpy.types.VIEW3D_MT_edit_armature.append(draw_edit_bone_menu_items)
+    bpy.types.DOPESHEET_MT_action.append(draw_action_menu_items)
 
     utils_contextmanagers.register_keymap('Node Editor', 'NODE_EDITOR', ops_nodeeditor.NODE_OT_copy_node_values.bl_idname, 'C', ctrl=True, shift=True)
     utils_contextmanagers.register_keymap('Window', 'EMPTY', 'wm.call_menu', 'P', ctrl=True, shift=True, properties={'name': panels_view3d.TOOLS_MT_KitsuneTool_PoseBoneTools.bl_idname})
@@ -220,15 +294,28 @@ def unregister():
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 
+    if utils_pose.mirror_pose_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(utils_pose.mirror_pose_handler)
+
     for km, kmi in utils_contextmanagers._addon_keymaps:
         km.keymap_items.remove(kmi)
     utils_contextmanagers._addon_keymaps.clear()
 
     bpy.types.NODE_MT_node.remove(draw_node_menu_items)
     bpy.types.NODE_MT_add.remove(draw_add_menu_items)
+    bpy.types.MESH_MT_vertex_group_context_menu.remove(draw_vertex_group_menu_items)
+    bpy.types.MESH_MT_shape_key_context_menu.remove(draw_shapekey_menu_items)
+    bpy.types.VIEW3D_MT_edit_mesh.remove(draw_edit_mesh_menu_items)
+    bpy.types.VIEW3D_MT_select_edit_mesh.remove(draw_select_edit_mesh_menu_items)
+    bpy.types.VIEW3D_MT_object.remove(draw_object_menu_items)
+    bpy.types.VIEW3D_MT_object_cleanup.remove(draw_object_cleanup_menu_items)
+    bpy.types.VIEW3D_MT_pose.remove(draw_edit_bone_menu_items)
+    bpy.types.VIEW3D_MT_edit_armature.remove(draw_edit_bone_menu_items)
+    bpy.types.DOPESHEET_MT_action.remove(draw_action_menu_items)
 
     del bpy.types.Scene.kitsunetools
     del bpy.types.Material.kitsunetools
+    del bpy.types.Armature.kitsunetools
     
 
 if __name__ == "__main__":
