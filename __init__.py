@@ -65,7 +65,6 @@ def draw_vertex_group_menu_items(self, context):
 
 def draw_shapekey_menu_items(self, context):
     self.layout.separator(type='LINE')
-    self.layout.operator(ops_mesh.MESH_OT_CleanShapeKeys.bl_idname)
     self.layout.operator(ops_mesh.MESH_OT_SelectShapekeyVerts.bl_idname, icon='SELECT_SET')
     self.layout.operator(ops_mesh.MESH_OT_transfer_topology_shapekeys.bl_idname, icon='MOD_DATA_TRANSFER')
 
@@ -85,6 +84,7 @@ def draw_object_menu_items(self, context):
 def draw_object_cleanup_menu_items(self, context):
     self.layout.separator(type='LINE')
     self.layout.operator(ops_armature.ARMATURE_OT_CleanUnWeightedBones.bl_idname)
+    self.layout.operator(ops_mesh.MESH_OT_CleanShapeKeys.bl_idname)
     self.layout.operator(ops_mesh.MESH_OT_RemoveUnusedVertexGroups.bl_idname)
     self.layout.operator(ops_mesh.MESH_OT_CleanDuplicateMaterials.bl_idname)
 
