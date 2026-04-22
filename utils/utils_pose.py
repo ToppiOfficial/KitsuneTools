@@ -1,5 +1,6 @@
 import bpy
 from mathutils import Vector, Matrix
+from bpy.app.handlers import persistent
 
 _prev_matrices: dict = {}
 _is_mirroring: bool = False
@@ -64,6 +65,7 @@ def _copy_mirrored_pose(source_pb, target_pb):
     target_pb.scale = sca
 
 
+@persistent
 def mirror_pose_handler(scene, depsgraph):
     global _is_mirroring
 

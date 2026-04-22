@@ -98,6 +98,9 @@ class NODE_PT_KitsuneTool_NodeBaker(TOOLS_PT_KitsuneTool_Panel):
                 )
                 mat = obj.active_material
 
+            if listmode == 'ALL':
+                layout.operator(NODE_OT_node_bake_all_materials.bl_idname, text="Bake All Materials", icon='MATERIAL')
+
             if not mat or not mat.use_nodes:
                 layout.label(text="Active material has no nodes", icon='INFO')
                 return
