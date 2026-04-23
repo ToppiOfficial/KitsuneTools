@@ -78,7 +78,7 @@ all_patterns = gitignore_patterns + EXTRA_IGNORE
 this_script = os.path.basename(__file__)
 
 for platform_name, platform_wheels in wheel_platform_map.items():
-    zip_name = f"../kitsunesourcetool_{version_str}_{platform_name}.zip"
+    zip_name = f"../kitsunetools_{version_str}_{platform_name}.zip"
     print(f"Creating {zip_name}...")
     
     zip_file = zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_BZIP2)
