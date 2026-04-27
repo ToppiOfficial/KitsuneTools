@@ -9,6 +9,10 @@ bonename_direction_map = {
     '.R': '.L', '_R': '_L', 'Right': 'Left', '_Right': '_Left', '.Right': '.Left', 'R_': 'L_', 'R.': 'L.', 'R ': 'L '
 }
 
+exportname_shortcut_keywords = {
+    "vbip": "ValveBiped.Bip01"
+}
+
 # Only when KitsuneSrcTool is installed
 def get_bone_exportname(bone: Bone | PoseBone | None, for_write=False) -> str:
     _EXPORTNAME_MODULES = (
@@ -28,6 +32,28 @@ def get_bone_exportname(bone: Bone | PoseBone | None, for_write=False) -> str:
     if bone is None:
         return "None"
     return bone.name if hasattr(bone, "name") else str(bone)
+
+
+def get_canonical_bonename(export_name: str) -> str:
+    """Convert an exported bone name back to its canonical form:
+       - Replaces directional markers with ' * '
+       - Converts expanded shortcut names back to '!shortcut!' form
+       - Converts underscores to spaces
+       - Collapses multiple spaces into a single space
+    """
+    # Reverse shortcut expansion
+    reversed_shortcuts = {v: k for k, v in exportname_shortcut_keywords.items()}
+    for full, shortcut in reversed_shortcuts.items():
+        export_name = export_name.replace(full, f"!{shortcut}!")
+
+    for k, v in bonename_direction_map.items():
+        export_name = export_name.replace(k, " * ")
+
+
+    export_name = export_name.replace("_", " ")
+    export_name = re.sub(r'\s+', ' ', export_name).strip()
+
+    return export_name
 
 
 @selfreport

@@ -9,10 +9,11 @@ from .gui import (
 from .op import (
     ops_armature,
     ops_bone,
+    ops_humanoidmapper,
     ops_nodeeditor,
     ops_vertexgroup,
     ops_mesh,
-    ops_action
+    ops_action,
 )
 from .utils import (
     utils_armature,
@@ -23,7 +24,7 @@ from .utils import (
     utils_bone,
     utils_material,
     utils_mesh,
-    utils_pose
+    utils_pose,
 )
 
 #
@@ -61,7 +62,8 @@ def draw_add_menu_items(self, context):
 def draw_vertex_group_menu_items(self, context):
     self.layout.separator(type='LINE')
     self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_unlock_all_vertexgroups.bl_idname, icon='UNLOCKED')
-    self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_TransferSelectedGroup.bl_idname, icon='MOD_DATA_TRANSFER')
+    self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_TransferSelectedGroup.bl_idname)
+    self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_JoinWeights.bl_idname)
 
 def draw_shapekey_menu_items(self, context):
     self.layout.separator(type='LINE')
@@ -80,6 +82,7 @@ def draw_select_edit_mesh_menu_items(self, context):
 def draw_object_menu_items(self, context):
     self.layout.separator(type='LINE')
     self.layout.operator(ops_armature.ARMATURE_OT_MergeArmatures.bl_idname)
+    self.layout.operator(ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected.bl_idname)
 
 def draw_object_cleanup_menu_items(self, context):
     self.layout.separator(type='LINE')
@@ -92,8 +95,8 @@ def draw_edit_bone_menu_items(self, context):
     self.layout.separator(type='LINE')
     self.layout.operator(ops_bone.BONE_OT_FlipBone.bl_idname)
     self.layout.operator(ops_bone.BONE_OT_SubdivideBone.bl_idname, text='Subdivide (With Weights)').weights_only = False
-    self.layout.operator(ops_bone.BONE_OT_mirror_by_position.bl_idname, icon='MOD_MIRROR')
     self.layout.operator(ops_bone.BONE_OT_CreateCenterBone.bl_idname)
+    self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_SplitActiveWeightLinear.bl_idname)
     self.layout.operator(ops_bone.BONE_OT_RemoveBone.bl_idname, icon='TRASH')
 
 def draw_action_menu_items(self, context):
@@ -105,6 +108,9 @@ def draw_action_menu_items(self, context):
     self.layout.operator(ops_action.ACTION_OT_copy_bone_keyframes.bl_idname)
     self.layout.operator(ops_action.ACTION_OT_propagate_pose_offset.bl_idname)
 
+def draw_weight_paint_menu_items(self, context):
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_SplitActiveWeightLinear.bl_idname)
 
 
 #
@@ -148,6 +154,30 @@ class BakeNodeItem(PropertyGroup):
         return None
 
 
+class Humanoidmapper(PropertyGroup):
+    boneExportName : StringProperty(
+        name='Bone',
+        description="The original bone name in the source armature. Used when writing JSON for retargeting."
+    )
+
+    boneName : StringProperty(
+        name='Target Name',
+        description="The target name that this bone should be mapped to during retargeting. When loading JSON, any bone matching this name will be treated as the original bone."
+    )
+    
+    writeRotation : EnumProperty(name='Write Rotation', items=[
+        ('NONE', 'Do Not Write', ''),
+        ('ROTATION', 'Rotation', ''),
+        ('ROLL', 'Roll Only', '')
+    ], default='ROLL')
+    
+    writeTwistBone : BoolProperty(name='Write TwistBone', default=False)
+    twistBoneTarget : StringProperty(name='TwistBone Target Bone')
+    twistBoneCount : IntProperty(name='TwistBone Count', default=1, min=1, soft_max=5)
+    writeExportRotationOffset : BoolProperty(name='Write Export Rotation Offset', default=True)
+    parentBone : StringProperty(name='Parent Bone', default='', description='Overwrite Parent bone on JSON parse')
+
+
 class KitsuneTool_SceneProperties(PropertyGroup):
     _bone_merging_options_base = [
         ('DEFAULT', 'Default', 'Merge bones and remove target bone and weights', 'NONE', 0),
@@ -168,6 +198,47 @@ class KitsuneTool_SceneProperties(PropertyGroup):
         ('ACTIVE', 'Active', 'All materials in the active object'),
     ], default='ACTIVE')
     node_baker_material_list_index : IntProperty(default=-1)
+
+    humanoid_armature_map_menu : EnumProperty(name='Define Armature Category',items=[('LOAD', 'Load', ''),('WRITE', 'Write', ''),])
+
+
+class KitsuneTool_ObjectProperties(PropertyGroup):
+    humanoid_armature_map_bonecollections : CollectionProperty(name='JSON Bone Collection',type=Humanoidmapper)
+    humanoid_armature_map_bonecollections_index : IntProperty()
+    
+    armature_map_pelvis : StringProperty(name="Pelvis")
+    armature_map_chest  : StringProperty(name="Chest")
+    armature_map_spine  : StringProperty(name="Spine")
+    armature_map_head   : StringProperty(name="Head")
+    armature_map_thigh_l : StringProperty(name="Left Thigh")
+    armature_map_ankle_l : StringProperty(name="Left Ankle")
+    armature_map_toe_l   : StringProperty(name="Left Toe")
+    armature_map_thigh_r : StringProperty(name="Right Thigh")
+    armature_map_ankle_r : StringProperty(name="Right Ankle")
+    armature_map_toe_r   : StringProperty(name="Right Toe")
+    armature_map_shoulder_l : StringProperty(name="Left Shoulder")
+    armature_map_wrist_l    : StringProperty(name="Left Wrist")
+    armature_map_index_f_l  : StringProperty(name="Left Index Finger")
+    armature_map_middle_f_l : StringProperty(name="Left Middle Finger")
+    armature_map_ring_f_l   : StringProperty(name="Left Ring Finger")
+    armature_map_pinky_f_l  : StringProperty(name="Left Pinky Finger")
+    armature_map_thumb_f_l  : StringProperty(name="Left Thumb Finger")
+    armature_map_shoulder_r : StringProperty(name="Right Shoulder")
+    armature_map_wrist_r    : StringProperty(name="Right Wrist")
+    armature_map_index_f_r  : StringProperty(name="Right Index Finger")
+    armature_map_middle_f_r : StringProperty(name="Right Middle Finger")
+    armature_map_ring_f_r   : StringProperty(name="Right Ring Finger")
+    armature_map_pinky_f_r  : StringProperty(name="Right Pinky Finger")
+    armature_map_thumb_f_r  : StringProperty(name="Right Thumb Finger")
+    armature_map_eye_l  : StringProperty(name="Left Eye")
+    armature_map_eye_r  : StringProperty(name="Right Eye")
+    
+    armature_map_upperarm_l: StringProperty(name="Left Upper Arm",)
+    armature_map_upperarm_r: StringProperty(name="Right Upper Arm",)
+    armature_map_forearm_l: StringProperty(name="Left Fore Arm",)
+    armature_map_forearm_r: StringProperty(name="Right Fore Arm",)
+    armature_map_knee_l: StringProperty(name="Left Knee",)
+    armature_map_knee_r: StringProperty(name="Right Knee",)
 
 
 class KitsuneTool_MaterialProperties(PropertyGroup):
@@ -191,9 +262,15 @@ class KitsuneTool_ArmatureProperties(PropertyGroup):
 _classes = (
     # PROPERTIES
     BakeNodeItem,
+    Humanoidmapper,
+
     KitsuneTool_SceneProperties,
+    KitsuneTool_ObjectProperties,
     KitsuneTool_MaterialProperties,
     KitsuneTool_ArmatureProperties,
+
+    # List
+    panels_view3d.HUMANOIDMAPPER_UL_ConfigList,
 
     # MENU
     panels_view3d.TOOLS_MT_KitsuneTool_PoseBoneTools,
@@ -201,9 +278,8 @@ _classes = (
     # PANELS
     panels_view3d.TOOLS_PT_KitsuneTool_Armature,
     panels_view3d.TOOLS_PT_KitsuneTool_Bone,
-    #panels_view3d.TOOLS_PT_KitsuneTool_Mesh,
     panels_view3d.TOOLS_PT_KitsuneTool_VertexGroup,
-    #panels_view3d.TOOLS_PT_KitsuneTool_Animation,
+    panels_view3d.TOOLS_PT_KitsuneTool_Humanoidmapper,
     
     panels_nodeeditor.NODE_UL_nodes_to_bake,
     panels_nodeeditor.NODE_UL_material_list,
@@ -222,10 +298,8 @@ _classes = (
     ops_bone.BONE_OT_CopyTargetRotation,
     ops_bone.BONE_OT_align_bone_to_axis,
     ops_bone.BONE_OT_SubdivideBone,
-    ops_bone.BONE_OT_mirror_by_position,
     ops_bone.BONE_OT_FlipBone,
     ops_bone.BONE_OT_CreateCenterBone,
-    ops_bone.BONE_OT_SplitActiveWeightLinear,
     ops_bone.BONE_OT_parent_bone_in_pose,
     ops_bone.BONE_OT_RemoveBone,
 
@@ -247,6 +321,8 @@ _classes = (
     ops_vertexgroup.VERTEXGROUP_OT_multi_weight_paint_cancel,
     ops_vertexgroup.VERTEXGROUP_OT_TransferSelectedGroup,
     ops_vertexgroup.VERTEXGROUP_OT_unlock_all_vertexgroups,
+    ops_vertexgroup.VERTEXGROUP_OT_SplitActiveWeightLinear,
+    ops_vertexgroup.VERTEXGROUP_OT_JoinWeights,
 
     ops_action.ACTION_OT_merge_animation_slots,
     ops_action.ACTION_OT_merge_two_actions,
@@ -263,6 +339,14 @@ _classes = (
     ops_nodeeditor.NODE_OT_node_bake_run,
     ops_nodeeditor.NODE_OT_copy_node_values,
     ops_nodeeditor.NODE_OT_set_copy_input,
+
+    ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected,
+    ops_humanoidmapper.HUMANOIDMAPPER_OT_LoadPreset,
+    ops_humanoidmapper.HUMANOIDMAPPER_OT_LoadConfig,
+    ops_humanoidmapper.HUMANOIDMAPPER_OT_RemoveItem,
+    ops_humanoidmapper.HUMANOIDMAPPER_OT_AddItem,
+    ops_humanoidmapper.HUMANOIDMAPPER_OT_MirrorBoneNames,
+    ops_humanoidmapper.HUMANOIDMAPPER_OT_WriteConfig,
 )
 
 def register():
@@ -272,6 +356,7 @@ def register():
     bpy.app.handlers.depsgraph_update_post.append(utils_pose.mirror_pose_handler)
 
     bpy.types.Scene.kitsunetools = utils_contextmanagers.make_pointer(KitsuneTool_SceneProperties)
+    bpy.types.Object.kitsunetools = utils_contextmanagers.make_pointer(KitsuneTool_ObjectProperties)
     bpy.types.Material.kitsunetools = utils_contextmanagers.make_pointer(KitsuneTool_MaterialProperties)
     bpy.types.Armature.kitsunetools = utils_contextmanagers.make_pointer(KitsuneTool_ArmatureProperties)
 
@@ -285,6 +370,7 @@ def register():
     bpy.types.VIEW3D_MT_object_cleanup.append(draw_object_cleanup_menu_items)
     bpy.types.VIEW3D_MT_pose.append(draw_edit_bone_menu_items)
     bpy.types.VIEW3D_MT_edit_armature.append(draw_edit_bone_menu_items)
+    bpy.types.VIEW3D_MT_paint_weight.append(draw_weight_paint_menu_items)
     bpy.types.DOPESHEET_MT_action.append(draw_action_menu_items)
 
     utils_contextmanagers.register_keymap('Node Editor', 'NODE_EDITOR', ops_nodeeditor.NODE_OT_copy_node_values.bl_idname, 'C', ctrl=True, shift=True)
@@ -311,9 +397,11 @@ def unregister():
     bpy.types.VIEW3D_MT_object_cleanup.remove(draw_object_cleanup_menu_items)
     bpy.types.VIEW3D_MT_pose.remove(draw_edit_bone_menu_items)
     bpy.types.VIEW3D_MT_edit_armature.remove(draw_edit_bone_menu_items)
+    bpy.types.VIEW3D_MT_paint_weight.remove(draw_weight_paint_menu_items)
     bpy.types.DOPESHEET_MT_action.remove(draw_action_menu_items)
 
     del bpy.types.Scene.kitsunetools
+    del bpy.types.Object.kitsunetools
     del bpy.types.Material.kitsunetools
     del bpy.types.Armature.kitsunetools
     

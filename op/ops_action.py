@@ -358,76 +358,44 @@ class ACTION_OT_merge_two_actions(Operator):
     bl_label = 'Merge Two Actions'
     bl_options = {'REGISTER', 'UNDO'}
 
-    action_1: StringProperty(
-        name="First Action",
-        description="First action to merge"
-    )
-    action_2: StringProperty(
-        name="Second Action",
-        description="Second action to merge"
-    )
-    new_action_name: StringProperty(
-        name="New Action Name",
-        description="Name for the merged action",
-        default="MergedAction"
-    )
-    use_existing_action: BoolProperty(
-        name="Use Existing Action",
-        description="Merge into an existing action instead of creating a new one",
-        default=False
-    )
-    existing_action: StringProperty(
-        name="Existing Action",
-        description="Existing action to merge into"
-    )
-    do_not_merge_matching_names: BoolProperty(
-        name="Do Not Merge Matching Names",
-        description="Keep slots with identical names separate (appends .001, .002)",
-        default=False
-    )
-    
-    rename_legacy_slots: BoolProperty(
-        name="Rename Legacy Slots",
-        description="Rename slots named 'Legacy Slot' to the action's name",
-        default=True
-    )
-    
-    use_fake_user: BoolProperty(
-        name="Fake User",
-        description="Assign fake user to the new action",
-        default=True
-    )
+    action_1: StringProperty(name="First Action", description="First action to merge")
+    action_2: StringProperty(name="Second Action", description="Second action to merge")
+    new_action_name: StringProperty(name="New Action Name", default="MergedAction")
+    use_existing_action: BoolProperty(name="Use Existing Action", default=False)
+    existing_action: StringProperty(name="Existing Action")
+    do_not_merge_matching_names: BoolProperty(name="Do Not Merge Matching Names", default=False)
+    rename_legacy_slots: BoolProperty(name="Rename Legacy Slots", default=True)
+    use_fake_user: BoolProperty(name="Fake User", default=True)
 
-    def invoke(self, context, event) -> set:
+    def invoke(self, context, event):
         if bpy.data.actions:
-            self.action_1 = bpy.data.actions[0].name
-            self.action_2 = bpy.data.actions[0].name
-            self.existing_action = bpy.data.actions[0].name
-        
+            first = bpy.data.actions[0].name
+            self.action_1 = first
+            self.action_2 = first
+            self.existing_action = first
         return context.window_manager.invoke_props_dialog(self, width=400)
 
-    def draw(self, context) -> None:
+    def draw(self, context):
         layout = self.layout
-        
+
         box = layout.box()
         box.label(text="Source Actions:", icon='ACTION')
         box.prop_search(self, "action_1", bpy.data, "actions", text="Action 1")
         box.prop_search(self, "action_2", bpy.data, "actions", text="Action 2")
-        
+
         layout.separator()
-        
+
         box = layout.box()
         box.label(text="Output:", icon='FILE_NEW')
         box.prop(self, "use_existing_action")
-        
         if self.use_existing_action:
             box.prop_search(self, "existing_action", bpy.data, "actions", text="Action")
         else:
             box.prop(self, "new_action_name")
             box.prop(self, "use_fake_user")
-        
+
         layout.separator()
-        
+
         box = layout.box()
         box.label(text="Options:", icon='PREFERENCES')
         box.prop(self, "do_not_merge_matching_names")
@@ -436,15 +404,15 @@ class ACTION_OT_merge_two_actions(Operator):
     def execute(self, context) -> set:
         act1 = bpy.data.actions.get(self.action_1)
         act2 = bpy.data.actions.get(self.action_2)
-        
+
         if not act1 or not act2:
             self.report({'ERROR'}, "One or both actions not found")
             return {'CANCELLED'}
-        
+
         if act1 == act2:
             self.report({'ERROR'}, "Cannot merge an action with itself")
             return {'CANCELLED'}
-        
+
         if self.use_existing_action:
             target_action = bpy.data.actions.get(self.existing_action)
             if not target_action:
@@ -452,122 +420,118 @@ class ACTION_OT_merge_two_actions(Operator):
                 return {'CANCELLED'}
         else:
             target_action = bpy.data.actions.new(name=self.new_action_name)
-            if self.use_fake_user:
-                target_action.use_fake_user = True
-        
-        if not target_action.layers:
-            layer = target_action.layers.new(name="Layer")
-        else:
-            layer = target_action.layers[0]
-        
-        if not layer.strips:
-            strip = layer.strips.new(type='KEYFRAME')
-        else:
-            strip = layer.strips[0]
-        
-        slot_groups = self._group_slots_by_name([act1, act2])
-        
+            target_action.use_fake_user = self.use_fake_user
+
+        layer = target_action.layers[0] if target_action.layers else target_action.layers.new(name="Layer")
+        strip = layer.strips[0] if layer.strips else layer.strips.new(type='KEYFRAME')
+
+        # Snapshot with list() BEFORE any writes to avoid mutation side-effects
+        # when target_action is one of the source actions.
+        slot_groups = {}
+        for action in (act1, act2):
+            for slot in list(action.slots):
+                name = slot.name_display
+                if self.rename_legacy_slots and name.lower() == "legacy slot":
+                    name = action.name
+                slot_groups.setdefault(name, []).append((action, slot))
+
         merged_count = 0
         for slot_name, slot_list in slot_groups.items():
             if self.do_not_merge_matching_names and len(slot_list) > 1:
                 for idx, (action, slot) in enumerate(slot_list):
-                    unique_name = f"{slot_name}.{idx+1:03d}" if idx > 0 else slot_name
-                    self._create_slot_copy(target_action, strip, action, slot, unique_name)
+                    if action is target_action:
+                        # Slot already lives in target — nothing to copy.
+                        merged_count += 1
+                        continue
+                    unique_name = f"{slot_name}.{idx + 1:03d}" if idx > 0 else slot_name
+                    self._copy_slot(target_action, strip, action, slot, unique_name)
                     merged_count += 1
-            else:
-                if len(slot_list) > 1:
-                    self._merge_slots(target_action, strip, slot_list, slot_name)
+
+            elif len(slot_list) > 1:
+                # Check whether one of the slots already belongs to the target action.
+                existing_target_entry = next(
+                    ((a, s) for a, s in slot_list if a is target_action), None
+                )
+
+                if existing_target_entry:
+                    # Reuse the existing slot/channelbag — don't duplicate it.
+                    _, existing_slot = existing_target_entry
+                    new_slot = existing_slot
+                    new_channelbag = anim_utils.action_get_channelbag_for_slot(target_action, existing_slot)
+                    if not new_channelbag:
+                        new_channelbag = strip.channelbags.new(slot=new_slot)
                 else:
-                    self._create_slot_copy(target_action, strip, slot_list[0][0], slot_list[0][1], slot_name)
+                    new_slot = target_action.slots.new(id_type='OBJECT', name=slot_name)
+                    new_channelbag = strip.channelbags.new(slot=new_slot)
+
+                for action, slot in slot_list:
+                    if action is target_action:
+                        # Data is already present in new_channelbag — skip.
+                        continue
+                    source_cb = anim_utils.action_get_channelbag_for_slot(action, slot)
+                    if not source_cb:
+                        continue
+                    for src_fc in source_cb.fcurves:
+                        existing_fc = next(
+                            (f for f in new_channelbag.fcurves
+                            if f.data_path == src_fc.data_path and f.array_index == src_fc.array_index),
+                            None
+                        )
+                        if existing_fc:
+                            existing_frames = {kp.co.x for kp in existing_fc.keyframe_points}
+                            for kp in src_fc.keyframe_points:
+                                if kp.co.x not in existing_frames:
+                                    new_kp = existing_fc.keyframe_points.insert(
+                                        frame=kp.co.x, value=kp.co.y, options={'FAST'}
+                                    )
+                                    self._copy_keyframe_props(new_kp, kp)
+                            existing_fc.update()
+                        else:
+                            self._copy_fcurve(src_fc, new_channelbag)
                 merged_count += 1
-        
+
+            else:
+                action, slot = slot_list[0]
+                if action is not target_action:
+                    # Only copy if the slot doesn't already belong to target.
+                    self._copy_slot(target_action, strip, action, slot, slot_name)
+                merged_count += 1
+
         self.report({'INFO'}, f"Merged '{act1.name}' + '{act2.name}' into '{target_action.name}' ({merged_count} slots)")
         return {'FINISHED'}
 
-    def _group_slots_by_name(self, actions: list[Action]) -> dict[str, list[tuple[Action, ActionSlot]]]:
-        """Groups slots by their display name across both actions"""
-        slot_groups = {}
-        
-        use_legacy_replacement = self.rename_legacy_slots
-        
-        for action in actions:
-            for slot in action.slots:
-                name = slot.name_display
-                
-                if use_legacy_replacement and name.lower() == "legacy slot":
-                    name = action.name
-
-                slot_groups.setdefault(name, []).append((action, slot))
-        
-        return slot_groups
-
-    def _create_slot_copy(self, target_action: Action, strip: ActionStrip, 
-                         source_action: Action, source_slot: ActionSlot, 
-                         new_slot_name: str) -> ActionSlot:
-        """Creates a new slot and copies fcurves from source"""
-        new_slot = target_action.slots.new(id_type='OBJECT', name=new_slot_name)
+    def _copy_slot(self, target_action: Action, strip: ActionStrip,
+                   source_action: Action, source_slot: ActionSlot, slot_name: str) -> None:
+        new_slot = target_action.slots.new(id_type='OBJECT', name=slot_name)
         new_channelbag = strip.channelbags.new(slot=new_slot)
-        
-        source_channelbag = anim_utils.action_get_channelbag_for_slot(source_action, source_slot)
-        if source_channelbag:
-            for fcurve in source_channelbag.fcurves:
-                self._copy_fcurve(fcurve, new_channelbag)
-        
-        return new_slot
+        source_cb = anim_utils.action_get_channelbag_for_slot(source_action, source_slot)
+        if source_cb:
+            for fc in source_cb.fcurves:
+                self._copy_fcurve(fc, new_channelbag)
 
-    def _merge_slots(self, target_action: Action, strip: ActionStrip,
-                    slot_list: list[tuple[Action, ActionSlot]], 
-                    merged_slot_name: str) -> None:
-        """Merges multiple slots with the same name into one slot"""
-        new_slot = target_action.slots.new(id_type='OBJECT', name=merged_slot_name)
-        new_channelbag = strip.channelbags.new(slot=new_slot)
-        
-        for action, slot in slot_list:
-            source_channelbag = anim_utils.action_get_channelbag_for_slot(action, slot)
-            if not source_channelbag:
-                continue
-            
-            for source_fcurve in source_channelbag.fcurves:
-                existing_fcurve = self._find_matching_fcurve(new_channelbag, source_fcurve)
-                
-                if existing_fcurve:
-                    self._merge_fcurve_keyframes(existing_fcurve, source_fcurve)
-                else:
-                    self._copy_fcurve(source_fcurve, new_channelbag)
+    def _copy_fcurve(self, source: FCurve, target_channelbag: ActionChannelbag) -> None:
+        new_fc = target_channelbag.fcurves.new(data_path=source.data_path, index=source.array_index)
+        new_fc.extrapolation = source.extrapolation
+        new_fc.color_mode = source.color_mode
+        new_fc.color = source.color[:]
 
-    def _find_matching_fcurve(self, channelbag: ActionChannelbag, 
-                             fcurve: FCurve) -> FCurve | None:
-        """Finds fcurve with matching data_path and array_index"""
-        for existing in channelbag.fcurves:
-            if existing.data_path == fcurve.data_path and existing.array_index == fcurve.array_index:
-                return existing
-        return None
+        new_fc.keyframe_points.add(len(source.keyframe_points))
+        for i, src_kp in enumerate(source.keyframe_points):
+            self._copy_keyframe_props(new_fc.keyframe_points[i], src_kp)
+        new_fc.update()
 
-    def _copy_fcurve(self, source_fcurve: FCurve, 
-                    target_channelbag: ActionChannelbag) -> FCurve:
-        """Copies fcurve data to target channelbag"""
-        new_fcurve = target_channelbag.fcurves.new(
-            data_path=source_fcurve.data_path,
-            index=source_fcurve.array_index
-        )
-        for kp in source_fcurve.keyframe_points:
-            new_fcurve.keyframe_points.insert(frame=kp.co.x, value=kp.co.y, options={'FAST'})
-        return new_fcurve
-
-    def _merge_fcurve_keyframes(self, target_fcurve: FCurve, 
-                               source_fcurve: FCurve) -> None:
-        """Adds keyframes from source to target, summing values at existing frames"""
-        existing_frames = {kp.co.x: kp.co.y for kp in target_fcurve.keyframe_points}
-        
-        for kp in source_fcurve.keyframe_points:
-            frame = kp.co.x
-            value = kp.co.y
-            
-            if frame in existing_frames:
-                new_value = existing_frames[frame] + value
-                target_fcurve.keyframe_points.insert(frame=frame, value=new_value, options={'REPLACE'})
-            else:
-                target_fcurve.keyframe_points.insert(frame=frame, value=value, options={'FAST'})
+    def _copy_keyframe_props(self, target_kp, source_kp) -> None:
+        target_kp.co = source_kp.co[:]
+        target_kp.handle_left = source_kp.handle_left[:]
+        target_kp.handle_right = source_kp.handle_right[:]
+        target_kp.handle_left_type = source_kp.handle_left_type
+        target_kp.handle_right_type = source_kp.handle_right_type
+        target_kp.interpolation = source_kp.interpolation
+        target_kp.easing = source_kp.easing
+        target_kp.amplitude = source_kp.amplitude
+        target_kp.back = source_kp.back
+        target_kp.period = source_kp.period
+        target_kp.type = source_kp.type
 
 
 class ACTION_OT_delete_action_slot(Operator):

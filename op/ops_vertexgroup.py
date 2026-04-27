@@ -5,6 +5,7 @@ from ..utils.utils_object import is_armature, is_mesh, get_armature_meshes, get_
 from ..utils.utils_armature import get_selected_bones
 from ..utils.utils_contextmanagers import preserve_context_mode, preserve_armature_state
 from ..utils.utils_vertexgroup import reapply_vertexgroup_as_curve
+from ..utils.utils_bone import remove_bone
 
 
 class VERTEXGROUP_OT_WeightMath(Operator):
@@ -686,4 +687,196 @@ class VERTEXGROUP_OT_unlock_all_vertexgroups(bpy.types.Operator):
                     unlocked_count += 1
                 
         self.report({'INFO'}, f"Unlocked {unlocked_count} vertex group(s)")
+        return {'FINISHED'}
+
+
+class VERTEXGROUP_OT_SplitActiveWeightLinear(Operator):
+    bl_idname = 'kitsunetools.split_active_weights_linear'
+    bl_label = 'Split Active Weights Linearly'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    smoothness: FloatProperty(
+        name="Smoothness",
+        description="Smoothness of the weight split (0 = hard cut, 1 = full smooth blend)",
+        min=0.0, max=1.0,
+        default=0.6
+    )
+
+    @classmethod
+    def poll(cls, context) -> bool:
+        ob  = context.active_object
+        if ob is None: return False
+        if ob.mode not in ['WEIGHT_PAINT', 'POSE']: return False
+        
+        return bool(get_armature(ob))
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def get_vgroup_index(self, mesh, name):
+        for i, vg in enumerate(mesh.vertex_groups):
+            if vg.name == name:
+                return i
+        return None
+
+    def clamp(self, x, a, b):
+        return max(a, min(x, b))
+
+    def remap(self, value, minval, maxval):
+        if maxval - minval == 0:
+            return 0.5
+        return (value - minval) / (maxval - minval)
+
+    def project_point_onto_line(self, p, a, b):
+        ap = p - a
+        ab = b - a
+        ab_len_sq = ab.length_squared
+        if ab_len_sq == 0.0:
+            return 0.0
+        return self.clamp(ap.dot(ab) / ab_len_sq, 0.0, 1.0)
+
+    def execute(self, context) -> set:
+        arm = get_armature(context.active_object)
+        
+        bones = get_selected_bones(arm,sort_type=None,bone_type='BONE',exclude_active=True)
+        active_bone = arm.data.bones.active
+        
+        if not bones or len(bones) != 2 or not active_bone:
+            self.report({'WARNING'}, "Select 3 bones: 2 others and 1 active (middle split point).")
+            return {'CANCELLED'}
+        
+        og_arm_pose_mode = arm.data.pose_position
+        arm.data.pose_position = 'REST'
+        bpy.context.view_layer.update()
+
+        bone1 = arm.pose.bones.get(bones[0].name)
+        bone2 = arm.pose.bones.get(bones[1].name)
+        active = active_bone
+
+        bone1_name = bone1.name
+        bone2_name = bone2.name
+        active_name = active.name
+
+        arm_matrix = arm.matrix_world
+        p1 = arm_matrix @ ((bone1.head + bone1.tail) * 0.5)
+        p2 = arm_matrix @ ((bone2.head + bone2.tail) * 0.5)
+
+        meshes = get_armature_meshes(arm, visible_only=context.scene.kitsunetools.visible_mesh_only)
+
+        for mesh in meshes:
+            vg_active = self.get_vgroup_index(mesh, active_name)
+            vg1 = mesh.vertex_groups.get(bone1_name)
+            if vg1 is None:
+                vg1 = mesh.vertex_groups.new(name=bone1_name)
+
+            vg2 = mesh.vertex_groups.get(bone2_name)
+            if vg2 is None:
+                vg2 = mesh.vertex_groups.new(name=bone2_name)
+
+            if vg_active is None or vg1 is None or vg2 is None:
+                continue
+
+            vtx_weights = {}
+            for v in mesh.data.vertices:
+                for g in v.groups:
+                    if g.group == vg_active:
+                        vtx_weights[v.index] = g.weight
+                        break
+
+            for vidx, weight in vtx_weights.items():
+                vertex = mesh.data.vertices[vidx]
+                world_pos = mesh.matrix_world @ vertex.co
+
+                t = self.project_point_onto_line(world_pos, p1, p2)
+
+                # THIS WAS BACKWARDS BEFORE
+                if self.smoothness == 0.0:
+                    w1 = weight if t < 0.5 else 0.0
+                    w2 = weight if t >= 0.5 else 0.0
+                else:
+                    s = self.smoothness
+                    edge0 = 0.5 - s * 0.5
+                    edge1 = 0.5 + s * 0.5
+                    smooth_t = self.remap(t, edge0, edge1)
+                    smooth_t = self.clamp(smooth_t, 0.0, 1.0)
+                    w1 = weight * (1.0 - smooth_t)
+                    w2 = weight * smooth_t
+
+                vg1.add([vidx], w1, 'ADD')
+                vg2.add([vidx], w2, 'ADD')
+
+            mesh.vertex_groups.remove(mesh.vertex_groups[vg_active])
+            mesh.vertex_groups.active = vg1
+        
+        with preserve_context_mode(arm, 'EDIT'):
+            remove_bone(arm,active_bone.name)
+            arm.data.edit_bones.active = arm.data.edit_bones.get(bones[0].name)
+        
+        arm.data.pose_position = og_arm_pose_mode
+
+        self.report({'INFO'}, f"Split {active_name} between {bone1_name} and {bone2_name}")
+        return {'FINISHED'} 
+    
+
+class VERTEXGROUP_OT_JoinWeights(Operator):
+    bl_idname = 'kitsunetools.join_weights'
+    bl_label = 'Join Weights'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    target_group: StringProperty(name='Merge To')
+    source_group: StringProperty(name='Merge From')
+    keep_original_group: BoolProperty(name='Keep Original Group', default=False)
+
+    @classmethod
+    def poll(cls, context) -> bool:
+        obj = context.active_object
+        return obj is not None and hasattr(obj, 'vertex_groups') and \
+               obj.vertex_groups.active is not None
+
+    def invoke(self, context, event):
+        active_vg = context.active_object.vertex_groups.active
+        if active_vg:
+            self.target_group = active_vg.name
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        obj = context.active_object
+        layout = self.layout
+        layout.prop_search(self, 'target_group', obj, 'vertex_groups')
+        layout.prop_search(self, 'source_group', obj, 'vertex_groups')
+        layout.prop(self, 'keep_original_group')
+
+    def execute(self, context) -> set:
+        obj = context.active_object
+        vgs = obj.vertex_groups
+
+        target = vgs.get(self.target_group)
+        source = vgs.get(self.source_group)
+
+        if not target:
+            self.report({'ERROR'}, f"Target group '{self.target_group}' not found")
+            return {'CANCELLED'}
+        if not source:
+            self.report({'ERROR'}, f"Source group '{self.source_group}' not found")
+            return {'CANCELLED'}
+        if target == source:
+            self.report({'ERROR'}, "Target and source must be different groups")
+            return {'CANCELLED'}
+
+        for v in obj.data.vertices:
+            try:
+                src_w = source.weight(v.index)
+            except RuntimeError:
+                continue  # vertex not in source group, nothing to add
+
+            try:
+                dst_w = target.weight(v.index)
+            except RuntimeError:
+                dst_w = 0.0
+
+            target.add([v.index], min(dst_w + src_w, 1.0), 'REPLACE')
+
+        if not self.keep_original_group:
+            vgs.remove(source)
+
         return {'FINISHED'}
