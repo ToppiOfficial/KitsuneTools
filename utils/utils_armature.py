@@ -451,6 +451,15 @@ def merge_armatures( source_arm: Object, target_arm: Object, match_posture: bool
                 if getattr(con, 'target', None) == target_arm
             ]
 
+            mesh_arm_driver_targets = [
+                t
+                for ob in target_meshes if ob.animation_data
+                for fc in ob.animation_data.drivers
+                for var in fc.driver.variables
+                for t in var.targets
+                if t.id == target_arm
+            ]
+
             source_collection_names_before = {c.name for c in source_arm.data.collections}
 
             bpy.ops.object.select_all(action='DESELECT')
@@ -543,6 +552,25 @@ def merge_armatures( source_arm: Object, target_arm: Object, match_posture: bool
                         vg_cleaned += 1
             if vg_cleaned > 0:
                 print(f"  Cleaned {vg_cleaned} vertex group(s)")
+
+            # Remap mesh drivers that pointed to the (now absorbed) target_arm
+            for t in mesh_arm_driver_targets:
+                t.id = source_arm
+
+            # Fix drivers that came over from target_arm via join — their id is now None
+            driver_fixes = 0
+            if source_arm.animation_data:
+                for fc in source_arm.animation_data.drivers:
+                    for var in fc.driver.variables:
+                        for t in var.targets:
+                            if t.id is None:
+                                t.id = source_arm
+                                driver_fixes += 1
+                            if t.bone_target and t.bone_target in bone_name_map:
+                                t.bone_target = bone_name_map[t.bone_target]
+                                driver_fixes += 1
+            if driver_fixes or mesh_arm_driver_targets:
+                print(f"  Fixed {driver_fixes} armature driver ref(s), {len(mesh_arm_driver_targets)} mesh driver ref(s)")
 
             if group_bone_collections:
                 arm_data = source_arm.data

@@ -7,6 +7,8 @@ from ..op.ops_nodeeditor import (
     NODE_OT_node_bake_all_materials,
     NODE_OT_node_bake_remove,
     NODE_OT_node_bake_run,
+    NODE_OT_node_bake_auto_resolution,
+    NODE_OT_node_bake_auto_colorspace
 )
 
 
@@ -19,25 +21,33 @@ class TOOLS_PT_KitsuneTool_Panel(Panel):
 
 class NODE_UL_nodes_to_bake(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname): # pyright: ignore
-        row = layout.row(align=True)
-
-        node = None
-        for mat in bpy.data.materials:
-            if mat.node_tree and item.node_name in mat.node_tree.nodes:
-                node = mat.node_tree.nodes[item.node_name]
-                break
+        mat = data.id_data
+        node = mat.node_tree.nodes.get(item.node_name) if mat and mat.node_tree else None
 
         if node:
-            if hasattr(node, 'node_tree') and node.node_tree:
+            if node.label:
+                display_name = node.label
+            elif hasattr(node, 'node_tree') and node.node_tree:
                 display_name = node.node_tree.name
             else:
                 display_name = node.name
         else:
             display_name = item.node_name if item.node_name else "Select Node..."
 
+        row = layout.row(align=True)
         row.label(text=display_name, icon='NODE')
+
+        sub = row.row()
+        sub.alignment = 'RIGHT'
+        if not  item.sync_y_with_x:
+            sub.label(text=f"{item.resolution_x}x{item.resolution_y}")
+        else:
+            sub.label(text=f"{item.resolution_x}")
+
+        sub.label(text=item.color_space)
+
         if item.name:
-            row.label(text=f"({item.name})")
+            sub.label(text=f"({item.name})")
 
 
 class NODE_UL_material_list(UIList):
@@ -48,7 +58,13 @@ class NODE_UL_material_list(UIList):
             mat = item.material
 
         if mat:
-            layout.prop(mat, "name", text="", icon_value=layout.icon(mat), emboss=False)
+            row = layout.row(align=True)
+            row.prop(mat, "name", text="", icon_value=layout.icon(mat), emboss=False)
+            count = len(mat.kitsunetools.node_baker_list)
+            if count > 0:
+                sub = row.row()
+                sub.alignment = 'RIGHT'
+                sub.label(text=f"{str(count)} Nodes")
         else:
             layout.label(text="(empty slot)", icon='BLANK1')
 
@@ -111,8 +127,16 @@ class NODE_PT_KitsuneTool_NodeBaker(TOOLS_PT_KitsuneTool_Panel):
             row.template_list("NODE_UL_nodes_to_bake", "", mat.kitsunetools, "node_baker_list", mat.kitsunetools, "node_baker_list_index")
             
             col = row.column(align=True)
-            col.operator(NODE_OT_node_bake_add.bl_idname, icon='ADD', text="")
-            col.operator(NODE_OT_node_bake_remove.bl_idname, icon='REMOVE', text="")
+            op = col.operator(NODE_OT_node_bake_add.bl_idname, icon='ADD', text="")
+            op.material_name = mat.name if listmode == 'ALL' else ""
+            op = col.operator(NODE_OT_node_bake_remove.bl_idname, icon='REMOVE', text="")
+            op.material_name = mat.name if listmode == 'ALL' else ""
+
+            row = layout.row()
+            op = row.operator(NODE_OT_node_bake_auto_resolution.bl_idname)
+            op.material_name = mat.name
+            op = row.operator(NODE_OT_node_bake_auto_colorspace.bl_idname)
+            op.material_name = mat.name
 
             def _draw_split(box, label, prop_owner, prop_name, **kwargs):
                 split = box.split(factor=0.4)
@@ -164,6 +188,10 @@ class NODE_PT_KitsuneTool_NodeBaker(TOOLS_PT_KitsuneTool_Panel):
                 sub = split.row(align=True)
                 sub.prop(item, "color_space", text="")
 
+                split = box.split(factor=0.4)
+                split.alignment = 'RIGHT'
+                split.label(text="")
+                split.prop(item, "bypass_texture_mapping")
 
             layout.separator()
             layout.prop(context.scene.kitsunetools, "node_baker_export_dir")

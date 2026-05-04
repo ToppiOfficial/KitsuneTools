@@ -85,9 +85,11 @@ def mirror_pose_handler(scene, depsgraph):
         return
 
     # If the user re-enabled Blender's built-in mirror, disable ours
-    if obj.data.use_mirror_x:
-        props.x_mirror_pose = False
-        return
+    # This doesn't work! why?
+    #
+    #if obj.data.use_mirror_x:
+    #    props.x_mirror_pose = False
+    #    return
 
     selected = context.selected_pose_bones
     if not selected:

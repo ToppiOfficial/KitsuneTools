@@ -1,6 +1,6 @@
 import bpy, mathutils, re
 from bpy.types import Bone, PoseBone, Object
-from .utils_contextmanagers import is_addon_enabled, selfreport, report, preserve_context_mode, preserve_armature_state
+from .utils_contextmanagers import is_addon_enabled, selfreport, report, preserve_context_mode, preserve_armature_state, unhide_all_objects
 from .utils_object import is_armature, get_armature
 from .utils_armature import get_armature_meshes
 
@@ -306,7 +306,7 @@ def subdivide_bone(bone: str | list, armature : Object, subdivisions: int = 2, f
 
     if bone is None: return None
     
-    with preserve_armature_state(armature, reset_pose=True):
+    with unhide_all_objects(), preserve_armature_state(armature, reset_pose=True):
         meshes = get_armature_meshes(armature, visible_only=bpy.context.scene.kitsunetools.visible_mesh_only)
         if not meshes:
             return
@@ -457,46 +457,49 @@ def merge_bones(armature: Object, source: Bone, target: Bone | list[Bone], keep_
             parent = parent.parent
         return parent
 
-    def _merge_vertex_groups(source_bone: Bone,target_bone: Bone,processed_groups: set[str],):
-        """
-        Merges vertex weights from the target bone's group to the source bone's group
-        on all meshes associated with the armature.
-        """
-        for mesh in get_armature_meshes(armature):
-            if visible_mesh_only and not mesh.visible_get():
-                continue
+    def _merge_vertex_groups(source_bone: Bone, target_bone: Bone, processed_groups: set[str]):
+        try:
+            # This is utterly fucking retarded.
+            source_name = source_bone.name
+            target_name = target_bone.name
+        except ReferenceError:
+            return
 
-            vgs = mesh.vertex_groups
-            target_group = vgs.get(target_bone.name)
-            if not target_group:
-                continue
+        with unhide_all_objects():
+            for mesh in get_armature_meshes(armature):
+                if visible_mesh_only and not mesh.visible_get():
+                    continue
 
-            source_group = vgs.get(source_bone.name)
-            if not source_group:
-                source_group = vgs.new(name=source_bone.name)
-            
-            target_group_index = target_group.index
+                vgs = mesh.vertex_groups
+                target_group = vgs.get(target_name)
+                if not target_group:
+                    continue
 
-            # Optimized loop to gather vertex weights
-            weights_to_add = []
-            for v in mesh.data.vertices:
-                for g in v.groups:
-                    if g.group == target_group_index:
-                        weights_to_add.append((v.index, g.weight))
-                        break  # Vertex found in group, move to the next vertex
+                source_group = vgs.get(source_name)
+                if not source_group:
+                    source_group = vgs.new(name=source_name)
 
-            if not weights_to_add:
+                target_group_index = target_group.index
+
+                weights_to_add = []
+                for v in mesh.data.vertices:
+                    for g in v.groups:
+                        if g.group == target_group_index:
+                            weights_to_add.append((v.index, g.weight))
+                            break
+
+                if not weights_to_add:
+                    if not keep_original_weight:
+                        vgs.remove(target_group)
+                    continue
+
+                for vertex_index, weight in weights_to_add:
+                    source_group.add([vertex_index], weight, 'ADD')
+
+                processed_groups.add(target_name)
+
                 if not keep_original_weight:
                     vgs.remove(target_group)
-                continue
-                
-            for vertex_index, weight in weights_to_add:
-                source_group.add([vertex_index], weight, 'ADD')
-
-            processed_groups.add(target_bone.name)
-
-            if not keep_original_weight:
-                vgs.remove(target_group)
 
     def _update_constraints(old_target: str, new_target: str):
         """

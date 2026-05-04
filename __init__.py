@@ -122,12 +122,14 @@ class BakeNodeItem(PropertyGroup):
         ('8', '8', ''),
         ('16', '16', ''),
         ('32', '32', ''),
+        ('64', '64', ''),
         ('128', '128', ''),
         ('256', '256', ''),
         ('512', '512', ''),
         ('1024', '1024', ''),
         ('2048', '2048', ''),
         ('4096', '4096', ''),
+        ('8192', '8192', ''),
     ]
 
     color_space = [
@@ -135,17 +137,58 @@ class BakeNodeItem(PropertyGroup):
         ('Non-Color', 'Non-Color (Data)', '')
     ]
 
-    node_name: StringProperty(name="Node Name")
-    name: StringProperty(name="Suffix", default="")
-    socket_index: EnumProperty(name="Output", items=utils_material._get_socket_items)
-    has_alpha_channel : BoolProperty(name="Has Alpha Channel", default=False)
-    alpha_socket_index : EnumProperty(name="Output", items=utils_material._get_socket_items)
-
-    sync_y_with_x: BoolProperty(name="Sync Resolution", default=True)
-    resolution_x: EnumProperty(name="X Resolution",items=resolutions,default='2048')
-    resolution_y: EnumProperty(name="Y Resolution",items=resolutions,default='2048')
-
-    color_space: EnumProperty(name="Type",items=color_space,default='Non-Color')
+    node_name: StringProperty(
+        name="Node Name",
+        description="Name of the source node in the material node tree to bake from",
+    )
+    name: StringProperty(
+        name="Suffix",
+        description="Suffix appended to the material name when saving the baked file. Defaults to the socket name if left empty",
+        default="",
+    )
+    socket_index: EnumProperty(
+        name="Output",
+        description="Output socket on the source node whose value will be baked",
+        items=utils_material._get_socket_items,
+    )
+    has_alpha_channel: BoolProperty(
+        name="Has Alpha Channel",
+        description="Bake a second pass for the alpha channel and merge it into the final image using PIL",
+        default=False,
+    )
+    alpha_socket_index: EnumProperty(
+        name="Alpha Output",
+        description="Output socket to use as the alpha channel in the merged image",
+        items=utils_material._get_socket_items,
+    )
+    sync_y_with_x: BoolProperty(
+        name="Sync Resolution",
+        description="Lock the Y resolution to match X, producing a square texture",
+        default=True,
+    )
+    resolution_x: EnumProperty(
+        name="X Resolution",
+        description="Horizontal resolution of the baked texture in pixels",
+        items=resolutions,
+        default='2048',
+    )
+    resolution_y: EnumProperty(
+        name="Y Resolution",
+        description="Vertical resolution of the baked texture in pixels. Only used when Sync Resolution is disabled",
+        items=resolutions,
+        default='2048',
+    )
+    color_space: EnumProperty(
+        name="Color Space",
+        description="Color space for the baked image. Use sRGB for color data and Non-Color for masks, normals, or other non-color data",
+        items=color_space,
+        default='Non-Color',
+    )
+    bypass_texture_mapping: BoolProperty(
+        name="Bypass Texture Mapping",
+        description="Temporarily disconnect the Vector input on all upstream texture nodes before baking, so textures use their default UV coordinates instead of any Mapping or vector node chain",
+        default=False,
+    )
 
     def get_node(self):
         mat = self.id_data
@@ -302,6 +345,7 @@ _classes = (
     ops_bone.BONE_OT_CreateCenterBone,
     ops_bone.BONE_OT_parent_bone_in_pose,
     ops_bone.BONE_OT_RemoveBone,
+    ops_bone.BONE_OT_kitsune_mirror_pose,
 
     ops_mesh.MESH_OT_CleanShapeKeys,
     ops_mesh.MESH_OT_RemoveUnusedVertexGroups,
@@ -339,6 +383,8 @@ _classes = (
     ops_nodeeditor.NODE_OT_node_bake_run,
     ops_nodeeditor.NODE_OT_copy_node_values,
     ops_nodeeditor.NODE_OT_set_copy_input,
+    ops_nodeeditor.NODE_OT_node_bake_auto_resolution,
+    ops_nodeeditor.NODE_OT_node_bake_auto_colorspace,
 
     ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected,
     ops_humanoidmapper.HUMANOIDMAPPER_OT_LoadPreset,

@@ -1,4 +1,4 @@
-import bpy, os
+import bpy, os, re
 from bpy.types import Operator
 from PIL import Image
 from ..utils.utils_object import is_mesh
@@ -9,9 +9,13 @@ class NODE_OT_node_bake_add(Operator):
     bl_idname = "kitsunetools.node_bake_node_add"
     bl_label = "Add Bake Item"
     bl_options = {'UNDO'}
+
+    material_name: bpy.props.StringProperty(default="")
     
     def execute(self, context) -> set:
-        mat = context.active_object.active_material
+        mat = bpy.data.materials.get(self.material_name) if self.material_name else context.active_object.active_material
+        if not mat:
+            return {'CANCELLED'}
         node = context.space_data.node_tree.nodes.active
         item = mat.kitsunetools.node_baker_list.add()
         if node: item.node_name = node.name
@@ -23,9 +27,13 @@ class NODE_OT_node_bake_remove(Operator):
     bl_idname = "kitsunetools.node_bake_node_remove"
     bl_label = "Remove Bake Item"
     bl_options = {'UNDO'}
+
+    material_name: bpy.props.StringProperty(default="")
     
     def execute(self, context) -> set:
-        mat = context.active_object.active_material
+        mat = bpy.data.materials.get(self.material_name) if self.material_name else context.active_object.active_material
+        if not mat:
+            return {'CANCELLED'}
         mat.kitsunetools.node_baker_list.remove(mat.kitsunetools.node_baker_list_index)
         mat.kitsunetools.node_baker_list_index = max(0, mat.kitsunetools.node_baker_list_index - 1)
         return {'FINISHED'}
@@ -52,6 +60,24 @@ def _restore_after_plane(context, temp_plane, prev_active, prev_selected):
     bpy.data.objects.remove(temp_plane, do_unlink=True)
     for o in prev_selected: o.select_set(True)
     context.view_layer.objects.active = prev_active
+
+
+def _collect_tex_nodes_upstream(start_node):
+    """Return all ShaderNodeTexImage nodes reachable upstream from start_node."""
+    visited, tex_nodes = set(), []
+
+    def traverse(node):
+        if node in visited:
+            return
+        visited.add(node)
+        if node.type == 'TEX_IMAGE':
+            tex_nodes.append(node)
+        for inp in node.inputs:
+            for link in inp.links:
+                traverse(link.from_node)
+
+    traverse(start_node)
+    return tex_nodes
 
 
 def _run_bake_for_material(operator, context, obj, mat, export_path):
@@ -105,7 +131,9 @@ def _run_bake_for_material(operator, context, obj, mat, export_path):
         print(f"    Done -> {os.path.join(export_path, filename)}")
         operator.report({'INFO'}, f"Baked '{filename}' -> {os.path.join(export_path, filename)}")
 
-
+#
+#   FIXME: Somewhere in the process can cause a hang that even keyboard interrupt doesn't seem to work !!
+#
 class NODE_OT_node_bake_run(Operator):
     bl_idname = "kitsunetools.node_bake_run"
     bl_label = "Run Node Bake"
@@ -192,6 +220,12 @@ class NODE_OT_node_bake_run(Operator):
 
         print(f"      _process_bake | res_x={res_x} | res_y={res_y} | colorspace='{colorspace}' | save_alpha={save_alpha}")
 
+        print(f"      >> creating image...")
+        bake_img = bpy.data.images.new("_temp_bake", width=res_x, height=res_y, alpha=save_alpha)
+        print(f"      >> setting colorspace '{colorspace}'...")
+        bake_img.colorspace_settings.name = colorspace
+        print(f"      >> image ready.")
+
         bake_img = bpy.data.images.new("_temp_bake", width=res_x, height=res_y, alpha=save_alpha)
         bake_img.colorspace_settings.name = colorspace
 
@@ -237,25 +271,44 @@ class NODE_OT_node_bake_run(Operator):
         old_transform = scene.view_settings.view_transform
         old_format = scene.render.image_settings.file_format
         old_cycles_device = scene.cycles.device
+        old_samples = scene.cycles.samples
 
         scene.render.engine = 'CYCLES'
         scene.cycles.bake_type = 'EMIT'
+        scene.cycles.samples = 1
         scene.view_settings.view_transform = 'Standard'
 
         cycles_addon = bpy.context.preferences.addons.get('cycles')
         if cycles_addon:
             cprefs = cycles_addon.preferences
-            cprefs.refresh_devices()
-            has_gpu = any(d.type != 'CPU' for d in cprefs.devices)
+            has_gpu = any(d.use and d.type != 'CPU' for d in cprefs.devices)
             scene.cycles.device = 'GPU' if has_gpu else 'CPU'
         else:
             scene.cycles.device = 'CPU'
+
+        if not obj.data.uv_layers:
+            obj.data.uv_layers.new(name="UVMap")
+            print(f"      Added missing UV layer to bake target '{obj.name}'.")
+
+        vector_links = []
+        if item.bypass_texture_mapping:
+            for tex_node in _collect_tex_nodes_upstream(node):
+                vec_input = tex_node.inputs.get('Vector')
+                if vec_input and vec_input.links:
+                    for link in list(vec_input.links):
+                        vector_links.append((link.from_socket, link.to_socket))
+                        ntree.links.remove(link)
+            if vector_links:
+                print(f"      bypass_texture_mapping: disconnected {len(vector_links)} vector link(s).")
 
         print(f"      Running bpy.ops.object.bake (device={scene.cycles.device})...")
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
         context.view_layer.objects.active = obj
         bpy.ops.object.bake(type='EMIT')
+
+        for f, t in vector_links:
+            ntree.links.new(f, t)
 
         if not save_alpha:
             pixels = list(bake_img.pixels)
@@ -274,6 +327,7 @@ class NODE_OT_node_bake_run(Operator):
 
         scene.render.engine = old_engine
         scene.cycles.device = old_cycles_device
+        scene.cycles.samples = old_samples
         scene.view_settings.view_transform = old_transform
         scene.render.image_settings.file_format = old_format
 
@@ -600,4 +654,256 @@ class NODE_OT_set_copy_input(Operator):
  
     def execute(self, context) -> set:
         context.window_manager['_copy_node_selected_input'] = self.input_name #pyright: ignore
+        return {'FINISHED'}
+
+class NODE_OT_node_bake_auto_resolution(Operator):
+    bl_idname = "node.node_bake_auto_resolution"
+    bl_label = "Auto Resolution"
+    bl_description = "Set resolution from the average of all connected Image Texture nodes"
+
+    material_name: StringProperty(default="")
+
+    mode: bpy.props.EnumProperty(
+        items=[
+            ('ACTIVE',         "Active Item",              "Only the active item in the active material"),
+            ('ALL_ACTIVE_MAT', "All in Active Material",   "All items in the active material"),
+            ('ALL_MATERIALS',  "All Materials",            "All items across all materials"),
+        ],
+        default='ACTIVE',
+    )
+
+    filter_regex: StringProperty(
+        name="Filter Regex",
+        description="Only process items whose match field satisfies this regex. Leave empty to match all.",
+        default="",
+    )
+
+    filter_by: bpy.props.EnumProperty(
+        name="Filter By",
+        items=[
+            ('ITEM_NAME',  "Item Name",  "Match against the baker item's suffix name"),
+            ('NODE_NAME',  "Node Name",  "Match against the node's internal name"),
+            ('NODE_LABEL', "Node Label", "Match against the node's label"),
+        ],
+        default='ITEM_NAME',
+    )
+
+    reducer: bpy.props.IntProperty(
+        name="Reducer",
+        description="Divide the averaged resolution before snapping. 1 = no reduction, 2 = half, etc.",
+        default=1,
+        min=1,
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=300)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "mode")
+        layout.prop(self, "reducer")
+        layout.separator()
+        layout.label(text="Filter:")
+        layout.prop(self, "filter_by", text="")
+        layout.prop(self, "filter_regex", text="Regex")
+
+    def _get_materials(self, context):
+        if self.mode == 'ALL_MATERIALS':
+            return [m for m in bpy.data.materials if m.use_nodes and m.kitsunetools.node_baker_list]
+
+        if self.material_name:
+            mat = bpy.data.materials.get(self.material_name)
+        else:
+            obj = context.active_object
+            mat = obj.active_material if obj else None
+        return [mat] if mat and mat.use_nodes else []
+
+    def _get_items(self, mat):
+        kt = mat.kitsunetools
+        if self.mode == 'ACTIVE':
+            if not kt.node_baker_list or kt.node_baker_list_index >= len(kt.node_baker_list):
+                return []
+            return [kt.node_baker_list[kt.node_baker_list_index]]
+        return list(kt.node_baker_list)
+
+    def _matches_filter(self, item, node):
+        if not self.filter_regex:
+            return True
+        try:
+            pattern = re.compile(self.filter_regex)
+        except re.error:
+            return True
+
+        if self.filter_by == 'ITEM_NAME':
+            target = item.name
+        elif self.filter_by == 'NODE_NAME':
+            target = node.name if node else ""
+        else:  # NODE_LABEL
+            target = node.label if node else ""
+
+        return bool(pattern.search(target))
+
+    def execute(self, context) -> set:
+        resolutions = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+
+        materials = self._get_materials(context)
+        if not materials:
+            self.report({'WARNING'}, "No valid material(s) found")
+            return {'CANCELLED'}
+
+        resolved = 0
+        for mat in materials:
+            for item in self._get_items(mat):
+                node = mat.node_tree.nodes.get(item.node_name)
+
+                if not self._matches_filter(item, node):
+                    continue
+                if not node:
+                    continue
+
+                visited = set()
+                sizes = []
+                stack = [node]
+                while stack:
+                    current = stack.pop()
+                    if current.name in visited:
+                        continue
+                    visited.add(current.name)
+                    if current.type == 'TEX_IMAGE' and current.image and current.image.size[0] > 0:
+                        sizes.append((current.image.size[0], current.image.size[1]))
+                    for inp in current.inputs:
+                        for link in inp.links:  # pyright: ignore
+                            if link.from_node.name not in visited:
+                                stack.append(link.from_node)
+
+                if not sizes:
+                    continue
+
+                avg_x = (sum(w for w, _ in sizes) / len(sizes)) / self.reducer
+                avg_y = (sum(h for _, h in sizes) / len(sizes)) / self.reducer
+                snapped_x = str(min(resolutions, key=lambda r: abs(r - avg_x)))
+                snapped_y = str(min(resolutions, key=lambda r: abs(r - avg_y)))
+
+                item.resolution_x = snapped_x
+                if snapped_x != snapped_y:
+                    item.sync_y_with_x = False
+                    item.resolution_y = snapped_y
+                else:
+                    item.sync_y_with_x = True
+                resolved += 1
+
+        if resolved == 0:
+            self.report({'WARNING'}, "No Image Texture nodes with valid images found")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Auto resolution applied to {resolved} item(s)")
+        return {'FINISHED'}
+    
+
+class NODE_OT_node_bake_auto_colorspace(Operator):
+    bl_idname = "node.node_bake_auto_colorspace"
+    bl_label = "Set Color Space"
+    bl_description = "Set color space on items, optionally filtered by regex"
+
+    material_name: StringProperty(default="")
+
+    mode: bpy.props.EnumProperty(
+        items=[
+            ('ACTIVE',         "Active Item",            "Only the active item in the active material"),
+            ('ALL_ACTIVE_MAT', "All in Active Material", "All items in the active material"),
+            ('ALL_MATERIALS',  "All Materials",          "All items across all materials"),
+        ],
+        default='ACTIVE',
+    )
+
+    color_space: bpy.props.EnumProperty(
+        name="Color Space",
+        items=[
+            ('sRGB',      'sRGB (Color)',    ''),
+            ('Non-Color', 'Non-Color (Data)', ''),
+        ],
+        default='sRGB',
+    )
+
+    filter_regex: StringProperty(
+        name="Filter Regex",
+        description="Only process items whose match field satisfies this regex. Leave empty to match all.",
+        default="",
+    )
+
+    filter_by: bpy.props.EnumProperty(
+        name="Filter By",
+        items=[
+            ('ITEM_NAME',  "Item Name",  "Match against the baker item's suffix name"),
+            ('NODE_NAME',  "Node Name",  "Match against the node's internal name"),
+            ('NODE_LABEL', "Node Label", "Match against the node's label"),
+        ],
+        default='ITEM_NAME',
+    )
+
+    def _get_materials(self, context):
+        if self.mode == 'ALL_MATERIALS':
+            return [m for m in bpy.data.materials if m.use_nodes and m.kitsunetools.node_baker_list]
+        if self.material_name:
+            mat = bpy.data.materials.get(self.material_name)
+        else:
+            obj = context.active_object
+            mat = obj.active_material if obj else None
+        return [mat] if mat and mat.use_nodes else []
+
+    def _get_items(self, mat):
+        kt = mat.kitsunetools
+        if self.mode == 'ACTIVE':
+            if not kt.node_baker_list or kt.node_baker_list_index >= len(kt.node_baker_list):
+                return []
+            return [kt.node_baker_list[kt.node_baker_list_index]]
+        return list(kt.node_baker_list)
+
+    def _matches_filter(self, item, node):
+        if not self.filter_regex:
+            return True
+        try:
+            pattern = re.compile(self.filter_regex)
+        except re.error:
+            return True
+        if self.filter_by == 'ITEM_NAME':
+            target = item.name
+        elif self.filter_by == 'NODE_NAME':
+            target = node.name if node else ""
+        else:  # NODE_LABEL
+            target = node.label if node else ""
+        return bool(pattern.search(target))
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=300)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "mode")
+        layout.prop(self, "color_space")
+        layout.separator()
+        layout.label(text="Filter:")
+        layout.prop(self, "filter_by", text="")
+        layout.prop(self, "filter_regex", text="Regex")
+
+    def execute(self, context) -> set:
+        materials = self._get_materials(context)
+        if not materials:
+            self.report({'WARNING'}, "No valid material(s) found")
+            return {'CANCELLED'}
+
+        applied = 0
+        for mat in materials:
+            for item in self._get_items(mat):
+                node = mat.node_tree.nodes.get(item.node_name)
+                if not self._matches_filter(item, node):
+                    continue
+                item.color_space = self.color_space
+                applied += 1
+
+        if applied == 0:
+            self.report({'WARNING'}, "No matching items found")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Color space set to '{self.color_space}' on {applied} item(s)")
         return {'FINISHED'}

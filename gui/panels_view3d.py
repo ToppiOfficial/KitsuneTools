@@ -25,6 +25,7 @@ from ..op.ops_bone import (
     BONE_OT_CreateCenterBone,
     BONE_OT_parent_bone_in_pose,
     BONE_OT_RemoveBone,
+    BONE_OT_kitsune_mirror_pose
 )
 from ..op.ops_mesh import (
     MESH_OT_CleanShapeKeys,
@@ -101,6 +102,8 @@ class TOOLS_PT_KitsuneTool_Armature(TOOLS_PT_KitsuneTool_Panel):
             bx = l.box().column(align=True)
             bx.prop(active_armature.data.kitsunetools, 'x_mirror_pose')
             bx.prop(active_armature.data.kitsunetools, 'x_mirror_tolerance')
+            bx.separator()
+            bx.operator(BONE_OT_kitsune_mirror_pose.bl_idname)
 
         bx = l.box()
 

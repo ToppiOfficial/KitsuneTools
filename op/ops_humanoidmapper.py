@@ -125,7 +125,7 @@ class HUMANOIDMAPPER_OT_LoadPreset(Operator):
         self.report({'INFO'}, f"Loaded preset from: {self.filepath} ({len(items)} items)")
         return {'FINISHED'}
 
-
+# This is a very dumb feature.
 class HUMANOIDMAPPER_OT_LoadConfig(Operator):
     bl_idname= "kitsunetools.humanoidmapper_load_json"
     bl_label= "Load JSON"
@@ -137,17 +137,24 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
         name="Load Options",
         description="Select which parts of the JSON to load",
         items=[
-            ("EXPORT_NAME", "Export Name", "Load bone export names"),
-            ("BONE_EXROTATION", "Bone Export Rotation", "Load export rotation offsets"),
-            ("BONE_ROTATION", "Bone Rotation", "Load bone rotations"),
-            ("CONSTRAINTS", "Constraints", "Create twist bone constraints"),
-            ("TWIST_BONES", "Twist Bones", "Create twist bones"),
-            ("HIERARCHY", "Hierarchy", "Update bone parent relationships"),
-            ("MISSING_BONES", "Missing Bones", "Create bones that don't exist in armature"),
-            ("RESCALE_BONES", "Rescale Bones", "Align bone tails to child heads based on hierarchy")
+            ("EXPORT_NAME",      "Export Name",         "Set each bone's export name from the JSON ExportName field"),
+            ("BONE_EXROTATION",  "Bone Export Rotation","Apply per-bone export rotation offsets (ExportRotationOffset)"),
+            ("BONE_ROTATION",    "Bone Rotation",        "Orient bones using the Rotation and Roll values from the JSON"),
+            ("CONSTRAINTS",      "Constraints",          "Add Y-rotation drivers to twist bones (requires Twist Bones)"),
+            ("TWIST_BONES",      "Twist Bones",          "Create twist bones alongside bones that have a TwistBoneCount defined"),
+            ("HIERARCHY",        "Hierarchy",            "Re-parent bones according to the ParentBone field in the JSON"),
+            ("MISSING_BONES",    "Missing Bones",        "Create any bones referenced in the JSON that don't exist in the armature"),
+            ("RESCALE_BONES",    "Rescale Bones",        "Move each bone's tail to its JSON child's head, keeping lengths consistent"),
         ],
-        default={"EXPORT_NAME", "BONE_EXROTATION", "CONSTRAINTS","BONE_ROTATION", "TWIST_BONES", "HIERARCHY", "MISSING_BONES", "RESCALE_BONES"},
+        default={"EXPORT_NAME", "BONE_EXROTATION", "CONSTRAINTS", "BONE_ROTATION", "TWIST_BONES", "HIERARCHY", "MISSING_BONES", "RESCALE_BONES"},
         options={"ENUM_FLAG"}
+    )
+
+    extra_twist_bones: IntProperty(
+        name="Extra Twist Bones",
+        description="Additional twist bones added on top of what the JSON defines. Has no effect if the JSON specifies no twist bones for a bone",
+        default=1,
+        min=0
     )
 
     remove_intermediate_bones: BoolProperty(
@@ -213,6 +220,9 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
         col.separator()
         col.prop(self, "remove_intermediate_bones")
 
+        col.separator()
+        col.prop(self, "extra_twist_bones")
+
         if self.up_to_bone_attr:
             col.separator()
             box = col.box()
@@ -275,6 +285,10 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
             
         return {"FINISHED"}
     
+    def _get_twist_count(self, bone_data: dict) -> int:
+        base = bone_data.get("TwistBoneCount") or (1 if bone_data.get("TwistBones") else 0)
+        return base + self.extra_twist_bones if base > 0 else 0
+
     def _apply_temp_renames_to_mapped_bones(self, arm: Object, kitsunetools_arm, bones, bone_elements: dict) -> dict:
         temp_prefix = "__MAPPED__"
         existing_prefix = "__EXISTING__"
@@ -854,7 +868,7 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
             self.assign_bone_headtip_positions(arm, [(bone_name, None, None, None, roll)])
 
     def _setup_twist_bones(self, arm: Object, bone, bone_name: str, bone_data: dict) -> None:
-        twist_count = bone_data.get("TwistBoneCount") or (1 if bone_data.get("TwistBones") else 0)
+        twist_count = self._get_twist_count(bone_data)
         if twist_count <= 0:
             return
 
@@ -875,12 +889,9 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
 
     def _create_single_twist_bone(self, arm: Object, bone, bone_name: str, base_head, total_vec) -> None:
         twist_name = self._get_twist_bone_name(bone_name, 0)
-        if arm.data.edit_bones.get(twist_name):
-            return
-
         mid_point = base_head + total_vec * 0.5
 
-        twistbone = arm.data.edit_bones.new(bone_name)
+        twistbone = arm.data.edit_bones.get(twist_name) or arm.data.edit_bones.new(bone_name)
         twistbone.head = mid_point
         twistbone.tail = base_head + total_vec
         twistbone.roll = bone.roll
@@ -891,13 +902,10 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
 
         for i in range(twist_count):
             twist_name = self._get_twist_bone_name(bone_name, i)
-            if arm.data.edit_bones.get(twist_name):
-                continue
-
             factor_start = i * segment_length
             factor_end = (i + 1) * segment_length
 
-            twistbone = arm.data.edit_bones.new(bone_name)
+            twistbone = arm.data.edit_bones.get(twist_name) or arm.data.edit_bones.new(bone_name)
             twistbone.head = base_head + total_vec * factor_start
             twistbone.tail = base_head + total_vec * factor_end
             twistbone.roll = bone.roll
@@ -916,7 +924,7 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
                 setattr(pb.bone.vs, 'export_name', get_canonical_bonename(bone_data.get("ExportName")))
 
             if 'TWIST_BONES' in self.load_options:
-                twist_count = bone_data.get("TwistBoneCount") or (1 if bone_data.get("TwistBones") else 0)
+                twist_count = self._get_twist_count(bone_data)
                 if twist_count > 0:
                     self._assign_twist_bones_to_collection(arm, bone_name, twist_count)
 
@@ -948,7 +956,7 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
 
     def _setup_twist_constraints(self, arm: Object, pb, bone_name: str, bone_data: dict) -> None:
         twist_target = bone_data.get("TwistBones")
-        twist_count = bone_data.get("TwistBoneCount") or (1 if twist_target else 0)
+        twist_count = self._get_twist_count(bone_data)
 
         if twist_count == 0:
             return
@@ -974,7 +982,11 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
     # Blender's constraint for targetting parent gives horrible results, so lets use drivers instead!
     def _add_twist_driver(self, arm: Object, pbtwist, twist_target: str, influence: float, invert: bool = False) -> None:
         pbtwist.rotation_mode = 'XYZ'
-        pbtwist.driver_remove('rotation_euler', 1)
+        
+        try:
+            pbtwist.driver_remove('rotation_euler', 1)
+        except Exception:
+            pass
 
         fc = pbtwist.driver_add('rotation_euler', 1)
         drv = fc.driver

@@ -5,6 +5,7 @@ from mathutils import Matrix, Vector
 from ..utils.utils_object import is_armature, is_mesh, get_armature
 from ..utils.utils_armature import get_armature_meshes, preserve_context_mode, get_selected_bones, get_visible_bones
 from ..utils.utils_bone import merge_bones, remove_bone, centralize_bone_pairs, subdivide_bone
+from ..utils.utils_pose import _find_mirror_bone, _copy_mirrored_pose
 
 
 class BONE_OT_CopyTargetRotation(Operator): 
@@ -849,4 +850,34 @@ class BONE_OT_RemoveBone(Operator):
             remove_bone(armature, self.selected_bone)
 
         self.report({'INFO'}, f'Removed bone {self.selected_bone}')
+        return {'FINISHED'}
+    
+
+class BONE_OT_kitsune_mirror_pose(bpy.types.Operator):
+    bl_idname = "kitsunetools.mirror_selected_pose"
+    bl_label = "Mirror Pose (Manually)"
+    bl_description = "Mirror selected bones to their X-axis counterparts"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context) -> bool:
+        return bool(context.mode == 'POSE' and context.object and context.object.type == 'ARMATURE')
+
+    def execute(self, context) -> set:
+        obj = context.object
+        props = obj.data.kitsunetools
+        selected = context.selected_pose_bones
+
+        if not selected:
+            self.report({'WARNING'}, "No bones selected")
+            return {'CANCELLED'}
+
+        mirrored = 0
+        for pb in selected:
+            mirror = _find_mirror_bone(obj, pb, props.x_mirror_tolerance)
+            if mirror:
+                _copy_mirrored_pose(pb, mirror)
+                mirrored += 1
+
+        self.report({'INFO'}, f"Mirrored {mirrored} bone(s)")
         return {'FINISHED'}
