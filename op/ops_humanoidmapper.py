@@ -701,7 +701,7 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
             self._process_bones_edit_mode(arm, bone_elements)
             self._process_bones_object_mode(arm, bone_elements)
             self._assign_eye_bones_to_face_collection(arm)
-            #self._assign_hair_bones_to_collection(arm)
+            self._assign_hair_bones_to_collection(arm)
 
     def _ensure_default_collection(self, arm: Object) -> BoneCollection:
         default_collection = arm.data.collections.get('Default')
@@ -1063,8 +1063,12 @@ class HUMANOIDMAPPER_OT_LoadConfig(Operator):
         if not hair_bones:
             return
 
-        default_collection = self._ensure_default_collection(arm)
-        hair_collection = self._ensure_child_collection(arm, "Hair", default_collection)
+        self._ensure_default_collection(arm)
+        hair_collection = next((c for c in arm.data.collections_all if c.name == "Hair"), None)
+        if hair_collection is None:
+            hair_collection = arm.data.collections.new("Hair")
+        else:
+            hair_collection.parent = None
 
         for bone in hair_bones:
             for col in list(bone.collections):

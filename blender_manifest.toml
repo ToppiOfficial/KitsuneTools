@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 id = "kitsune_tools"
 name = "Kitsune Tools"
-version = "0.1.1"
+version = "0.1.2"
 tagline = "Set of tools for Blender that can be useful for assisting on character rigging. Previously embedded within KitsuneSourceTool"
 maintainer = "Toppi"
 type = "add-on"

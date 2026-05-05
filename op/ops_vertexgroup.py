@@ -400,11 +400,18 @@ class VERTEXGROUP_OT_multi_weight_paint_finish(Operator):
         
         bpy.ops.object.select_all(action='DESELECT')
         
+        combined_vg_names = {vg.name for vg in combined_obj.vertex_groups}
+
         for target_obj in original_meshes:
             vg_name = target_obj.get("__temp_id_vg_name")
             if not vg_name or not combined_obj.vertex_groups.get(vg_name):
                 self.report({'WARNING'}, f"Object {target_obj.name} missing ID vertex group. Skipping.")
                 continue
+
+            # Remove groups that were deleted from the combined object
+            for vg in list(target_obj.vertex_groups):
+                if vg.name not in combined_vg_names and not vg.name.startswith("__temp_id_"):
+                    target_obj.vertex_groups.remove(vg)
 
             context.view_layer.objects.active = combined_obj
             combined_obj.select_set(True)
