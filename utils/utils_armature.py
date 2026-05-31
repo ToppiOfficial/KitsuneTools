@@ -1,4 +1,4 @@
-import bpy
+import bpy, re
 from mathutils import Matrix
 from bpy.types import Object, Bone, PoseBone, EditBone
 from .utils_object import get_armature_meshes, is_armature
@@ -310,7 +310,7 @@ def copy_armature_visual_pose(base_armature: Object, target_armature: Object, co
     
     target_bones = sort_bones_by_hierarchy(target_armature.data.bones)
 
-    # Based on copy_attributes.py from Blender Foundation
+    # Based on copy_attributes from Blender Foundation
     # SPDX-License-Identifier: GPL-3.0-or-later
     def getmat(bone, active, ignoreparent):
         """Helper function for visual transform copy, gets the active transform in bone space"""
@@ -360,6 +360,10 @@ def copy_armature_visual_pose(base_armature: Object, target_armature: Object, co
             if copy_type == 'ORIGIN':
                 mat = getmat(target_pose_bone, base_pose_bone, False)
                 target_pose_bone.location = mat.to_translation()
+            elif copy_type == 'SCALE':
+                ignoreparent = target_data_bone.inherit_scale not in {'NONE', 'NONE_LEGACY'}
+                mat = getmat(target_pose_bone, base_pose_bone, ignoreparent)
+                target_pose_bone.scale = mat.to_scale()
             else:
                 ignoreparent = not target_data_bone.use_inherit_rotation
                 mat = getmat(target_pose_bone, base_pose_bone, ignoreparent)
@@ -493,6 +497,19 @@ def merge_armatures( source_arm: Object, target_arm: Object, match_posture: bool
             if bones_to_remove:
                 print(f"  Merged {len(bones_to_remove)} duplicate bone(s)")
 
+            # Fix stale data_paths left by removed .temp_merge bones
+            if source_arm.animation_data:
+                for fc in source_arm.animation_data.drivers:
+                    if ".temp_merge" not in fc.data_path:
+                        continue
+                    # e.g. pose.bones["Left arm.001.temp_merge"].rotation_euler
+                    new_path = re.sub(
+                        r'pose\.bones\["([^"]+)\.temp_merge"\]',
+                        lambda m: f'pose.bones["{m.group(1)}"]',
+                        fc.data_path
+                    )
+                    fc.data_path = new_path
+
             if anchor_bone:
                 anchor = source_arm.data.edit_bones.get(anchor_bone)
                 if anchor:
@@ -557,7 +574,7 @@ def merge_armatures( source_arm: Object, target_arm: Object, match_posture: bool
             for t in mesh_arm_driver_targets:
                 t.id = source_arm
 
-            # Fix drivers that came over from target_arm via join — their id is now None
+            # Fix drivers that came over from target_arm via join - their id is now None
             driver_fixes = 0
             if source_arm.animation_data:
                 for fc in source_arm.animation_data.drivers:
@@ -621,6 +638,33 @@ def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, 
 
     print(f"Transferring bone data from '{source_arm.name}' to {len(targets)} armature(s)...")
 
+    def find_collection(collections, name):
+        for col in collections:
+            if col.name == name:
+                return col
+            found = find_collection(col.children, name)
+            if found:
+                return found
+        return None
+
+    def ensure_collection(arm_data, src_col):
+        existing = find_collection(arm_data.collections, src_col.name)
+        if existing:
+            existing.is_visible = src_col.is_visible
+            return existing
+        if src_col.parent:
+            parent = ensure_collection(arm_data, src_col.parent)
+        new_col = arm_data.collections.new(src_col.name)
+        new_col.is_visible = src_col.is_visible
+        if src_col.parent:
+            new_col.parent = parent
+        return new_col
+
+    def sync_collections(arm_data, src_collections):
+        for src_col in src_collections:
+            ensure_collection(arm_data, src_col)
+            sync_collections(arm_data, src_col.children)
+
     with preserve_armature_state(source_arm, reset_pose=True), unhide_all_objects():
         source_export_map = {
             get_bone_exportname(b): b.name
@@ -652,40 +696,13 @@ def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, 
                     continue
 
                 if sync_bone_collections:
-                    def find_collection(collections, name):
-                        for col in collections:
-                            if col.name == name:
-                                return col
-                            found = find_collection(col.children, name)
-                            if found:
-                                return found
-                        return None
-
-                    def ensure_collection(arm_data, src_col):
-                        existing = find_collection(arm_data.collections, src_col.name)
-                        if existing:
-                            if src_col.parent:
-                                parent = ensure_collection(arm_data, src_col.parent)
-                                if existing.parent != parent:
-                                    existing.parent = parent
-                            else:
-                                if existing.parent is not None:
-                                    existing.parent = None
-                            existing.is_visible = src_col.is_visible
-                            return existing
-
-                        new_col = arm_data.collections.new(src_col.name)
-                        new_col.is_visible = src_col.is_visible
-                        if src_col.parent:
-                            parent = ensure_collection(arm_data, src_col.parent)
-                            new_col.parent = parent
-                        return new_col
-
-                    for src_col in source_arm.data.collections:
-                        ensure_collection(target_arm.data, src_col)
+                    sync_collections(target_arm.data, source_arm.data.collections)
 
                     for bone in target_arm.data.bones:
-                        src_b = source_arm.data.bones.get(shared.get(bone.name, ""))
+                        source_name = shared.get(bone.name)
+                        if not source_name:
+                            continue
+                        src_b = source_arm.data.bones.get(source_name)
                         if not src_b:
                             continue
                         for col in list(bone.collections):
@@ -694,6 +711,18 @@ def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, 
                             dst_col = find_collection(target_arm.data.collections, src_col.name)
                             if dst_col:
                                 dst_col.assign(bone)
+
+                    # Remove synced collections that ended up empty
+                    def collect_all(collections):
+                        result = []
+                        for col in collections:
+                            result.append(col)
+                            result.extend(collect_all(col.children))
+                        return result
+
+                    for col in reversed(collect_all(target_arm.data.collections)):
+                        if not col.bones:
+                            target_arm.data.collections.remove(col)
 
                 if data_mode in ('ALL', 'TRANSFORMS'):
                     bpy.context.view_layer.objects.active = source_arm
@@ -753,7 +782,6 @@ def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, 
                     bpy.ops.object.mode_set(mode='OBJECT')
 
                 if data_mode in ('ALL', 'PROPERTIES'):
-
                     for target_name, source_name in shared.items():
                         src_pb = source_arm.pose.bones.get(source_name)
                         dst_pb = target_arm.pose.bones.get(target_name)

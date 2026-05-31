@@ -139,6 +139,7 @@ class TOOLS_PT_KitsuneTool_Armature(TOOLS_PT_KitsuneTool_Panel):
         col.operator(ACTION_OT_Make_Proportion_Animation.bl_idname, icon='ACTION_SLOT')
         col.operator(ARMATURE_OT_CopyVisPosture.bl_idname, icon='POSE_HLT', text=f'{ARMATURE_OT_CopyVisPosture.bl_label} (LOCATION)').copy_type = 'ORIGIN'
         col.operator(ARMATURE_OT_CopyVisPosture.bl_idname, icon='POSE_HLT', text=f'{ARMATURE_OT_CopyVisPosture.bl_label} (ROTATION)').copy_type = 'ANGLES'
+        col.operator(ARMATURE_OT_CopyVisPosture.bl_idname, icon='POSE_HLT', text=f'{ARMATURE_OT_CopyVisPosture.bl_label} (SCALE)').copy_type = 'SCALE'
 
 
 class TOOLS_PT_KitsuneTool_Bone(TOOLS_PT_KitsuneTool_Panel):
@@ -253,6 +254,10 @@ class TOOLS_PT_KitsuneTool_Humanoidmapper(TOOLS_PT_KitsuneTool_Panel):
 
     def draw(self, context : Context) -> None:
         layout = self.layout
+
+        box = layout.box()
+        box.label(text="Deprecated - use Humanoid Mapper 2", icon='ERROR')
+
         bx = layout.box()
 
         ob  = context.active_object

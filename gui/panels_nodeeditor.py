@@ -8,7 +8,9 @@ from ..op.ops_nodeeditor import (
     NODE_OT_node_bake_remove,
     NODE_OT_node_bake_run,
     NODE_OT_node_bake_auto_resolution,
-    NODE_OT_node_bake_auto_colorspace
+    NODE_OT_node_bake_auto_colorspace,
+    NODE_OT_node_bake_copy,
+    NODE_OT_node_bake_paste
 )
 
 
@@ -131,6 +133,9 @@ class NODE_PT_KitsuneTool_NodeBaker(TOOLS_PT_KitsuneTool_Panel):
             op.material_name = mat.name if listmode == 'ALL' else ""
             op = col.operator(NODE_OT_node_bake_remove.bl_idname, icon='REMOVE', text="")
             op.material_name = mat.name if listmode == 'ALL' else ""
+
+            op = col.operator(NODE_OT_node_bake_copy.bl_idname, icon='COPYDOWN', text="")
+            op = col.operator(NODE_OT_node_bake_paste.bl_idname, icon='PASTEDOWN', text="")
 
             row = layout.row()
             op = row.operator(NODE_OT_node_bake_auto_resolution.bl_idname)

@@ -1353,7 +1353,7 @@ class HUMANOIDMAPPER_OT_MirrorBoneNames(Operator):
         if mirrored_count:
             self.report({'INFO'}, f"Mirrored {mirrored_count} bone name(s).")
         elif not missing_log:
-            self.report({'INFO'}, "Nothing to mirror — all pairs are already filled or empty.")
+            self.report({'INFO'}, "Nothing to mirror - all pairs are already filled or empty.")
 
         return {'FINISHED'}
 

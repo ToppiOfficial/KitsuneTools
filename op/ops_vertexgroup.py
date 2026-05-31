@@ -574,7 +574,7 @@ class VERTEXGROUP_OT_TransferSelectedGroup(Operator):
     bl_label = "Transfer Vertex Groups (Topology & Selected Pose Bones)"
     bl_description = (
         "Select: source mesh, receiver mesh, receiver's armature (active). "
-        "In Pose Mode, select a bone — copies its vertex group from source to receiver by topology."
+        "In Pose Mode, select a bone - copies its vertex group from source to receiver by topology."
     )
     bl_options = {'REGISTER', 'UNDO'}
 

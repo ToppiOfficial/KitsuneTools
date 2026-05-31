@@ -1,15 +1,17 @@
 import bpy, importlib, sys
 from bpy.types import PropertyGroup, Material
-from bpy.props import EnumProperty, BoolProperty, StringProperty, IntProperty, CollectionProperty, FloatProperty
+from bpy.props import EnumProperty, BoolProperty, StringProperty, IntProperty, CollectionProperty, FloatProperty, PointerProperty
 
 from .gui import (
     panels_view3d,
     panels_nodeeditor,
+    panels_humanoidmapper2,
 )
 from .op import (
     ops_armature,
     ops_bone,
     ops_humanoidmapper,
+    ops_humanoidmapper2,
     ops_nodeeditor,
     ops_vertexgroup,
     ops_mesh,
@@ -197,6 +199,104 @@ class BakeNodeItem(PropertyGroup):
         return None
 
 
+class HM2_FingerItem(PropertyGroup):
+    source_bone: StringProperty(name="Bone")
+    finger_type: EnumProperty(name="Type", items=[
+        ('THUMB',  'Thumb',  ''),
+        ('INDEX',  'Index',  ''),
+        ('MIDDLE', 'Middle', ''),
+        ('RING',   'Ring',   ''),
+        ('PINKY',  'Pinky',  ''),
+    ], default='INDEX')
+    side: EnumProperty(name="Side", items=[
+        ('L', 'Left',  ''),
+        ('R', 'Right', ''),
+    ], default='L')
+    joint_count: IntProperty(name="Joints", default=3, min=1, max=5)
+    generate_ik: BoolProperty(name="Finger IK", default=True)
+
+
+_HM2_TWIST_MODE_ITEMS = [
+    ('FOLLOW',  'Follow',  'Twist rotates in the same direction as the target bone'),
+    ('AGAINST', 'Against', 'Twist rotates opposite to the target bone'),
+]
+
+
+class KitsuneTool_HM2Properties(PropertyGroup):
+    # Core body
+    hm2_map_root:  StringProperty(name="Root")
+    hm2_map_chest: StringProperty(name="Chest")
+    hm2_map_neck:  StringProperty(name="Neck")
+    hm2_map_head:  StringProperty(name="Head")
+    hm2_map_eye_l: StringProperty(name="Eye L")
+    hm2_map_eye_r: StringProperty(name="Eye R")
+
+    # Arms
+    hm2_map_scapula_l:  StringProperty(name="Scapula L")
+    hm2_map_scapula_r:  StringProperty(name="Scapula R")
+    hm2_map_shoulder_l: StringProperty(name="Shoulder L")
+    hm2_map_shoulder_r: StringProperty(name="Shoulder R")
+    hm2_map_elbow_l:    StringProperty(name="Elbow L")
+    hm2_map_elbow_r:    StringProperty(name="Elbow R")
+    hm2_map_hand_l:     StringProperty(name="Hand L")
+    hm2_map_hand_r:     StringProperty(name="Hand R")
+
+    # Legs
+    hm2_map_hip_l:   StringProperty(name="Hip L")
+    hm2_map_hip_r:   StringProperty(name="Hip R")
+    hm2_map_knee_l:  StringProperty(name="Knee L")
+    hm2_map_knee_r:  StringProperty(name="Knee R")
+    hm2_map_ankle_l: StringProperty(name="Ankle L")
+    hm2_map_ankle_r: StringProperty(name="Ankle R")
+    hm2_map_toe_l:   StringProperty(name="Toe L")
+    hm2_map_toe_r:   StringProperty(name="Toe R")
+
+    # Spine
+    hm2_spine_count: IntProperty(name="Spine Count", default=3, min=1, max=8)
+
+    # Fingers
+    hm2_fingers:       CollectionProperty(type=HM2_FingerItem)
+    hm2_fingers_index: IntProperty(default=-1)
+
+    # Twist counts
+    hm2_twist_shoulder: IntProperty(name="Shoulder Twists", default=3, min=0, max=6)
+    hm2_twist_elbow:    IntProperty(name="Elbow Twists",    default=4, min=0, max=6)
+    hm2_twist_hip:      IntProperty(name="Hip Twists",      default=4, min=0, max=6)
+    hm2_twist_knee:     IntProperty(name="Knee Twists",     default=2, min=0, max=6)
+
+    # Twist driver config - per joint per side
+    hm2_twist_shoulder_target_l: StringProperty(name="Shoulder Twist Target L", default="L_Shoulder")
+    hm2_twist_shoulder_target_r: StringProperty(name="Shoulder Twist Target R", default="R_Shoulder")
+    hm2_twist_shoulder_mode_l:   EnumProperty(name="Shoulder Mode L", items=_HM2_TWIST_MODE_ITEMS, default='AGAINST')
+    hm2_twist_shoulder_mode_r:   EnumProperty(name="Shoulder Mode R", items=_HM2_TWIST_MODE_ITEMS, default='AGAINST')
+
+    hm2_twist_elbow_target_l: StringProperty(name="Elbow Twist Target L", default="L_Hand")
+    hm2_twist_elbow_target_r: StringProperty(name="Elbow Twist Target R", default="R_Hand")
+    hm2_twist_elbow_mode_l:   EnumProperty(name="Elbow Mode L", items=_HM2_TWIST_MODE_ITEMS, default='FOLLOW')
+    hm2_twist_elbow_mode_r:   EnumProperty(name="Elbow Mode R", items=_HM2_TWIST_MODE_ITEMS, default='FOLLOW')
+
+    hm2_twist_hip_target_l: StringProperty(name="Hip Twist Target L", default="L_Hip")
+    hm2_twist_hip_target_r: StringProperty(name="Hip Twist Target R", default="R_Hip")
+    hm2_twist_hip_mode_l:   EnumProperty(name="Hip Mode L", items=_HM2_TWIST_MODE_ITEMS, default='AGAINST')
+    hm2_twist_hip_mode_r:   EnumProperty(name="Hip Mode R", items=_HM2_TWIST_MODE_ITEMS, default='AGAINST')
+
+    hm2_twist_knee_target_l: StringProperty(name="Knee Twist Target L", default="L_Ankle")
+    hm2_twist_knee_target_r: StringProperty(name="Knee Twist Target R", default="R_Ankle")
+    hm2_twist_knee_mode_l:   EnumProperty(name="Knee Mode L", items=_HM2_TWIST_MODE_ITEMS, default='FOLLOW')
+    hm2_twist_knee_mode_r:   EnumProperty(name="Knee Mode R", items=_HM2_TWIST_MODE_ITEMS, default='FOLLOW')
+
+    # IK options
+    hm2_generate_ik:       BoolProperty(name="Generate IK Rig", default=True)
+    hm2_generate_shapes:   BoolProperty(name="Generate Custom Shapes", default=True)
+    hm2_ik_pole_angle_arm: FloatProperty(name="Arm Pole Angle", subtype='ANGLE',
+                               default=-1.5707963, description="Pole angle for arm IK (radians)")
+    hm2_ik_pole_angle_leg: FloatProperty(name="Leg Pole Angle", subtype='ANGLE',
+                               default=1.5707963, description="Pole angle for leg IK (radians)")
+
+    # Optional JSON for export names
+    hm2_json_filepath: StringProperty(name="Optional JSON", subtype='FILE_PATH', default="")
+
+
 class Humanoidmapper(PropertyGroup):
     boneExportName : StringProperty(
         name='Bone',
@@ -283,6 +383,8 @@ class KitsuneTool_ObjectProperties(PropertyGroup):
     armature_map_knee_l: StringProperty(name="Left Knee",)
     armature_map_knee_r: StringProperty(name="Right Knee",)
 
+    hm2: PointerProperty(type=KitsuneTool_HM2Properties)
+
 
 class KitsuneTool_MaterialProperties(PropertyGroup):
     node_baker_list : CollectionProperty(type=BakeNodeItem)
@@ -306,6 +408,8 @@ _classes = (
     # PROPERTIES
     BakeNodeItem,
     Humanoidmapper,
+    HM2_FingerItem,
+    KitsuneTool_HM2Properties,
 
     KitsuneTool_SceneProperties,
     KitsuneTool_ObjectProperties,
@@ -314,6 +418,7 @@ _classes = (
 
     # List
     panels_view3d.HUMANOIDMAPPER_UL_ConfigList,
+    panels_humanoidmapper2.HM2_UL_FingerList,
 
     # MENU
     panels_view3d.TOOLS_MT_KitsuneTool_PoseBoneTools,
@@ -323,6 +428,14 @@ _classes = (
     panels_view3d.TOOLS_PT_KitsuneTool_Bone,
     panels_view3d.TOOLS_PT_KitsuneTool_VertexGroup,
     panels_view3d.TOOLS_PT_KitsuneTool_Humanoidmapper,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Core,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Arms,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Legs,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Fingers,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Twist,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_IK,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Actions,
     
     panels_nodeeditor.NODE_UL_nodes_to_bake,
     panels_nodeeditor.NODE_UL_material_list,
@@ -385,6 +498,8 @@ _classes = (
     ops_nodeeditor.NODE_OT_set_copy_input,
     ops_nodeeditor.NODE_OT_node_bake_auto_resolution,
     ops_nodeeditor.NODE_OT_node_bake_auto_colorspace,
+    ops_nodeeditor.NODE_OT_node_bake_copy,
+    ops_nodeeditor.NODE_OT_node_bake_paste,
 
     ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected,
     ops_humanoidmapper.HUMANOIDMAPPER_OT_LoadPreset,
@@ -393,6 +508,15 @@ _classes = (
     ops_humanoidmapper.HUMANOIDMAPPER_OT_AddItem,
     ops_humanoidmapper.HUMANOIDMAPPER_OT_MirrorBoneNames,
     ops_humanoidmapper.HUMANOIDMAPPER_OT_WriteConfig,
+
+    ops_humanoidmapper2.HM2_OT_AddFinger,
+    ops_humanoidmapper2.HM2_OT_RemoveFinger,
+    ops_humanoidmapper2.HM2_OT_MirrorFingers,
+    ops_humanoidmapper2.HM2_OT_MirrorBodyMapping,
+    ops_humanoidmapper2.HM2_OT_CopyMappingToSelected,
+    ops_humanoidmapper2.HM2_OT_ValidateMapping,
+    ops_humanoidmapper2.HM2_OT_Process,
+    ops_humanoidmapper2.HM2_OT_JsonFormatHelp,
 )
 
 def register():

@@ -164,7 +164,7 @@ class ARMATURE_OT_CopyVisPosture(Operator):
     bl_label = "Copy Visual Pose"
     bl_options = {'REGISTER', 'UNDO'}
 
-    copy_type: EnumProperty(items=[('ORIGIN', 'Location', ''), ('ANGLES', 'Rotation', '')])
+    copy_type: EnumProperty(items=[('ORIGIN', 'Location', ''), ('ANGLES', 'Rotation', ''), ('SCALE', 'Scale', '')])
         
     @classmethod
     def poll(cls,context : Context) -> bool:

@@ -440,7 +440,7 @@ class ACTION_OT_merge_two_actions(Operator):
             if self.do_not_merge_matching_names and len(slot_list) > 1:
                 for idx, (action, slot) in enumerate(slot_list):
                     if action is target_action:
-                        # Slot already lives in target — nothing to copy.
+                        # Slot already lives in target - nothing to copy.
                         merged_count += 1
                         continue
                     unique_name = f"{slot_name}.{idx + 1:03d}" if idx > 0 else slot_name
@@ -454,7 +454,7 @@ class ACTION_OT_merge_two_actions(Operator):
                 )
 
                 if existing_target_entry:
-                    # Reuse the existing slot/channelbag — don't duplicate it.
+                    # Reuse the existing slot/channelbag - don't duplicate it.
                     _, existing_slot = existing_target_entry
                     new_slot = existing_slot
                     new_channelbag = anim_utils.action_get_channelbag_for_slot(target_action, existing_slot)
@@ -466,7 +466,7 @@ class ACTION_OT_merge_two_actions(Operator):
 
                 for action, slot in slot_list:
                     if action is target_action:
-                        # Data is already present in new_channelbag — skip.
+                        # Data is already present in new_channelbag - skip.
                         continue
                     source_cb = anim_utils.action_get_channelbag_for_slot(action, slot)
                     if not source_cb:

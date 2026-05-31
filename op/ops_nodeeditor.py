@@ -4,6 +4,31 @@ from PIL import Image
 from ..utils.utils_object import is_mesh
 from bpy.props import EnumProperty, StringProperty, BoolProperty
 
+# Module-level clipboard: list of dicts, one per copied item
+_clipboard: list[dict] = []
+ 
+_FIELDS = (
+    "node_name",
+    "name",
+    "resolution_x",
+    "resolution_y",
+    "sync_y_with_x",
+    "color_space",
+    "socket_index",
+    "has_alpha_channel",
+    "alpha_socket_index",
+    "bypass_texture_mapping",
+)
+ 
+ 
+def _item_to_dict(item) -> dict:
+    return {f: getattr(item, f) for f in _FIELDS}
+ 
+ 
+def _dict_to_item(d: dict, item) -> None:
+    for f, v in d.items():
+        setattr(item, f, v)
+
 
 class NODE_OT_node_bake_add(Operator):
     bl_idname = "kitsunetools.node_bake_node_add"
@@ -254,7 +279,7 @@ class NODE_OT_node_bake_run(Operator):
 
         socket = node.outputs[socket_idx]
         if socket.type == 'VECTOR':
-            print(f"      Socket type VECTOR — inserting SeparateXYZ + CombineRGB.")
+            print(f"      Socket type VECTOR - inserting SeparateXYZ + CombineRGB.")
             sep = ntree.nodes.new('ShaderNodeSeparateXYZ')
             comb = ntree.nodes.new('ShaderNodeCombineRGB')
             temp_nodes.extend([sep, comb])
@@ -379,7 +404,7 @@ class NODE_OT_node_bake_all_materials(Operator):
         export_path = os.path.normpath(raw_path)
         os.makedirs(export_path, exist_ok=True)
 
-        print(f"\n[Node Baker] Bake All Materials — '{obj.name}' | {total_mats} material(s)")
+        print(f"\n[Node Baker] Bake All Materials - '{obj.name}' | {total_mats} material(s)")
         print(f"[Node Baker] Export path: {export_path}")
 
         for mat_idx, slot in enumerate(material_slots):
@@ -489,7 +514,7 @@ class NODE_OT_import_custom_nodes(Operator):
             return {'CANCELLED'}
 
         if self._conflicts and not self.overwrite:
-            self.report({'INFO'}, "Import cancelled — existing nodes were not overwritten.")
+            self.report({'INFO'}, "Import cancelled - existing nodes were not overwritten.")
             return {'CANCELLED'}
 
         self._import_nodes(blend_path)
@@ -906,4 +931,65 @@ class NODE_OT_node_bake_auto_colorspace(Operator):
             return {'CANCELLED'}
 
         self.report({'INFO'}, f"Color space set to '{self.color_space}' on {applied} item(s)")
+        return {'FINISHED'}
+    
+ 
+class NODE_OT_node_bake_copy(Operator):
+    bl_idname = "node.node_bake_copy"
+    bl_label = "Copy Node Bake Item(s)"
+    bl_description = "Copy active or all node baker list items to clipboard"
+ 
+    all_items: BoolProperty(default=False, name="All Items")
+ 
+    @classmethod
+    def poll(cls, context) -> bool:
+        obj = context.active_object
+        mat = obj.active_material if obj else None
+        return bool(mat and mat.use_nodes and len(mat.kitsunetools.node_baker_list) > 0)
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+    
+    def draw(self, context):
+        self.layout.prop(self, "all_items", toggle=True)
+ 
+    def execute(self, context) -> set:
+        global _clipboard
+        mat = context.active_object.active_material
+        baker_list = mat.kitsunetools.node_baker_list
+ 
+        if self.all_items:
+            _clipboard = [_item_to_dict(item) for item in baker_list]
+        else:
+            idx = mat.kitsunetools.node_baker_list_index
+            if not (0 <= idx < len(baker_list)):
+                self.report({'WARNING'}, "No active item to copy")
+                return {'CANCELLED'}
+            _clipboard = [_item_to_dict(baker_list[idx])]
+ 
+        self.report({'INFO'}, f"Copied {len(_clipboard)} item(s)")
+        return {'FINISHED'}
+ 
+ 
+class NODE_OT_node_bake_paste(Operator):
+    bl_idname = "node.node_bake_paste"
+    bl_label = "Paste Node Bake Item(s)"
+    bl_description = "Paste copied node baker items into the active material's list"
+ 
+    @classmethod
+    def poll(cls, context) -> bool:
+        obj = context.active_object
+        mat = obj.active_material if obj else None
+        return bool(mat and mat.use_nodes and bool(_clipboard))
+ 
+    def execute(self, context) -> set:
+        mat = context.active_object.active_material
+        baker_list = mat.kitsunetools.node_baker_list
+ 
+        for d in _clipboard:
+            item = baker_list.add()
+            _dict_to_item(d, item)
+ 
+        mat.kitsunetools.node_baker_list_index = len(baker_list) - 1
+        self.report({'INFO'}, f"Pasted {len(_clipboard)} item(s)")
         return {'FINISHED'}
