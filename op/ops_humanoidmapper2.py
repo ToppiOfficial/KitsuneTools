@@ -1048,8 +1048,18 @@ class HM2_OT_Process(Operator):
             tt.up_axis    = 'UP_Z'
 
     def _setup_fk_controllers(self, arm: Object) -> None:
-        """Add Copy Rotation constraints so FK/IK controllers drive the real bones."""
+        """Add Copy Rotation/Location constraints so FK/IK controllers drive the real bones."""
         pb = arm.pose.bones
+
+        # M_Root follows CTRL_Ground's world-space location so moving the ground
+        # controller translates the entire deform skeleton.
+        root_pb = pb.get('M_Root')
+        if root_pb and pb.get('CTRL_Ground'):
+            co = root_pb.constraints.new('CHILD_OF')
+            co.target    = arm
+            co.subtarget = 'CTRL_Ground'
+            # Bake the inverse so M_Root stays in place at rest
+            co.inverse_matrix = arm.pose.bones['CTRL_Ground'].matrix.inverted()
 
         def copy_rot(owner_name: str, target_name: str, local: bool = False) -> None:
             bone = pb.get(owner_name)
