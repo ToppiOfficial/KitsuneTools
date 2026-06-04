@@ -9,6 +9,7 @@ from .gui import (
 )
 from .op import (
     ops_armature,
+    ops_object,
     ops_bone,
     ops_humanoidmapper,
     ops_humanoidmapper2,
@@ -85,6 +86,10 @@ def draw_object_menu_items(self, context):
     self.layout.separator(type='LINE')
     self.layout.operator(ops_armature.ARMATURE_OT_MergeArmatures.bl_idname)
     self.layout.operator(ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected.bl_idname)
+
+def draw_object_apply_menu_items(self, context):
+    self.layout.separator()
+    self.layout.operator(ops_object.OBJECT_OT_ApplyTransformsSafe.bl_idname, icon='CON_TRANSFORM')
 
 def draw_object_cleanup_menu_items(self, context):
     self.layout.separator(type='LINE')
@@ -213,7 +218,7 @@ class HM2_FingerItem(PropertyGroup):
         ('R', 'Right', ''),
     ], default='L')
     joint_count: IntProperty(name="Joints", default=3, min=1, max=5)
-    generate_ik: BoolProperty(name="Finger IK", default=True)
+    generate_ik: BoolProperty(name="Finger Rig", default=True)
 
 
 _HM2_TWIST_MODE_ITEMS = [
@@ -285,6 +290,15 @@ class KitsuneTool_HM2Properties(PropertyGroup):
     hm2_twist_knee_mode_l:   EnumProperty(name="Knee Mode L", items=_HM2_TWIST_MODE_ITEMS, default='FOLLOW')
     hm2_twist_knee_mode_r:   EnumProperty(name="Knee Mode R", items=_HM2_TWIST_MODE_ITEMS, default='FOLLOW')
 
+    hm2_legacy_roll: BoolProperty(
+        name="Legacy Roll",
+        default=False,
+        description=("Use the old pose-derived bone roll alignment. When off (default), bone "
+                     "rolls are recomputed from fixed world axes, so the result is identical "
+                     "regardless of the source rest pose. Requires the character to face -Y "
+                     "(Blender's standard front view)"),
+    )
+
     # IK options
     hm2_generate_ik:       BoolProperty(name="Generate IK Rig", default=True)
     hm2_generate_shapes:   BoolProperty(name="Generate Custom Shapes", default=True)
@@ -293,7 +307,6 @@ class KitsuneTool_HM2Properties(PropertyGroup):
     hm2_ik_pole_angle_leg: FloatProperty(name="Leg Pole Angle", subtype='ANGLE',
                                default=1.5707963, description="Pole angle for leg IK (radians)")
 
-    # Optional JSON for export names
     hm2_json_filepath: StringProperty(name="Optional JSON", subtype='FILE_PATH', default="")
 
 
@@ -427,6 +440,7 @@ _classes = (
     panels_view3d.TOOLS_PT_KitsuneTool_Armature,
     panels_view3d.TOOLS_PT_KitsuneTool_Bone,
     panels_view3d.TOOLS_PT_KitsuneTool_VertexGroup,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HumanoidMapping,
     panels_view3d.TOOLS_PT_KitsuneTool_Humanoidmapper,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Core,
@@ -435,6 +449,7 @@ _classes = (
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Fingers,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Twist,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_IK,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Export,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Actions,
     
     panels_nodeeditor.NODE_UL_nodes_to_bake,
@@ -448,6 +463,8 @@ _classes = (
     ops_armature.ARMATURE_OT_MergeArmatures,
     ops_armature.ARMATURE_OT_CleanUnWeightedBones,
     ops_armature.ARMATURE_OT_TransferBoneData,
+
+    ops_object.OBJECT_OT_ApplyTransformsSafe,
 
     ops_bone.BONE_OT_MergeBones,
     ops_bone.BONE_OT_ReAlignBones,
@@ -537,6 +554,7 @@ def register():
     bpy.types.VIEW3D_MT_edit_mesh.append(draw_edit_mesh_menu_items)
     bpy.types.VIEW3D_MT_select_edit_mesh.append(draw_select_edit_mesh_menu_items)
     bpy.types.VIEW3D_MT_object.append(draw_object_menu_items)
+    bpy.types.VIEW3D_MT_object_apply.append(draw_object_apply_menu_items)
     bpy.types.VIEW3D_MT_object_cleanup.append(draw_object_cleanup_menu_items)
     bpy.types.VIEW3D_MT_pose.append(draw_edit_bone_menu_items)
     bpy.types.VIEW3D_MT_edit_armature.append(draw_edit_bone_menu_items)
@@ -564,6 +582,7 @@ def unregister():
     bpy.types.VIEW3D_MT_edit_mesh.remove(draw_edit_mesh_menu_items)
     bpy.types.VIEW3D_MT_select_edit_mesh.remove(draw_select_edit_mesh_menu_items)
     bpy.types.VIEW3D_MT_object.remove(draw_object_menu_items)
+    bpy.types.VIEW3D_MT_object_apply.remove(draw_object_apply_menu_items)
     bpy.types.VIEW3D_MT_object_cleanup.remove(draw_object_cleanup_menu_items)
     bpy.types.VIEW3D_MT_pose.remove(draw_edit_bone_menu_items)
     bpy.types.VIEW3D_MT_edit_armature.remove(draw_edit_bone_menu_items)

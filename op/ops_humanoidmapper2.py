@@ -1,5 +1,5 @@
-import bpy, traceback, math
-from mathutils import Vector
+import bpy, traceback, math, re
+from mathutils import Vector, Matrix
 from bpy.types import Context, Object, Operator
 from bpy.props import IntProperty, StringProperty, BoolProperty, EnumProperty
 
@@ -14,8 +14,6 @@ from ..utils.utils_humanoidmapper2 import (
     ensure_hm2_shapes,
     ensure_bone_collection,
 )
-
-# -- Shared mirror helper ------------------------------------------------------
 
 def _try_mirror_bone_name(bone_name: str) -> str | None:
     infix_pairs = [
@@ -34,8 +32,6 @@ def _try_mirror_bone_name(bone_name: str) -> str | None:
 
     return None
 
-
-# -- UIList operators ----------------------------------------------------------
 
 class HM2_OT_AddFinger(Operator):
     bl_idname = "kitsunetools.hm2_add_finger"
@@ -232,8 +228,6 @@ class HM2_OT_CopyMappingToSelected(Operator):
         return {'FINISHED'}
 
 
-# -- JSON format help popup ---------------------------------------------------
-
 class HM2_OT_JsonFormatHelp(Operator):
     bl_idname = "kitsunetools.hm2_json_format_help"
     bl_label = "Export Config JSON Format"
@@ -283,8 +277,6 @@ class HM2_OT_JsonFormatHelp(Operator):
         return {'FINISHED'}
 
 
-# -- Validate -----------------------------------------------------------------
-
 class HM2_OT_ValidateMapping(Operator):
     bl_idname = "kitsunetools.hm2_validate"
     bl_label = "Validate HM2 Mapping"
@@ -308,17 +300,31 @@ class HM2_OT_ValidateMapping(Operator):
         return {'FINISHED'}
 
 
-# -- Main Process operator -----------------------------------------------------
-
 class HM2_OT_Process(Operator):
     bl_idname = "kitsunetools.hm2_process"
     bl_label = "Run HM2 Setup"
     bl_description = "Rename bones, generate twist bones, build IK rig, assign custom shapes, and organize collections"
-    bl_options = {'REGISTER'}
+    bl_options = {'REGISTER', 'UNDO'}
+
+    reapply_config: BoolProperty(
+        name="Re-apply JSON config",
+        description="Apply the JSON export config file again during this update",
+        default=True,
+    )
 
     @classmethod
     def poll(cls, context: Context) -> bool:
         return context.mode == 'OBJECT' and is_armature(context.active_object)
+
+    def invoke(self, context: Context, event) -> set:
+        arm = context.active_object
+        hm2 = arm.kitsunetools.hm2
+        if self._is_hm2_applied(arm) and hm2.hm2_json_filepath.strip():
+            return context.window_manager.invoke_props_dialog(self, title="Re-apply HM2 Setup")
+        return self.execute(context)
+
+    def draw(self, context: Context) -> None:
+        self.layout.prop(self, "reapply_config")
 
     def execute(self, context: Context) -> set:
         arm = context.active_object
@@ -332,90 +338,171 @@ class HM2_OT_Process(Operator):
 
         bpy.ops.ed.undo_push(message="Before HM2 Process")
         try:
+            was_applied = self._is_hm2_applied(arm)
+            # Preserve per-bone export config (export name / rotation / location)
+            # so a rebuild doesn't wipe it - especially for twist bones, which are
+            # deleted and recreated during cleanup.
+            vs_snapshot = self._snapshot_vs_config(arm) if was_applied else {}
+            if was_applied:
+                self._cleanup_for_reapply(arm)
             self._run(context, arm, hm2)
+            if vs_snapshot and not self.reapply_config:
+                self._restore_vs_config(arm, vs_snapshot)
         except Exception as e:
             traceback.print_exc()
-            bpy.ops.ed.undo()
             self.report({'ERROR'}, f"HM2 failed and was reverted: {e}")
+            # Roll the half-built rig back to the "Before HM2 Process" snapshot.
+            # The undo is deferred to after this operator returns: driving undo
+            # while still inside execute() restores a memfile underneath our live
+            # bpy references (arm / edit_bones / hm2), which only partially
+            # reverts and can corrupt the depsgraph.
+            self._schedule_revert()
             return {'CANCELLED'}
 
         self.report({'INFO'}, "HM2 processing complete")
         return {'FINISHED'}
 
-    # -- Internals -------------------------------------------------------------
+    @staticmethod
+    def _schedule_revert() -> None:
+        """Run a single undo on the next timer tick, once this operator has
+        fully returned and the context is stable again."""
+        def _revert():
+            try:
+                bpy.ops.ed.undo()
+            except Exception:
+                traceback.print_exc()
+            return None  # one-shot
+        bpy.app.timers.register(_revert, first_interval=0.0)
+
+    @staticmethod
+    def _is_hm2_applied(arm: Object) -> bool:
+        bones = arm.data.bones
+        return any(m in bones for m in ('CTRL_Ground', 'IK_Hand_L', 'IK_Hand_R', 'IK_Ankle_L', 'IK_Ankle_R'))
+
+    _VS_FIELDS = (
+        'export_name',
+        'ignore_rotation_offset',
+        'export_rotation_offset_x', 'export_rotation_offset_y', 'export_rotation_offset_z',
+        'ignore_location_offset',
+        'export_location_offset_x', 'export_location_offset_y', 'export_location_offset_z',
+    )
+
+    @classmethod
+    def _snapshot_vs_config(cls, arm: Object) -> dict:
+        """Capture every bone's `vs` export config, keyed by bone name."""
+        snapshot = {}
+        for bone in arm.data.bones:
+            vs = getattr(bone, 'vs', None)
+            if vs is None:
+                continue
+            data = {f: getattr(vs, f) for f in cls._VS_FIELDS if hasattr(vs, f)}
+            if data:
+                snapshot[bone.name] = data
+        return snapshot
+
+    @classmethod
+    def _restore_vs_config(cls, arm: Object, snapshot: dict) -> None:
+        """Re-apply a snapshot from `_snapshot_vs_config` for bones that still exist."""
+        bones = arm.data.bones
+        for name, data in snapshot.items():
+            bone = bones.get(name)
+            if bone is None:
+                continue
+            vs = getattr(bone, 'vs', None)
+            if vs is None:
+                continue
+            for field, value in data.items():
+                try:
+                    setattr(vs, field, value)
+                except Exception:
+                    pass
+
+    _ADDED_PREFIXES = ('CTRL_', 'IK_', 'MCH_', 'VIS_', 'FK_')
+    _TWIST_PARENTS = frozenset({
+        'L_Shoulder', 'R_Shoulder', 'L_Elbow', 'R_Elbow',
+        'L_Hip', 'R_Hip', 'L_Knee', 'R_Knee',
+    })
+
+    def _cleanup_for_reapply(self, arm: Object) -> None:
+        bpy.ops.object.mode_set(mode='POSE')
+        bpy.ops.pose.select_all(action='SELECT')
+        bpy.ops.pose.rot_clear()
+        bpy.ops.pose.loc_clear()
+        bpy.ops.pose.scale_clear()
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        eb = arm.data.edit_bones
+        to_delete = [
+            bone for bone in eb
+            if any(bone.name.startswith(p) for p in self._ADDED_PREFIXES)
+            or (re.search(r'\.\d{3}$', bone.name)
+                and bone.parent and bone.parent.name in self._TWIST_PARENTS)
+        ]
+        for bone in to_delete:
+            eb.remove(bone)
+
+        bpy.ops.object.mode_set(mode='POSE')
+        for pb in arm.pose.bones:
+            for c in list(pb.constraints):
+                pb.constraints.remove(c)
+            pb.custom_shape = None
+            pb.color.palette = 'DEFAULT'
+
+        if arm.animation_data:
+            to_remove = [fc for fc in arm.animation_data.drivers
+                         if fc.data_path.startswith('pose.bones[')]
+            for fc in to_remove:
+                arm.animation_data.drivers.remove(fc)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
 
     def _run(self, context: Context, arm: Object, hm2) -> None:
         self._twist_bone_names = {}
         self._computed_pole_angles = {}
 
-        # Step 0: apply scale, reset location and rotation on the armature object
         bpy.context.view_layer.objects.active = arm
         bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
         arm.location = (0.0, 0.0, 0.0)
         arm.rotation_euler = (0.0, 0.0, 0.0)
         arm.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+        arm.show_in_front = True
 
-        # Step 1: enter edit mode, disable x-mirror, disconnect all bones
         bpy.ops.object.mode_set(mode='EDIT')
         arm.data.use_mirror_x = False
         for eb in arm.data.edit_bones:
             eb.use_connect = False
 
-        # Step 2: two-pass rename to fixed names
         self._rename_core_bones(arm, hm2)
-
-        # Step 3: handle spine
         self._setup_spine(arm, hm2)
-
-        # Step 4: rename finger chains
         self._rename_fingers(arm, hm2)
-
-        # Step 4.5: connect bone tails to next bone's head in every chain
         self._connect_chains(arm, hm2)
-
-        # Step 5: remove intermediate limb bones
         self._remove_intermediates(arm, hm2)
 
-        # Step 6: align bone rolls, then create twist bones so they inherit correct rolls
         bpy.ops.object.mode_set(mode='EDIT')
         self._align_bone_rolls(arm, hm2)
         self._create_all_twist_bones(arm, hm2)
-
-        # Step 8: create IK bones
         self._create_ik_bones(arm, hm2)
 
         bpy.ops.object.mode_set(mode='OBJECT')
         bpy.ops.object.mode_set(mode='POSE')
 
-        # Step 9a: unlock all pose bone transforms
         self._unlock_all_bones(arm)
-
-        # Step 9b: add IK constraints + FK controller constraints
         if hm2.hm2_generate_ik:
             self._setup_ik_constraints(arm, hm2)
             self._setup_eye_constraints(arm)
         self._setup_fk_controllers(arm)
-
-        # Step 10: add twist drivers
         self._setup_twist_drivers(arm, hm2)
 
-        # Step 11: custom shapes + colors
         if hm2.hm2_generate_shapes:
             shapes = ensure_hm2_shapes(context)
             self._assign_custom_shapes(arm, hm2, shapes)
-
-        # Step 12: bone colors
         self._assign_bone_colors(arm, hm2)
 
-        # Step 13: bone collections
         bpy.ops.object.mode_set(mode='OBJECT')
         self._organize_collections(arm, hm2)
 
-        # Step 14: optional JSON export config (export names + rotation/location offsets)
-        if hm2.hm2_json_filepath.strip():
+        if hm2.hm2_json_filepath.strip() and self.reapply_config:
             self._apply_export_config(arm, hm2)
-
-    # -- Rename helpers --------------------------------------------------------
 
     def _rename_core_bones(self, arm: Object, hm2) -> None:
         eb = arm.data.edit_bones
@@ -526,8 +613,6 @@ class HM2_OT_Process(Operator):
                 new_name = spine_name(i)
                 new_bone = eb.new(new_name)
                 prev = eb.get(spine_name(i - 1)) if i > 0 else eb.get('M_Root')
-                # Interpolate from prev.head (not prev.tail - it may equal chest.head
-                # when the bone was connected, producing a zero-length bone).
                 n_remaining = count - i
                 new_bone.head = prev.head.lerp(chest_eb.head, 1.0 / (n_remaining + 1)) if prev else Vector((0, 0, 0))
                 next_head = chest_eb.head if i == count - 1 else prev.head.lerp(chest_eb.head, 2.0 / (n_remaining + 1))
@@ -567,6 +652,18 @@ class HM2_OT_Process(Operator):
             for i in range(cap):
                 chain[i].name = f"{side}_{base}Finger{i + start_idx}"
 
+            # Keep the finger entry pointing at the renamed first joint so a
+            # re-apply still resolves source_bone (mirrors _rename_core_bones,
+            # which writes the new names back into the body mapping props).
+            if cap > 0:
+                item.source_bone = f"{side}_{base}Finger{start_idx}"
+
+            hand_name = f"{side}_Hand"
+            hand_eb = eb.get(hand_name)
+            if hand_eb and chain[0].parent != hand_eb:
+                chain[0].parent = hand_eb
+                chain[0].use_connect = False
+
     def _connect_chains(self, arm: Object, hm2) -> None:
         eb = arm.data.edit_bones
 
@@ -593,7 +690,6 @@ class HM2_OT_Process(Operator):
                 pairs.append((f'M_Spine{i}', f'M_Spine{i + 1}'))
             pairs.append((f'M_Spine{count}', 'M_Chest'))
 
-        # Neck / head
         pairs += [('M_Chest', 'M_Neck'), ('M_Neck', 'M_Head')]
 
         for parent_name, child_name in pairs:
@@ -640,23 +736,69 @@ class HM2_OT_Process(Operator):
                     inter_coll.assign(bone)
 
     def _align_bone_rolls(self, arm: Object, hm2) -> None:
+        if getattr(hm2, 'hm2_legacy_roll', False):
+            self._align_bone_rolls_legacy(arm, hm2)
+        else:
+            self._align_bone_rolls_world(arm, hm2)
+
+    def _align_bone_rolls_world(self, arm: Object, hm2) -> None:
+        """Recompute every roll from fixed world axes so the result is identical
+        regardless of the source rest pose (A-pose, T-pose, anything in between).
+
+        Assumes the character faces -Y (Blender's standard front view). Each roll
+        depends only on its own bone direction and a constant world reference, so
+        it is fully deterministic and L/R symmetric (bone_X_R == -bone_X_L)."""
         eb = arm.data.edit_bones
 
-        # Knee copies hip roll
-        for hip_n, knee_n in [('L_Hip', 'L_Knee'), ('R_Hip', 'R_Knee')]:
-            hip_eb  = eb.get(hip_n)
-            knee_eb = eb.get(knee_n)
-            if hip_eb and knee_eb:
-                knee_eb.roll = hip_eb.roll
+        FORWARD = Vector((0.0, -1.0, 0.0))  # character faces -Y
+        BACK    = Vector((0.0,  1.0, 0.0))
+        UP      = Vector((0.0,  0.0, 1.0))
 
-        # Elbow copies shoulder roll
-        for sho_n, elb_n in [('L_Shoulder', 'L_Elbow'), ('R_Shoulder', 'R_Elbow')]:
-            sho_eb = eb.get(sho_n)
-            elb_eb = eb.get(elb_n)
-            if sho_eb and elb_eb:
-                elb_eb.roll = sho_eb.roll
+        def align_axis(name: str, z_ref: Vector, fallback: Vector) -> None:
+            b = eb.get(name)
+            if not b:
+                return
+            bone_y = b.tail - b.head
+            if bone_y.length < 1e-6:
+                return
+            bone_y.normalize()
+            # Avoid a degenerate align_roll when the reference is parallel to the bone.
+            ref = z_ref if abs(z_ref.normalized().dot(bone_y)) < 0.999 else fallback
+            b.align_roll(ref)
 
-        # Finger joints 2..N copy the roll of the first joint in their chain
+        def align_limb_pair(upper_l: str, mid_l: str, upper_r: str, mid_r: str,
+                            bend_l: Vector) -> None:
+            # bend_l is the world direction the joint flexes toward on the LEFT side.
+            # Negating it for the right keeps bone_X_R == -bone_X_L (X-mirror symmetry).
+            for name, bend in ((upper_l, bend_l), (mid_l, bend_l),
+                               (upper_r, -bend_l), (mid_r, -bend_l)):
+                b = eb.get(name)
+                if not b:
+                    continue
+                bone_y = b.tail - b.head
+                if bone_y.length < 1e-6:
+                    continue
+                z_dir = bend.cross(bone_y.normalized())
+                if z_dir.length < 1e-5:
+                    continue
+                b.align_roll(z_dir)
+
+        # Arms flex forward at the elbow; legs flex backward at the knee.
+        align_limb_pair('L_Shoulder', 'L_Elbow', 'R_Shoulder', 'R_Elbow', FORWARD)
+        align_limb_pair('L_Hip',      'L_Knee',  'R_Hip',      'R_Knee',  BACK)
+
+        # Hands and scapulae sit roughly horizontal -> Z up. Opposite bone
+        # directions across the body make these auto-mirror.
+        for name in ('L_Hand', 'R_Hand', 'L_Scapula', 'R_Scapula'):
+            align_axis(name, UP, FORWARD)
+
+        # Spine column + head/neck point roughly up -> Z faces forward (-Y).
+        count = hm2.hm2_spine_count
+        spine_names = ['M_Spine'] if count == 1 else [f'M_Spine{i + 1}' for i in range(count)]
+        for name in ['M_Root', *spine_names, 'M_Chest', 'M_Neck', 'M_Head']:
+            align_axis(name, FORWARD, UP)
+
+        # Fingers: keep each finger's segments consistent with its first joint.
         _ftype_map = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
                       'RING': 'Ring', 'PINKY': 'Pinky'}
         for finger in hm2.hm2_fingers:
@@ -670,7 +812,85 @@ class HM2_OT_Process(Operator):
                 if joint_eb:
                     joint_eb.roll = first_eb.roll
 
-        # Spine chain - propagate root roll upward through each bone
+    def _align_bone_rolls_legacy(self, arm: Object, hm2) -> None:
+        eb = arm.data.edit_bones
+
+        def _get_bend(upper_n: str, mid_n: str) -> Vector | None:
+            upper_eb = eb.get(upper_n)
+            mid_eb   = eb.get(mid_n)
+            if not (upper_eb and mid_eb):
+                return None
+            limb_vec = mid_eb.tail - upper_eb.head
+            if limb_vec.length < 1e-5:
+                return None
+            limb_n = limb_vec.normalized()
+            t      = (mid_eb.head - upper_eb.head).dot(limb_n)
+            proj   = upper_eb.head + limb_n * t
+            bend   = mid_eb.head - proj
+            if bend.length < 1e-4:
+                return None
+            return bend.normalized()
+
+        def _apply_limb_roll(upper_n: str, bend: Vector) -> None:
+            upper_eb = eb.get(upper_n)
+            if not upper_eb:
+                return
+            bone_y = (upper_eb.tail - upper_eb.head).normalized()
+            z_dir  = bend.cross(bone_y)
+            if z_dir.length < 1e-5:
+                return
+            upper_eb.align_roll(z_dir)
+
+        def _canonicalize_limb_pair(upper_l: str, mid_l: str,
+                                     upper_r: str, mid_r: str) -> None:
+            bend_l = _get_bend(upper_l, mid_l)
+            bend_r = _get_bend(upper_r, mid_r)
+
+            if bend_l is None and bend_r is None:
+                # Straight limb on both sides : fall back to current bone X axes.
+                ul_eb = eb.get(upper_l)
+                ur_eb = eb.get(upper_r)
+                if not (ul_eb and ur_eb):
+                    return
+                x_l      = ul_eb.x_axis.copy()
+                x_r      = ur_eb.x_axis.copy()
+                mirror_r = Vector((-x_r.x, x_r.y, x_r.z))
+                avg      = x_l + mirror_r
+                if avg.length < 1e-5:
+                    return
+                bend_l = avg.normalized()
+            elif bend_l is None:
+                bend_l = Vector((-bend_r.x, bend_r.y, bend_r.z))
+            elif bend_r is not None:
+                mirror_r = Vector((-bend_r.x, bend_r.y, bend_r.z))
+                avg = bend_l + mirror_r
+                if avg.length > 1e-5:
+                    bend_l = avg.normalized()
+
+            # Negate for R: ensures bone_X_R = -bone_X_L (Blender X-mirror symmetry).
+            bend_r_canon = -bend_l
+
+            _apply_limb_roll(upper_l, bend_l)
+            _apply_limb_roll(upper_r, bend_r_canon)
+            _apply_limb_roll(mid_l, bend_l)
+            _apply_limb_roll(mid_r, bend_r_canon)
+
+        _canonicalize_limb_pair('L_Shoulder', 'L_Elbow', 'R_Shoulder', 'R_Elbow')
+        _canonicalize_limb_pair('L_Hip',      'L_Knee',  'R_Hip',      'R_Knee')
+
+        _ftype_map = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
+                      'RING': 'Ring', 'PINKY': 'Pinky'}
+        for finger in hm2.hm2_fingers:
+            base      = _ftype_map.get(finger.finger_type, finger.finger_type)
+            start_idx = 0 if finger.finger_type == 'THUMB' else 1
+            first_eb  = eb.get(f"{finger.side}_{base}Finger{start_idx}")
+            if not first_eb:
+                continue
+            for i in range(1, finger.joint_count):
+                joint_eb = eb.get(f"{finger.side}_{base}Finger{start_idx + i}")
+                if joint_eb:
+                    joint_eb.roll = first_eb.roll
+
         count = hm2.hm2_spine_count
         spine_names = ['M_Spine'] if count == 1 else [f'M_Spine{i + 1}' for i in range(count)]
 
@@ -683,7 +903,6 @@ class HM2_OT_Process(Operator):
                     b.roll = current_roll
                     current_roll = b.roll
 
-        # Chest, Neck, Head inherit the last spine bone's roll
         top_spine = eb.get(spine_names[-1]) if spine_names else None
         if top_spine:
             for name in ('M_Chest', 'M_Neck', 'M_Head'):
@@ -691,10 +910,14 @@ class HM2_OT_Process(Operator):
                 if b:
                     b.roll = top_spine.roll
 
-        # M_Root: align bone-Z to face -Y (character forward) for a consistent spine orientation
         root_eb = eb.get('M_Root')
         if root_eb:
             root_eb.align_roll(Vector((0, -1, 0)))
+
+        for scap_n in ('L_Scapula', 'R_Scapula'):
+            scap_eb = eb.get(scap_n)
+            if scap_eb:
+                scap_eb.align_roll(Vector((0, 0, 1)))
 
     def _create_all_twist_bones(self, arm: Object, hm2) -> None:
         self._twist_bone_names = {}
@@ -732,12 +955,6 @@ class HM2_OT_Process(Operator):
             return b
 
         def limb_pole_position(upper_name: str, mid_name: str, dist: float) -> tuple | None:
-            """
-            Project mid joint onto the limb axis (upper.head -> mid.tail).
-            The vector from the projected point to mid.head IS the bend direction -
-            this is the correct place for the pole target.
-            Returns (pole_pos, bend_dir) or None.
-            """
             upper = eb.get(upper_name)
             mid   = eb.get(mid_name)
             if not (upper and mid):
@@ -760,44 +977,43 @@ class HM2_OT_Process(Operator):
             bend_dir = bend_dir.normalized()
             return mid.head + bend_dir * dist, bend_dir
 
-        def compute_pole_angle(ik_root_name: str, ik_target_pos: Vector, pole_pos: Vector) -> float:
-            """
-            Compute the IK pole_angle so the IK solver reproduces the rest pose exactly.
-
-            Formula (from Blender rigging community):
-              ik_axis = (ik_target_pos - root.head).normalized()
-              u = ik_axis × (pole_pos - root.head)
-              v = u × ik_axis   ← projection of pole_dir onto plane ⊥ to ik_axis
-              pole_angle = signed_angle(root.x_axis, v, around ik_axis)
-
-            ik_root_name: the FIRST bone in the IK chain (e.g. L_Elbow for a
-                          chain_count=2 IK on L_Hand - the root of the 2-bone chain).
-            """
+        def compute_pole_angle(ik_root_name: str, ik_target_pos: Vector, pole_pos: Vector,
+                               rest_bend_dir: Vector | None = None) -> float:
             root = eb.get(ik_root_name)
             if not root:
                 return 0.0
-            ik_axis = ik_target_pos - root.head
+
+            ik_axis = (ik_target_pos - root.head)
             if ik_axis.length < 1e-5:
                 return 0.0
-            ik_axis.normalize()
-            pole_dir = pole_pos - root.head
-            u = ik_axis.cross(pole_dir)
-            v = u.cross(ik_axis)
-            if v.length < 1e-5:
+            ik_axis = ik_axis.normalized()
+
+            pole_vec  = pole_pos - root.head
+            pole_proj = pole_vec - pole_vec.dot(ik_axis) * ik_axis
+            if pole_proj.length < 1e-5:
                 return 0.0
-            x_axis = root.x_axis  # armature-space X axis of the root bone
-            v_n = v.normalized()
-            x_n = x_axis.normalized()
-            dot   = max(-1.0, min(1.0, x_n.dot(v_n)))
-            angle = math.acos(dot)
-            if x_n.cross(v_n).dot(ik_axis) < 0:
-                angle = -angle
+            pole_proj = pole_proj.normalized()
+
+            x_axis = root.x_axis.normalized()
+            x_proj  = x_axis - x_axis.dot(ik_axis) * ik_axis
+            if x_proj.length < 1e-5:
+                return 0.0
+            x_proj = x_proj.normalized()
+
+            angle = math.atan2(x_proj.cross(pole_proj).dot(ik_axis),
+                               x_proj.dot(pole_proj))
+
+            # ±π check: if computed angle would bend the chain opposite to rest pose, flip it.
+            if rest_bend_dir is not None and rest_bend_dir.length > 1e-4:
+                c, s = math.cos(angle), math.sin(angle)
+                expected_bend = x_proj * c + ik_axis.cross(x_proj) * s
+                if expected_bend.dot(rest_bend_dir) < 0:
+                    angle += math.pi
+                    if angle > math.pi:
+                        angle -= 2 * math.pi
+
             return angle
 
-        # -- CTRL_Ground: absolute master / world-space translation bone ---------
-        # Placed at foot level, pointing forward (+Y).  All IK targets are
-        # parented here so moving CTRL_Ground translates the whole character
-        # including the hands and feet - standard root-motion controller.
         _al = eb.get('L_Ankle')
         _ar = eb.get('R_Ankle')
         _rg = eb.get('M_Root')
@@ -811,12 +1027,11 @@ class HM2_OT_Process(Operator):
             _gx, _gy = _rg.head.x, _rg.head.y
         else:
             _gx, _gy = 0.0, 0.0
-        _gz = 0.0  # arm.location was reset to (0,0,0) so Z=0 is the world floor
+        _gz = 0.0
         _gpos    = Vector((_gx, _gy, _gz))
         _g_len   = (_rg.length if _rg else 0.1) * 2.0
         make_ik_bone('CTRL_Ground', _gpos, tail=_gpos + Vector((0, _g_len, 0)))
 
-        # -- Arms --------------------------------------------------------------
         for shoulder_n, elbow_n, hand_n, ik_hand, ik_elbow in [
             ('L_Shoulder', 'L_Elbow', 'L_Hand', 'IK_Hand_L', 'IK_Elbow_L'),
             ('R_Shoulder', 'R_Elbow', 'R_Hand', 'IK_Hand_R', 'IK_Elbow_R'),
@@ -827,8 +1042,7 @@ class HM2_OT_Process(Operator):
                 ib = make_ik_bone(ik_hand, hand.head, tail=hand.tail,
                                   parent_name='CTRL_Ground')
                 if ib:
-                    ib.roll = hand.roll  # match roll so COPY_ROTATION is neutral at rest
-            # Pole distance = 50% of full arm span, scaled with the character.
+                    ib.roll = hand.roll
             arm_len = (shoulder.head - hand.head).length if (shoulder and hand) else 0.3
             pole_dist = max(arm_len * 0.5, 1e-4)
             result = limb_pole_position(shoulder_n, elbow_n, dist=pole_dist)
@@ -837,11 +1051,9 @@ class HM2_OT_Process(Operator):
                 bone_len = max(arm_len * 0.12, 1e-4)
                 make_ik_bone(ik_elbow, pole_pos, tail=pole_pos + bend_dir * bone_len,
                              parent_name='CTRL_Ground')
-                # IK chain root for chain_count=2 on L_Elbow is L_Shoulder
                 self._computed_pole_angles[ik_elbow] = compute_pole_angle(
-                    shoulder_n, hand.head if hand else pole_pos, pole_pos)
+                    shoulder_n, hand.head if hand else pole_pos, pole_pos, bend_dir)
 
-        # -- Legs --------------------------------------------------------------
         for hip_n, knee_n, ankle_n, ik_ankle, ik_knee, side in [
             ('L_Hip', 'L_Knee', 'L_Ankle', 'IK_Ankle_L', 'IK_Knee_L', 'L'),
             ('R_Hip', 'R_Knee', 'R_Ankle', 'IK_Ankle_R', 'IK_Knee_R', 'R'),
@@ -852,36 +1064,33 @@ class HM2_OT_Process(Operator):
 
             if ankle:
                 ctrl_toe_name = f'CTRL_Toe_{side}'
-                mch_name      = f'MCH_FootRoll_{side}'
-
-                if toe_eb:
-                    # CTRL_Toe: world-space ball-of-foot controller, child of
-                    # CTRL_Ground.  Moving it positions the foot; rotating X
-                    # lifts the heel because IK_Ankle is a descendant of this bone.
-                    ct = make_ik_bone(ctrl_toe_name, toe_eb.head, tail=toe_eb.tail,
-                                      parent_name='CTRL_Ground')
-                    if ct:
-                        ct.roll = toe_eb.roll
-
-                    # MCH_FootRoll: hidden pivot child of CTRL_Toe.  It inherits
-                    # CTRL_Toe's rotation automatically (no constraint needed) so
-                    # the pivot centre is exactly the ball of foot.
-                    mch_fwd = (toe_eb.tail - toe_eb.head).normalized()
-                    make_ik_bone(mch_name, toe_eb.head.copy(),
-                                 tail=toe_eb.head + mch_fwd * ankle.length * 0.3,
-                                 parent_name=ctrl_toe_name)
-
-                    # IK_Ankle: child of MCH_FootRoll so it traces an arc around
-                    # the ball-of-foot when CTRL_Toe is rotated -> tip-toe.
-                    ib = make_ik_bone(ik_ankle, ankle.head, tail=ankle.tail,
-                                      parent_name=mch_name)
-                else:
-                    ib = make_ik_bone(ik_ankle, ankle.head, tail=ankle.tail,
-                                      parent_name='CTRL_Ground')
-
+                ib = make_ik_bone(ik_ankle, ankle.head, tail=ankle.tail,
+                                  parent_name='CTRL_Ground')
                 if ib:
                     ib.roll = ankle.roll
-            # Pole distance = 50% of full leg span, scaled with the character.
+
+                if toe_eb:
+                    roll_mch = f'MCH_FootRoll_{side}'
+                    tgt_mch  = f'MCH_IK_Ankle_{side}'
+
+                    mch_fwd = (toe_eb.tail - toe_eb.head).normalized()
+                    mr = make_ik_bone(roll_mch, toe_eb.head.copy(),
+                                      tail=toe_eb.head + mch_fwd * ankle.length * 0.3,
+                                      parent_name=ik_ankle)
+                    if mr:
+                        mr.roll = toe_eb.roll
+
+                    # The actual leg-IK target, carried by the roll pivot.
+                    tm = make_ik_bone(tgt_mch, ankle.head, tail=ankle.tail,
+                                      parent_name=roll_mch)
+                    if tm:
+                        tm.roll = ankle.roll
+
+                    # Toe wiggle control, sibling of the roll pivot under the master.
+                    ct = make_ik_bone(ctrl_toe_name, toe_eb.head, tail=toe_eb.tail,
+                                      parent_name=ik_ankle)
+                    if ct:
+                        ct.roll = toe_eb.roll
             leg_len = (hip.head - ankle.head).length if (hip and ankle) else 0.3
             pole_dist = max(leg_len * 0.5, 1e-4)
             result = limb_pole_position(hip_n, knee_n, dist=pole_dist)
@@ -890,17 +1099,14 @@ class HM2_OT_Process(Operator):
                 bone_len = max(leg_len * 0.12, 1e-4)
                 make_ik_bone(ik_knee, pole_pos, tail=pole_pos + bend_dir * bone_len,
                              parent_name='CTRL_Ground')
-                # IK chain root for chain_count=2 on L_Knee is L_Hip
                 self._computed_pole_angles[ik_knee] = compute_pole_angle(
-                    hip_n, ankle.head if ankle else pole_pos, pole_pos)
+                    hip_n, ankle.head if ankle else pole_pos, pole_pos, bend_dir)
 
-        # -- Eye roll: align to Global +Z so bone-Z faces up (not downward) ---
         for _en in ('L_Eye', 'R_Eye'):
             _eeb = eb.get(_en)
             if _eeb:
                 _eeb.align_roll(Vector((0, 0, 1)))
 
-        # -- Eye target --------------------------------------------------------
         head_bone = eb.get('M_Head')
         if head_bone and (hm2.hm2_map_eye_l or hm2.hm2_map_eye_r):
             eye_l = eb.get('L_Eye')
@@ -918,7 +1124,6 @@ class HM2_OT_Process(Operator):
 
             if lr_vec.length > 1e-5:
                 lr_vec.normalize()
-                # world-up x LR-axis = character's forward direction
                 fwd = Vector((0, 0, 1)).cross(lr_vec)
                 if fwd.length < 1e-5:
                     fwd = Vector((0, -1, 0))
@@ -931,9 +1136,6 @@ class HM2_OT_Process(Operator):
             eye_tail = eye_head + fwd * head_bone.length * 0.5
             make_ik_bone('IK_EyeTarget', eye_head, tail=eye_tail, parent_name='M_Head')
 
-            # Per-eye look-at bones: children of IK_EyeTarget, each offset to
-            # its eye's lateral (X) position.  This keeps eyes parallel at rest
-            # instead of cross-eyed when both track to a single centre point.
             _bone_len = head_bone.length * 0.3
             for _eye_eb, _name in ((eye_l, 'IK_EyeTarget_L'), (eye_r, 'IK_EyeTarget_R')):
                 if _eye_eb is None:
@@ -942,27 +1144,104 @@ class HM2_OT_Process(Operator):
                 _lt = _lh + fwd * _bone_len
                 make_ik_bone(_name, _lh, tail=_lt, parent_name='IK_EyeTarget')
 
-        # -- Finger curl controllers (rotation traversal) ---------------------
-        # One CTRL bone per finger at the first knuckle.  Rotating it on X
-        # curls all joints; rotating on Z splays the base joint only.
         _ftype_map = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
                       'RING': 'Ring', 'PINKY': 'Pinky'}
         for finger in hm2.hm2_fingers:
             if not finger.generate_ik or not finger.source_bone:
                 continue
             base      = _ftype_map.get(finger.finger_type, finger.finger_type)
+            side      = finger.side
             start_idx = 0 if finger.finger_type == 'THUMB' else 1
-            j1_name   = f"{finger.side}_{base}Finger{start_idx}"
-            j1_eb     = eb.get(j1_name)
-            if j1_eb:
-                ctrl_name = f"CTRL_{base}Finger_{finger.side}"
-                cb            = eb.new(ctrl_name)
-                cb.head       = j1_eb.head.copy()
-                cb.tail       = j1_eb.tail.copy()
-                cb.roll       = j1_eb.roll
-                cb.use_connect = False
-                cb.use_deform  = False
-                cb.parent      = j1_eb.parent  # sibling of first joint
+
+            # Collect the existing (deform) finger segments that are present.
+            orgs = []
+            for i in range(finger.joint_count):
+                o = eb.get(f"{side}_{base}Finger{start_idx + i}")
+                if o is None:
+                    break
+                orgs.append(o)
+            if not orgs:
+                continue
+            n           = len(orgs)
+            hand_eb     = orgs[0].parent
+            hand_name   = hand_eb.name if hand_eb else None
+
+            # Deform bones must be free so COPY_TRANSFORMS can place them in pose.
+            for o in orgs:
+                o.use_connect = False
+
+            # Master: spans the whole finger, parented to the hand.
+            master_name = f"CTRL_{base}MasterFinger_{side}"
+            mb = make_ik_bone(master_name, orgs[0].head, tail=orgs[-1].tail,
+                              parent_name=hand_name)
+            if mb:
+                mb.roll = orgs[0].roll
+
+            # FK controls (one per segment) + a tip control.
+            fk_names = []
+            for i, o in enumerate(orgs):
+                fkn = f"FK_{base}Finger{start_idx + i}_{side}"
+                fb  = make_ik_bone(fkn, o.head, tail=o.tail)
+                if fb:
+                    fb.roll = o.roll
+                fk_names.append(fkn)
+            tip_name = f"FK_{base}FingerTip_{side}"
+            _tip_dir = (orgs[-1].tail - orgs[-1].head)
+            _tip_dir = _tip_dir.normalized() if _tip_dir.length > 1e-6 else Vector((0, 1, 0))
+            tb = make_ik_bone(tip_name, orgs[-1].tail.copy(),
+                              tail=orgs[-1].tail + _tip_dir * max(orgs[-1].length * 0.5, 1e-4))
+            if tb:
+                tb.roll = orgs[-1].roll
+            fk_names.append(tip_name)  # fk list has n + 1 entries
+
+            # MCH bend (short stubs) and MCH stretch (copies of org).
+            bend_names, stretch_names = [], []
+            for i, o in enumerate(orgs):
+                bdir = (o.tail - o.head)
+                bdir = bdir.normalized() if bdir.length > 1e-6 else Vector((0, 1, 0))
+                bn = f"MCH_Bend_{base}Finger{start_idx + i}_{side}"
+                bb = make_ik_bone(bn, o.head, tail=o.head + bdir * max(o.length * 0.3, 1e-4))
+                if bb:
+                    bb.roll = o.roll
+                bend_names.append(bn)
+
+                sn = f"MCH_Stretch_{base}Finger{start_idx + i}_{side}"
+                sb = make_ik_bone(sn, o.head, tail=o.tail)
+                if sb:
+                    sb.roll = o.roll
+                stretch_names.append(sn)
+
+            # Parenting (mirrors Rigify super_finger):
+            #   fk[i].parent = bend[i]; tip.parent = last real fk
+            for i in range(n):
+                eb[fk_names[i]].parent = eb[bend_names[i]]
+            eb[fk_names[n]].parent = eb[fk_names[n - 1]]
+            #   bend[0].parent = hand; bend[i>0].parent = fk[i-1]
+            eb[bend_names[0]].parent = hand_eb
+            for i in range(1, n):
+                eb[bend_names[i]].parent = eb[fk_names[i - 1]]
+            #   stretch[0].parent = hand; stretch[i>0].parent = fk[i]
+            eb[stretch_names[0]].parent = hand_eb
+            for i in range(1, n):
+                eb[stretch_names[i]].parent = eb[fk_names[i]]
+
+        for joint_n, pole_n, line_n in [
+            ('L_Elbow', 'IK_Elbow_L', 'VIS_PoleLine_Elbow_L'),
+            ('R_Elbow', 'IK_Elbow_R', 'VIS_PoleLine_Elbow_R'),
+            ('L_Knee',  'IK_Knee_L',  'VIS_PoleLine_Knee_L'),
+            ('R_Knee',  'IK_Knee_R',  'VIS_PoleLine_Knee_R'),
+        ]:
+            joint_eb = eb.get(joint_n)
+            pole_eb  = eb.get(pole_n)
+            if joint_eb and pole_eb:
+                lb                      = eb.new(line_n)
+                lb.head                 = joint_eb.head.copy()
+                lb.tail                 = pole_eb.head.copy()
+                lb.use_connect          = False
+                lb.use_deform           = False
+                lb.use_inherit_rotation = False  # keep world-aligned so Stretch To works
+                lb.inherit_scale        = 'NONE'
+                lb.parent               = joint_eb
 
     def _setup_ik_constraints(self, arm: Object, hm2) -> None:
         pb       = arm.pose.bones
@@ -983,49 +1262,125 @@ class HM2_OT_Process(Operator):
             if pole and pb.get(pole):
                 ik.pole_target    = arm
                 ik.pole_subtarget = pole
-                # Use auto-computed angle; fall back to user override if missing
                 ik.pole_angle = computed.get(pole_key or pole,
                                              hm2.hm2_ik_pole_angle_arm if 'Elbow' in (pole or '')
                                              else hm2.hm2_ik_pole_angle_leg)
 
-        # IK is on the MID bone so its .tail (= next joint head) reaches the target:
-        #   L_Elbow.tail = L_Hand.head  -> IK_Hand_L is at L_Hand.head  ✓
-        #   L_Knee.tail  = L_Ankle.head -> IK_Ankle_L is at L_Ankle.head ✓
         add_ik('L_Elbow', 'IK_Hand_L',  'IK_Elbow_L', 2, 'IK_Elbow_L')
         add_ik('R_Elbow', 'IK_Hand_R',  'IK_Elbow_R', 2, 'IK_Elbow_R')
-        add_ik('L_Knee',  'IK_Ankle_L', 'IK_Knee_L',  2, 'IK_Knee_L')
-        add_ik('R_Knee',  'IK_Ankle_R', 'IK_Knee_R',  2, 'IK_Knee_R')
+        for side in ('L', 'R'):
+            # Prefer the roll-driven MCH target so the foot can stand on its toe;
+            # fall back to the bare foot master when there is no toe.
+            ankle_tgt = f'MCH_IK_Ankle_{side}' if pb.get(f'MCH_IK_Ankle_{side}') \
+                else f'IK_Ankle_{side}'
+            add_ik(f'{side}_Knee', ankle_tgt, f'IK_Knee_{side}', 2, f'IK_Knee_{side}')
 
-        # -- Finger rotation traversal -----------------------------------------
         _ftype_map2 = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
                        'RING': 'Ring', 'PINKY': 'Pinky'}
+
+        def _clear_constraints(bone, ctypes=None):
+            for c in list(bone.constraints):
+                if ctypes is None or c.type in ctypes:
+                    bone.constraints.remove(c)
+
         for finger in hm2.hm2_fingers:
             if not finger.generate_ik:
                 continue
             base      = _ftype_map2.get(finger.finger_type, finger.finger_type)
+            side      = finger.side
             start_idx = 0 if finger.finger_type == 'THUMB' else 1
-            ctrl_name = f"CTRL_{base}Finger_{finger.side}"
-            if not pb.get(ctrl_name):
+            master_name = f"CTRL_{base}MasterFinger_{side}"
+            if not pb.get(master_name):
                 continue
+
+            orgs = []
             for i in range(finger.joint_count):
-                jname = f"{finger.side}_{base}Finger{start_idx + i}"
-                jb    = pb.get(jname)
-                if not jb:
+                o = pb.get(f"{side}_{base}Finger{start_idx + i}")
+                if o is None:
+                    break
+                orgs.append(o)
+            n = len(orgs)
+            if n == 0:
+                continue
+
+            # Bend MCH: bone 0 copies the master; the rest curl from master scale.y.
+            for i in range(n):
+                bend = pb.get(f"MCH_Bend_{base}Finger{start_idx + i}_{side}")
+                if not bend:
                     continue
-                cr               = jb.constraints.new('COPY_ROTATION')
-                cr.target        = arm
-                cr.subtarget     = ctrl_name
-                cr.owner_space   = 'LOCAL'
-                cr.target_space  = 'LOCAL'
+                _clear_constraints(bend)
+                bend.driver_remove('rotation_euler')
                 if i == 0:
-                    # First joint: full rotation (curl X + splay Z)
-                    cr.mix_mode  = 'REPLACE'
+                    cl = bend.constraints.new('COPY_LOCATION')
+                    cl.target = arm
+                    cl.subtarget = master_name
+                    cr = bend.constraints.new('COPY_ROTATION')
+                    cr.target = arm
+                    cr.subtarget = master_name
+                    cr.owner_space = 'LOCAL'
+                    cr.target_space = 'LOCAL'
                 else:
-                    # Subsequent joints: only inherit curl (X), not splay
-                    cr.mix_mode  = 'ADD'
-                    cr.use_x     = True
-                    cr.use_y     = False
-                    cr.use_z     = False
+                    # Master Y-scale drives the curl: rot.x = (1 - scale_y) * pi.
+                    bend.rotation_mode = 'XYZ'
+                    fcurve = bend.driver_add('rotation_euler', 0)
+                    drv = fcurve.driver
+                    drv.type = 'SCRIPTED'
+                    drv.expression = '(1 - sy) * pi'
+                    var = drv.variables.new()
+                    var.name = 'sy'
+                    var.type = 'TRANSFORMS'
+                    t = var.targets[0]
+                    t.id = arm
+                    t.bone_target = master_name
+                    t.transform_type = 'SCALE_Y'
+                    t.transform_space = 'LOCAL_SPACE'
+
+            for i in range(n):
+                stretch = pb.get(f"MCH_Stretch_{base}Finger{start_idx + i}_{side}")
+                if not stretch:
+                    continue
+                _clear_constraints(stretch)
+                fk_cur  = f"FK_{base}Finger{start_idx + i}_{side}"
+                fk_next = f"FK_{base}Finger{start_idx + i + 1}_{side}" if i < n - 1 \
+                    else f"FK_{base}FingerTip_{side}"
+                cl = stretch.constraints.new('COPY_LOCATION')
+                cl.target = arm
+                cl.subtarget = fk_cur
+                cs = stretch.constraints.new('COPY_SCALE')
+                cs.target = arm
+                cs.subtarget = fk_cur
+                st = stretch.constraints.new('STRETCH_TO')
+                st.target = arm
+                st.subtarget = fk_next
+                st.volume = 'NO_VOLUME'
+                st.keep_axis = 'SWING_Y'
+
+            for i in range(n):
+                stretch_name = f"MCH_Stretch_{base}Finger{start_idx + i}_{side}"
+                if not pb.get(stretch_name):
+                    continue
+                _clear_constraints(orgs[i], {'COPY_TRANSFORMS', 'COPY_ROTATION'})
+                ct = orgs[i].constraints.new('COPY_TRANSFORMS')
+                ct.target = arm
+                ct.subtarget = stretch_name
+
+        for line_n, target_n in [
+            ('VIS_PoleLine_Elbow_L', 'IK_Elbow_L'),
+            ('VIS_PoleLine_Elbow_R', 'IK_Elbow_R'),
+            ('VIS_PoleLine_Knee_L',  'IK_Knee_L'),
+            ('VIS_PoleLine_Knee_R',  'IK_Knee_R'),
+        ]:
+            b = pb.get(line_n)
+            if b and pb.get(target_n):
+                st             = b.constraints.new('STRETCH_TO')
+                st.target      = arm
+                st.subtarget   = target_n
+                st.rest_length = 0.0  # 0 = use bone's edit-mode rest length
+                st.volume      = 'NO_VOLUME'
+                b.lock_location   = [True, True, True]
+                b.lock_rotation   = [True, True, True]
+                b.lock_rotation_w = True
+                b.lock_scale      = [True, True, True]
 
     def _setup_eye_constraints(self, arm: Object) -> None:
         pb = arm.pose.bones
@@ -1035,7 +1390,6 @@ class HM2_OT_Process(Operator):
             bone = pb.get(eye_name)
             if not bone:
                 continue
-            # Fall back to centre target if per-eye bone wasn't created
             if not pb.get(subtarget):
                 subtarget = 'IK_EyeTarget'
             for c in list(bone.constraints):
@@ -1048,17 +1402,13 @@ class HM2_OT_Process(Operator):
             tt.up_axis    = 'UP_Z'
 
     def _setup_fk_controllers(self, arm: Object) -> None:
-        """Add Copy Rotation/Location constraints so FK/IK controllers drive the real bones."""
         pb = arm.pose.bones
 
-        # M_Root follows CTRL_Ground's world-space location so moving the ground
-        # controller translates the entire deform skeleton.
         root_pb = pb.get('M_Root')
         if root_pb and pb.get('CTRL_Ground'):
             co = root_pb.constraints.new('CHILD_OF')
             co.target    = arm
             co.subtarget = 'CTRL_Ground'
-            # Bake the inverse so M_Root stays in place at rest
             co.inverse_matrix = arm.pose.bones['CTRL_Ground'].matrix.inverted()
 
         def copy_rot(owner_name: str, target_name: str, local: bool = False) -> None:
@@ -1076,24 +1426,27 @@ class HM2_OT_Process(Operator):
             cr.owner_space  = space
             cr.target_space = space
 
-        # Spine is pure FK - no constraints, each bone rotated directly by the animator.
+        copy_rot('L_Hand', 'IK_Hand_L', local=False)
+        copy_rot('R_Hand', 'IK_Hand_R', local=False)
+        for side in ('L', 'R'):
+            ankle_tgt = f'MCH_IK_Ankle_{side}' if pb.get(f'MCH_IK_Ankle_{side}') \
+                else f'IK_Ankle_{side}'
+            copy_rot(f'{side}_Ankle', ankle_tgt, local=False)
 
-        # Hand / ankle: WORLD space.  The IK target bones were created with the
-        # same roll as the deform bone, so in rest pose the world rotations match
-        # and the constraint is neutral.  Rotating the IK target then applies an
-        # equal world-space rotation to the deform bone (wrist roll, foot tilt).
-        for owner, tgt in [
-            ('L_Hand',  'IK_Hand_L'),
-            ('R_Hand',  'IK_Hand_R'),
-            ('L_Ankle', 'IK_Ankle_L'),
-            ('R_Ankle', 'IK_Ankle_R'),
-        ]:
-            copy_rot(owner, tgt, local=False)
+        for side in ('L', 'R'):
+            roll_pb = pb.get(f'MCH_FootRoll_{side}')
+            toe_ctrl = f'CTRL_Toe_{side}'
+            if roll_pb and pb.get(toe_ctrl):
+                for c in list(roll_pb.constraints):
+                    if c.type == 'COPY_ROTATION' and getattr(c, 'subtarget', '') == toe_ctrl:
+                        roll_pb.constraints.remove(c)
+                cr = roll_pb.constraints.new('COPY_ROTATION')
+                cr.target       = arm
+                cr.subtarget    = toe_ctrl
+                cr.mix_mode     = 'REPLACE'
+                cr.owner_space  = 'LOCAL'
+                cr.target_space = 'LOCAL'
 
-        # Tip-toe pivot lifts IK_Ankle structurally, but L_Toe inherits the
-        # pivot rotation via the chain and bends upward - wrong.
-        # Fix: ADD the inverse of CTRL_Toe's world rotation to L_Toe so the
-        # inherited bend is cancelled and the toe stays flat on the ground.
         for toe_name, toe_ctrl in [
             ('L_Toe', 'CTRL_Toe_L'),
             ('R_Toe', 'CTRL_Toe_R'),
@@ -1107,10 +1460,6 @@ class HM2_OT_Process(Operator):
                 cr.invert_x     = True
                 cr.invert_y     = True
                 cr.invert_z     = True
-                # LOCAL space: rest-pose local rotation is always 0, so the
-                # counter-rotation adds nothing at rest - no floor penetration.
-                # On tip-toe, CTRL_Toe local = +θ; inverted = −θ cancels the
-                # inherited tilt and keeps the toe flat on the ground.
                 cr.owner_space  = 'LOCAL'
                 cr.target_space = 'LOCAL'
 
@@ -1125,7 +1474,6 @@ class HM2_OT_Process(Operator):
             n = len(names)
             if n == 0:
                 return
-            # Stored target may be a pre-rename name; translate via rename map first.
             rename_map = getattr(self, '_rename_map', {})
             if target and target in rename_map:
                 target = rename_map[target]
@@ -1153,82 +1501,245 @@ class HM2_OT_Process(Operator):
 
     def _assign_custom_shapes(self, arm: Object, hm2, shapes: dict) -> None:
         pb = arm.pose.bones
+        _arm_world_3x3 = arm.matrix_world.to_3x3()
 
-        # Reference size = 5% of leg span (hip->ankle).  Keeps shapes proportional
-        # to the character regardless of Blender scene scale.
-        hip_pb   = pb.get('L_Hip') or pb.get('R_Hip')
-        ankle_pb = pb.get('L_Ankle') or pb.get('R_Ankle')
-        if hip_pb and ankle_pb:
-            ref = max((hip_pb.head - ankle_pb.head).length * 0.05, 1e-5)
-        else:
-            ref = 0.035  # fallback for a typical 0.7 m leg
+        def _orient_scoop_front(bone) -> None:
+            """Lock a shoulder-scoop widget (scapula/shoulder) to a consistent world
+            orientation regardless of the bone's roll. The widget's +Y stays along
+            the bone, but it is rotated about that axis so the scoop opening (+Z)
+            faces world front (-Y, Blender's standard armature-front). This keeps
+            shoulder shapes displaying the same way across every model, where
+            differing bone rolls would otherwise rotate them arbitrarily."""
+            bone_world = _arm_world_3x3 @ bone.bone.matrix_local.to_3x3()
+            by = (bone_world @ Vector((0.0, 1.0, 0.0)))
+            if by.length < 1e-5:
+                return
+            by.normalize()
+            front = Vector((0.0, -1.0, 0.0))
+            # Component of world front perpendicular to the bone axis.
+            z = front - by * front.dot(by)
+            if z.length < 1e-5:
+                z = Vector((0.0, 0.0, 1.0))  # bone ~parallel to front; fall back to up
+            z.normalize()
+            x = by.cross(z).normalized()
+            # Columns map widget-local X/Y/Z → world right/along-bone/front.
+            world_basis = Matrix((x, by, z)).transposed()
+            local_rot = bone_world.inverted() @ world_basis
+            bone.custom_shape_rotation_euler = local_rot.to_euler()
 
-        def assign(bone_name: str, shape_key: str, mult: float = 1.0) -> None:
+        hip_pb      = pb.get('L_Hip') or pb.get('R_Hip')
+        ankle_pb    = pb.get('L_Ankle') or pb.get('R_Ankle')
+        shoulder_pb = pb.get('L_Shoulder') or pb.get('R_Shoulder')
+        hand_pb     = pb.get('L_Hand') or pb.get('R_Hand')
+        root_ref    = pb.get('M_Root')
+        head_ref    = pb.get('M_Head')
+
+        # Separate limb refs so arm shapes scale to arm proportions and
+        # leg shapes to leg proportions : Rigify sizes each region independently.
+        _leg_ref = max((hip_pb.head - ankle_pb.head).length * 0.05, 1e-5) \
+            if (hip_pb and ankle_pb) else None
+        _arm_ref = max((shoulder_pb.head - hand_pb.head).length * 0.07, 1e-5) \
+            if (shoulder_pb and hand_pb) else None
+        _body_ref = max((head_ref.head - root_ref.head).length * 0.04, 1e-5) \
+            if (head_ref and root_ref) else None
+        ref = _leg_ref or _arm_ref or _body_ref or 0.035
+
+        def assign(bone_name: str, shape_key: str, sz: float) -> None:
+            """Assign a custom shape at an explicit world-space size (use_bone_size=False)."""
             bone = pb.get(bone_name)
             if bone and shape_key in shapes:
-                bone.custom_shape = shapes[shape_key]
-                sz = ref * mult
-                bone.custom_shape_scale_xyz = (sz, sz, sz)
+                bone.custom_shape               = shapes[shape_key]
+                bone.custom_shape_scale_xyz     = (sz, sz, sz)
                 bone.use_custom_shape_bone_size = False
 
-        # -- FK spine / root / chest (bone-length scaled boxes) ---------------
-        for _sbn in ('M_Root', 'M_Spine', 'M_Spine1', 'M_Spine2', 'M_Spine3',
-                     'M_Spine4', 'M_Spine5', 'M_Spine6', 'M_Spine7', 'M_Spine8',
-                     'M_Chest'):
+        _hip_l_pb, _hip_r_pb = pb.get('L_Hip'), pb.get('R_Hip')
+        _sho_l_pb, _sho_r_pb = pb.get('L_Shoulder'), pb.get('R_Shoulder')
+        _hip_width = (_hip_l_pb.head - _hip_r_pb.head).length if (_hip_l_pb and _hip_r_pb) else 0.0
+        _sho_width = (_sho_l_pb.head - _sho_r_pb.head).length if (_sho_l_pb and _sho_r_pb) else 0.0
+        _root_z  = pb['M_Root'].head.z  if pb.get('M_Root')  else 0.0
+        _chest_z = pb['M_Chest'].head.z if pb.get('M_Chest') else 1.0
+        _vert_span = max(_chest_z - _root_z, 1e-5)
+
+        _root_pb = pb.get('M_Root')
+        if _root_pb and 'box' in shapes:
+            _bl = _root_pb.bone.length
+            _box_sz = _vert_span * 0.6 if _vert_span > 1e-5 else _hip_width if _hip_width > 0 else _bl * 1.8
+            _root_pb.custom_shape               = shapes['box']
+            _root_pb.custom_shape_scale_xyz     = (_box_sz, _box_sz, _box_sz)
+            _root_pb.use_custom_shape_bone_size = False
+            _root_pb.custom_shape_translation   = Vector((0, _bl * 0.5, 0))
+
+        for _sbn in ('M_Spine', 'M_Spine1', 'M_Spine2', 'M_Spine3',
+                     'M_Spine4', 'M_Spine5', 'M_Spine6', 'M_Spine7', 'M_Spine8'):
             _spb = pb.get(_sbn)
-            if _spb and 'box' in shapes:
-                _bl = _spb.bone.length
-                _spb.custom_shape               = shapes['box']
-                _spb.custom_shape_scale_xyz     = (_bl * 0.8, _bl * 0.8, _bl * 0.8)
-                _spb.use_custom_shape_bone_size = False
-                _spb.custom_shape_translation   = Vector((0, _bl * 0.5, 0))
-        assign('M_Neck',  'circle', 1.2)
-        assign('M_Head',  'sphere', 1.5)
-        _mhd = pb.get('M_Head')
-        if _mhd:
-            _mhd.custom_shape_translation = Vector((0, _mhd.bone.length * 0.5, 0))
-        _mhd = pb.get('M_Neck')
-        if _mhd:
-            _mhd.custom_shape_translation = Vector((0, _mhd.bone.length * 0.5, 0))
+            if not (_spb and 'circle' in shapes):
+                continue
+            _bl = _spb.bone.length
+            _spb.custom_shape             = shapes['circle']
+            _spb.custom_shape_translation = Vector((0, _bl * 0.5, 0))
+            # FK spine: scale with own bone length (Rigify radius=1.0 convention).
+            _spb.custom_shape_scale_xyz     = (1.0, 1.0, 1.0)
+            _spb.use_custom_shape_bone_size = True
 
-        # -- FK Controllers ----------------------------------------------------
-        assign('CTRL_Ground', 'master', 6.0)
+        _chest_pb = pb.get('M_Chest')
+        if _chest_pb and 'shoulder' in shapes:
+            _bl = _chest_pb.bone.length
+            _sz = _sho_width if _sho_width > 0 else _bl * 1.8
+            _chest_pb.custom_shape                 = shapes['shoulder']
+            _chest_pb.custom_shape_scale_xyz       = (_sz, _sz, _sz)
+            _chest_pb.use_custom_shape_bone_size   = False
+            _bw = _arm_world_3x3 @ _chest_pb.bone.matrix_local.to_3x3()
+            _world_basis = Matrix((Vector((1.0, 0.0, 0.0)),
+                                   Vector((0.0, 1.0, 0.0)),
+                                   Vector((0.0, 0.0, 1.0)))).transposed()
+            _chest_pb.custom_shape_rotation_euler  = (_bw.inverted() @ _world_basis).to_euler()
+            _by = (_bw @ Vector((0.0, 1.0, 0.0)))
+            _by = _by.normalized() if _by.length > 1e-5 else Vector((0.0, 0.0, 1.0))
+            _world_off = _by * (_bl * 0.8) + Vector((0.0, -1.0, 0.0)) * (_sz * 0.5)
+            _chest_pb.custom_shape_translation     = _bw.inverted() @ _world_off
+
+        # Neck/head: Rigify uses create_circle_widget with bone-relative radii.
+        # We keep absolute sizing here keyed to body ref.
+        _br = _body_ref or ref
+        for _bn, _mult, _ht in (('M_Neck', 1.0, 0.5), ('M_Head', 2.5, 1.0)):
+            _b = pb.get(_bn)
+            if _b and 'circle' in shapes:
+                _sz = _br * _mult
+                _b.custom_shape               = shapes['circle']
+                _b.custom_shape_scale_xyz     = (_sz, _sz, _sz)
+                _b.use_custom_shape_bone_size = False
+                _b.custom_shape_translation   = Vector((0, _b.bone.length * _ht, 0))
+
+        # Scale to roughly match the character's stance width.
+        _ground_sz = max(_hip_width, _sho_width) * 0.9 if (_hip_width or _sho_width) else ref * 6.0
+        assign('CTRL_Ground', 'master', _ground_sz)
+
+        _ar = _arm_ref or ref
+        _lr = _leg_ref or ref
         for side in ('L', 'R'):
-            assign(f'CTRL_Toe_{side}', 'circle', 0.7)
+            assign(f'CTRL_Toe_{side}', 'circle',   _lr * 0.7)
+            assign(f'{side}_Scapula', 'shoulder',  _ar * 1.0)
+            _scap_pb = pb.get(f'{side}_Scapula')
+            if _scap_pb and 'shoulder' in shapes:
+                _orient_scoop_front(_scap_pb)
 
-        # -- IK limb targets and poles (all sphere wireframes) -----------------
+        # Rigify sizes these via set_bone_widget_transform to the IK output bone
+        # (wrist/ankle), so the widget naturally fits the limb endpoint.
+        # We approximate that by using limb-specific refs.
         for side in ('L', 'R'):
-            assign(f'IK_Hand_{side}',  'sphere', 0.9)
-            assign(f'IK_Ankle_{side}', 'sphere', 0.9)
-            assign(f'IK_Elbow_{side}', 'sphere', 0.8)
-            assign(f'IK_Knee_{side}',  'sphere', 0.8)
-            assign(f'{side}_Eye',      'circle', 0.7)
+            assign(f'IK_Hand_{side}',  'hand',   _ar * 1.2)
+            assign(f'IK_Elbow_{side}', 'sphere', _ar * 0.8)
+            assign(f'IK_Knee_{side}',  'sphere', _lr * 0.8)
+            assign(f'{side}_Eye',      'circle', _ar * 0.7)
+            hb = pb.get(f'IK_Hand_{side}')
+            if hb and 'hand' in shapes:
+                hb.custom_shape_rotation_euler = (0.0, math.radians(90), 0.0)
 
-        assign('IK_EyeTarget',   'goggle', 1.5)
-        assign('IK_EyeTarget_L', 'sphere', 0.6)
-        assign('IK_EyeTarget_R', 'sphere', 0.6)
+            ab  = pb.get(f'IK_Ankle_{side}')
+            ank = pb.get(f'{side}_Ankle')
+            toe = pb.get(f'{side}_Toe')
+            if ab and 'foot' in shapes:
+                # Foot length from ankle joint to toe (fall back to a leg-ref guess).
+                if ank and toe:
+                    foot_len = (toe.bone.head_local - ank.bone.head_local).length
+                else:
+                    foot_len = _lr * 4.0
+                len_sz = max(foot_len * 1.3 / 1.75, _lr * 2.5)
+                wid_sz = len_sz * 0.6
+                ab.custom_shape               = shapes['foot']
+                ab.use_custom_shape_bone_size = False
+                ab.custom_shape_scale_xyz     = (wid_sz, len_sz, len_sz)
 
-        # -- Twist rings -------------------------------------------------------
-        for names in self._twist_bone_names.values():
+                bone_world = _arm_world_3x3 @ ab.bone.matrix_local.to_3x3()
+                if ank and toe:
+                    fwd = _arm_world_3x3 @ (toe.bone.head_local - ank.bone.head_local)
+                else:
+                    fwd = bone_world @ Vector((0.0, 1.0, 0.0))
+                fwd.z = 0.0
+                if fwd.length < 1e-5:
+                    fwd = Vector((0.0, -1.0, 0.0))
+                fwd.normalize()
+                up    = Vector((0.0, 0.0, 1.0))
+                right = fwd.cross(up).normalized()
+                # Columns map widget-local X/Y/Z → world right/forward/up.
+                world_basis = Matrix((right, fwd, up)).transposed()
+                # custom_shape_rotation is applied in bone-local space.
+                local_rot = bone_world.inverted() @ world_basis
+                ab.custom_shape_rotation_euler = local_rot.to_euler()
+
+                # Drop the print to the floor, centered between heel and toe.
+                if ank and toe:
+                    mid = (ank.bone.head_local + toe.bone.head_local) * 0.5
+                else:
+                    mid = ab.bone.head_local.copy()
+                target_world = arm.matrix_world @ Vector((mid.x, mid.y, 0.0))
+                head_world   = arm.matrix_world @ ab.bone.head_local
+                # Translation is in raw bone-local units (bone-size scaling is off).
+                ab.custom_shape_translation = bone_world.inverted() @ (target_world - head_world)
+
+        _eye_l_pb = pb.get('L_Eye')
+        _eye_r_pb = pb.get('R_Eye')
+        if _eye_l_pb and _eye_r_pb:
+            _eye_sep = (_eye_l_pb.bone.head_local - _eye_r_pb.bone.head_local).length
+            _goggle_sz = _eye_sep if _eye_sep > 1e-5 else _br * 1.5
+        else:
+            _goggle_sz = _br * 1.5
+        assign('IK_EyeTarget',   'goggle', _goggle_sz)
+        assign('IK_EyeTarget_L', 'sphere', _br * 0.6)
+        assign('IK_EyeTarget_R', 'sphere', _br * 0.6)
+
+        _arm_twist_joints = {'L_Shoulder', 'R_Shoulder', 'L_Elbow', 'R_Elbow'}
+        for joint_name, names in self._twist_bone_names.items():
+            _tsz = (_ar if joint_name in _arm_twist_joints else _lr) * 0.9
             for name in names:
-                assign(name, 'circle', 0.8)
+                bone = pb.get(name)
+                if not (bone and 'twist' in shapes):
+                    continue
+                bone.custom_shape               = shapes['twist']
+                bone.custom_shape_scale_xyz     = (_tsz, _tsz, _tsz)
+                bone.use_custom_shape_bone_size = False
+                bone.custom_shape_translation   = Vector((0.0, bone.bone.length * 0.5, 0.0))
 
-        # -- Finger curl controllers --------------------------------------------
         _ftm = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
                 'RING': 'Ring', 'PINKY': 'Pinky'}
         for finger in hm2.hm2_fingers:
-            if finger.generate_ik and 'circle' in shapes:
-                base      = _ftm.get(finger.finger_type, finger.finger_type)
-                ctrl_name = f"CTRL_{base}Finger_{finger.side}"
-                cpb = pb.get(ctrl_name)
+            if not finger.generate_ik:
+                continue
+            base      = _ftm.get(finger.finger_type, finger.finger_type)
+            side      = finger.side
+            start_idx = 0 if finger.finger_type == 'THUMB' else 1
+
+            mpb = pb.get(f"CTRL_{base}MasterFinger_{side}")
+            if mpb and 'finger_master' in shapes:
+                mpb.custom_shape               = shapes['finger_master']
+                mpb.custom_shape_scale_xyz     = (1.0, 1.0, 1.0)
+                mpb.use_custom_shape_bone_size = True
+
+            if 'circle' not in shapes:
+                continue
+            fk_bones = [f"FK_{base}Finger{start_idx + i}_{side}"
+                        for i in range(finger.joint_count)]
+            fk_bones.append(f"FK_{base}FingerTip_{side}")
+            for idx, fkn in enumerate(fk_bones):
+                cpb = pb.get(fkn)
                 if not cpb:
                     continue
+                is_tip = (idx == len(fk_bones) - 1)
                 cpb.custom_shape               = shapes['circle']
-                cpb.custom_shape_scale_xyz     = (0.4, 0.4, 0.4)
+                cpb.custom_shape_scale_xyz     = (0.6, 0.6, 0.6)
                 cpb.use_custom_shape_bone_size = True
-                # Rotate 90° around bone-Y so the circle sits in the YZ plane
-                # (disc visible from the side, showing the curl arc)
-                cpb.custom_shape_rotation_euler = (0.0, math.radians(90), 0.0)
+                # Ring sits mid-bone for joints, at the head for the tip.
+                cpb.custom_shape_translation   = Vector((0.0, 0.0 if is_tip else 0.5, 0.0))
+
+        if 'line' in shapes:
+            for line_n in ('VIS_PoleLine_Elbow_L', 'VIS_PoleLine_Elbow_R',
+                           'VIS_PoleLine_Knee_L',  'VIS_PoleLine_Knee_R'):
+                b = pb.get(line_n)
+                if not b:
+                    continue
+                b.custom_shape               = shapes['line']
+                b.custom_shape_scale_xyz     = (1.0, 1.0, 1.0)
+                b.use_custom_shape_bone_size = True
 
     def _assign_bone_colors(self, arm: Object, hm2) -> None:
         pb = arm.pose.bones
@@ -1238,40 +1749,36 @@ class HM2_OT_Process(Operator):
             if b:
                 b.color.palette = palette
 
-        # Yellow  - root / world-space movement
         for n in ('CTRL_Ground', 'M_Root'):
             color(n, 'THEME07')
-
-        # Lime-green - FK body controllers (spine, chest, neck, head, scapula, toes)
         for n in ('M_Chest', 'M_Spine', 'M_Spine1', 'M_Spine2', 'M_Spine3',
                   'M_Spine4', 'M_Spine5', 'M_Spine6', 'M_Spine7', 'M_Spine8',
                   'CTRL_Toe_L', 'CTRL_Toe_R'):
             color(n, 'THEME05')
-
-        # Red/orange - IK end-effector targets (hands, feet, finger tips)
         for n in ('IK_Hand_L', 'IK_Hand_R', 'IK_Ankle_L', 'IK_Ankle_R'):
             color(n, 'THEME04')
-
-        # Pink - eye / face control
         for n in ('IK_EyeTarget', 'IK_EyeTarget_L', 'IK_EyeTarget_R'):
             color(n, 'THEME08')
-
-        # Purple - IK pole targets
         for n in ('IK_Elbow_L', 'IK_Elbow_R', 'IK_Knee_L', 'IK_Knee_R'):
             color(n, 'THEME06')
-
-        # Cyan - twist bones
+        for n in ('VIS_PoleLine_Elbow_L', 'VIS_PoleLine_Elbow_R',
+                  'VIS_PoleLine_Knee_L',  'VIS_PoleLine_Knee_R'):
+            color(n, 'THEME06')
         for names in self._twist_bone_names.values():
             for n in names:
                 color(n, 'THEME09')
-
-        # Lime-green - finger curl controllers
         _ftmc = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
                  'RING': 'Ring', 'PINKY': 'Pinky'}
         for finger in hm2.hm2_fingers:
-            if finger.generate_ik:
-                base = _ftmc.get(finger.finger_type, finger.finger_type)
-                color(f"CTRL_{base}Finger_{finger.side}", 'THEME05')
+            if not finger.generate_ik:
+                continue
+            base      = _ftmc.get(finger.finger_type, finger.finger_type)
+            side      = finger.side
+            start_idx = 0 if finger.finger_type == 'THUMB' else 1
+            color(f"CTRL_{base}MasterFinger_{side}", 'THEME05')
+            for i in range(finger.joint_count):
+                color(f"FK_{base}Finger{start_idx + i}_{side}", 'THEME05')
+            color(f"FK_{base}FingerTip_{side}", 'THEME05')
 
     def _apply_export_config(self, arm: Object, hm2) -> None:
         import json as _json, os
@@ -1421,14 +1928,15 @@ class HM2_OT_Process(Operator):
 
     def _organize_collections(self, arm: Object, hm2) -> None:
         default_coll = ensure_bone_collection(arm, 'Default')
-        twist_coll   = ensure_bone_collection(arm, 'Twist',     default_coll)
+        twist_coll   = ensure_bone_collection(arm, 'Twist')
+        if twist_coll.parent is not None:
+            twist_coll.parent = None
         finger_coll  = ensure_bone_collection(arm, 'Fingers',   default_coll)
         face_coll    = ensure_bone_collection(arm, 'Face',      default_coll)
         misc_coll    = ensure_bone_collection(arm, 'Misc')
         hair_coll    = ensure_bone_collection(arm, 'Hair',      misc_coll)
         mech_coll    = ensure_bone_collection(arm, 'Mechanism', misc_coll)
         mech_coll.is_visible = False
-        # All user-interactive bones go here; this collection is auto-soloed
         ctrl_coll    = ensure_bone_collection(arm, 'Controllers')
         spine_coll   = ensure_bone_collection(arm, 'Spine',     ctrl_coll)
 
@@ -1449,16 +1957,20 @@ class HM2_OT_Process(Operator):
 
             if name in twist_names:
                 target = twist_coll
+            elif name.startswith('VIS_'):
+                target = ctrl_coll
             elif name.startswith('MCH_'):
                 target = mech_coll
             elif name in ('IK_EyeTarget_L', 'IK_EyeTarget_R'):
-                target = mech_coll   # hidden - only the centre IK_EyeTarget is exposed
-            elif name.startswith('IK_') or name.startswith('CTRL_'):
+                target = mech_coll
+            elif name.startswith('FK_') or name.startswith('CTRL_') or name.startswith('IK_'):
                 target = ctrl_coll
-            elif name in ('M_Root', 'M_Neck', 'M_Chest') or name.startswith('M_Spine') or name == 'M_Spine':
+            elif name in ('M_Root', 'M_Neck', 'M_Chest', 'M_Head') or name.startswith('M_Spine') or name == 'M_Spine':
                 target = spine_coll
             elif 'Finger' in name:
                 target = finger_coll
+            elif 'Scapula' in name:
+                target = ctrl_coll
             elif 'Eye' in name:
                 target = face_coll
             elif name in hm2_bone_names:
@@ -1473,4 +1985,14 @@ class HM2_OT_Process(Operator):
                 for c in list(bone.collections):
                     c.unassign(bone)
                 target.assign(bone)
+
+        default_coll.is_visible = False
+        face_coll.is_visible    = False
+        misc_coll.is_visible    = False
+        hair_coll.is_visible    = False
+        mech_coll.is_visible    = False
+        twist_coll.is_visible   = True
+        ctrl_coll.is_visible    = True
+        spine_coll.is_visible   = True
+        finger_coll.is_visible  = True
 

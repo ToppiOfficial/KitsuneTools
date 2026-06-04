@@ -313,5 +313,196 @@ def reevaluate_bone_parented_empty_matrix(armature: Optional[Object] = None,filt
             obj.rotation_euler = (0, 0, 0)
         
         fixed_count += 1
-    
+
     return fixed_count
+
+
+#
+#   SAFE TRANSFORM APPLY
+#
+
+# Object types whose transform Blender's object.transform_apply can bake into data.
+TRANSFORM_APPLY_TYPES = {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META', 'LATTICE', 'ARMATURE', 'GPENCIL', 'GREASEPENCIL'}
+
+# Constraints that read the target's origin matrix. These break when the origin moves, and can be
+# safely redirected to an anchor empty placed at the old origin.
+ORIGIN_READING_CONSTRAINT_TYPES = {
+    'COPY_LOCATION', 'COPY_ROTATION', 'COPY_SCALE', 'COPY_TRANSFORMS',
+    'CHILD_OF', 'TRACK_TO', 'DAMPED_TRACK', 'LOCKED_TRACK', 'STRETCH_TO',
+    'IK', 'TRANSFORM', 'PIVOT', 'FLOOR', 'ACTION',
+}
+
+# Constraints that read the target's geometry/curve rather than its origin matrix. Apply Transform
+# is visually neutral for geometry, so these never break and must NOT be redirected to an empty.
+GEOMETRY_SAFE_CONSTRAINT_TYPES = {
+    'SHRINKWRAP', 'CLAMP_TO', 'FOLLOW_PATH', 'SPLINE_IK', 'ARMATURE',
+}
+
+ANCHOR_COLLECTION_NAME = "KitsuneTools Apply Anchors"
+
+
+def get_constraint_target_world(target: Object, subtarget: str = "") -> mathutils.Matrix:
+    """World-space matrix a constraint actually targets (bone-aware)."""
+    if subtarget and target.type == 'ARMATURE':
+        pose_bone = target.pose.bones.get(subtarget)
+        if pose_bone:
+            return target.matrix_world @ pose_bone.matrix
+    return target.matrix_world.copy()
+
+
+def sort_objects_parents_first(objects) -> list[Object]:
+    """Topologically order objects so a parent is always processed before its children."""
+    obj_set = set(objects)
+    ordered: list[Object] = []
+    visited = set()
+
+    def visit(ob: Object) -> None:
+        if ob in visited:
+            return
+        visited.add(ob)
+        if ob.parent in obj_set:
+            visit(ob.parent)
+        ordered.append(ob)
+
+    for ob in objects:
+        visit(ob)
+    return ordered
+
+
+def gather_transform_apply_context(applied_objs) -> Dict[str, list]:
+    """
+    Collect everything in the scene whose result depends on the origin space of `applied_objs`,
+    so an Apply Transform can be compensated instead of breaking things.
+
+    Only references that read an applied object's ORIGIN matrix break: constraints with an empty
+    subtarget whose type is origin-reading. Bone/vertex subtargets and geometry-based constraints
+    (Shrinkwrap, Clamp To, …) stay visually correct because Apply Transform is geometry-neutral,
+    so they are ignored.
+
+    Returns a dict with:
+        children:        objects parented to an applied object (any parent type) that are NOT
+                         themselves being applied -> restore their world matrix afterwards.
+        origin_refs:     (owner, pose_bone|None, constraint, attr, target) for each origin-reading
+                         constraint reference -> Child Of inverse re-solved, or redirected to an
+                         anchor in experimental mode. `attr` is 'target' or 'pole_target'.
+        warn_refs:       (owner_label, constraint_name, constraint_type, target_name) for origin
+                         references of an unrecognised constraint type -> warn only.
+        deformed_meshes: meshes deformed by an applied armature but NOT selected -> warn only.
+    """
+    applied_set = set(applied_objs)
+
+    children: list[Object] = []
+    origin_refs: list[tuple] = []
+    warn_refs: list[tuple] = []
+    deformed_meshes: list[Object] = []
+
+    for obj in bpy.data.objects:
+        if obj not in applied_set and obj.parent in applied_set:
+            children.append(obj)
+
+    def scan_constraints(owner: Object, pose_bone, constraints) -> None:
+        owner_label = owner.name if pose_bone is None else f"{owner.name} → {pose_bone.name}"
+        for con in constraints:
+            for attr, sub_attr in (('target', 'subtarget'), ('pole_target', 'pole_subtarget')):
+                target = getattr(con, attr, None)
+                if target not in applied_set:
+                    continue
+                if getattr(con, sub_attr, "") or "":
+                    continue  # bone/vertex subtarget -> geometry preserved, stays correct
+                if con.type in GEOMETRY_SAFE_CONSTRAINT_TYPES:
+                    continue
+                if con.type in ORIGIN_READING_CONSTRAINT_TYPES:
+                    origin_refs.append((owner, pose_bone, con, attr, target))
+                else:
+                    warn_refs.append((owner_label, con.name, con.type, target.name))
+
+    for obj in bpy.data.objects:
+        scan_constraints(obj, None, obj.constraints)
+        if obj.type == 'ARMATURE':
+            for pb in obj.pose.bones:
+                scan_constraints(obj, pb, pb.constraints)
+
+    applied_armatures = {o for o in applied_set if o.type == 'ARMATURE'}
+    if applied_armatures:
+        for obj in bpy.data.objects:
+            if obj.type != 'MESH' or obj in applied_set:
+                continue
+            if any(mod.type == 'ARMATURE' and mod.object in applied_armatures for mod in obj.modifiers):
+                deformed_meshes.append(obj)
+
+    return {
+        'children': children,
+        'origin_refs': origin_refs,
+        'warn_refs': warn_refs,
+        'deformed_meshes': deformed_meshes,
+    }
+
+
+def find_transform_driver_targets(applied_objs) -> list[tuple]:
+    """
+    Find driver variable targets that read an applied object's OBJECT-level transform.
+
+    Bone-channel reads are skipped (Apply Transform is visually neutral for bones). Returns a list
+    of (driver_target, applied_obj, owner_label, driver_data_path); `driver_target` is the live
+    DriverTarget whose `.id` can be re-pointed to an anchor in experimental mode.
+    """
+    applied_set = set(applied_objs)
+    transform_words = ('location', 'rotation', 'scale', 'delta_',
+                       'matrix_world', 'matrix_basis', 'matrix_local')
+    results: list[tuple] = []
+
+    def scan(owner_label: str, anim) -> None:
+        if not anim:
+            return
+        for fcurve in anim.drivers:
+            for var in fcurve.driver.variables:
+                for tgt in var.targets:
+                    tid = getattr(tgt, 'id', None)
+                    if tid not in applied_set:
+                        continue
+                    if var.type == 'TRANSFORMS':
+                        if getattr(tgt, 'bone_target', ""):
+                            continue  # bone transform -> safe
+                        results.append((tgt, tid, owner_label, fcurve.data_path))
+                    elif var.type == 'SINGLE_PROP':
+                        dp = getattr(tgt, 'data_path', "") or ""
+                        if 'pose.bones' in dp or 'bones[' in dp:
+                            continue  # bone channel -> safe
+                        if any(w in dp for w in transform_words):
+                            results.append((tgt, tid, owner_label, fcurve.data_path))
+
+    for obj in bpy.data.objects:
+        scan(obj.name, obj.animation_data)
+        data = getattr(obj, 'data', None)
+        if data is not None and hasattr(data, 'animation_data'):
+            scan(f"{obj.name} (data)", data.animation_data)
+        if obj.type == 'MESH' and obj.data.shape_keys:
+            scan(f"{obj.name} (shape keys)", obj.data.shape_keys.animation_data)
+
+    return results
+
+
+def get_apply_anchor_collection() -> bpy.types.Collection:
+    """Get (or create) the collection that holds Apply Transform anchor empties."""
+    coll = bpy.data.collections.get(ANCHOR_COLLECTION_NAME)
+    if coll is None:
+        coll = bpy.data.collections.new(ANCHOR_COLLECTION_NAME)
+        bpy.context.scene.collection.children.link(coll)
+    return coll
+
+
+def create_apply_anchor(obj: Object, world_matrix: mathutils.Matrix, collection: bpy.types.Collection) -> Object:
+    """Create an unparented empty at `world_matrix` to stand in for `obj`'s old origin."""
+    anchor = bpy.data.objects.new(f"{obj.name}_ApplyAnchor", None)
+    anchor.empty_display_type = 'ARROWS'
+    anchor.empty_display_size = 0.1
+    collection.objects.link(anchor)
+    anchor.matrix_world = world_matrix
+    return anchor
+
+
+def attach_apply_anchor(anchor: Object, obj: Object, world_matrix: mathutils.Matrix) -> None:
+    """Parent `anchor` to `obj` keeping it at `world_matrix`, so it follows the object afterwards."""
+    anchor.parent = obj
+    anchor.matrix_parent_inverse = obj.matrix_world.inverted()
+    anchor.matrix_basis = world_matrix

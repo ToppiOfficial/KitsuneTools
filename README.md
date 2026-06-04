@@ -19,3 +19,7 @@ Atleast 4.5
 
 ### Apply Armature Pose as Rest Pose or as Shapekeys
 - Apply armature's current pose as restpose which also apply the posture for connected mesh(es)
+
+## Acknowledgements
+
+- [angavrilov/angavrilov-rigs](https://github.com/angavrilov/angavrilov-rigs) - portions of the Humanoid Armature Mapper 2 (HM2) code are adapted from this Rigify-based project.

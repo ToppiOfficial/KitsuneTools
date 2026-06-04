@@ -249,8 +249,11 @@ class HUMANOIDMAPPER_UL_ConfigList(UIList):
 
 
 class TOOLS_PT_KitsuneTool_Humanoidmapper(TOOLS_PT_KitsuneTool_Panel):
+    bl_idname = 'TOOLS_PT_KitsuneTool_Humanoidmapper'
+    bl_parent_id = 'TOOLS_PT_KitsuneTool_HumanoidMapping'
+
     def draw_header(self, context):
-        self.layout.label(text=get_label_with_object_name('Humanoid Armature Mapper', context.active_object, 'Humanoid Armature Mapper'))
+        self.layout.label(text=get_label_with_object_name('Humanoid Armature Mapper (DEPRECATED)', context.active_object, 'Humanoid Armature Mapper (DEPRECATED)'))
 
     def draw(self, context : Context) -> None:
         layout = self.layout

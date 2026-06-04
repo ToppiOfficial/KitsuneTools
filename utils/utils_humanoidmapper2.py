@@ -156,194 +156,420 @@ _SHAPE_NAMES = {
     'box':      'HM2Shape_Box',
     'circle':   'HM2Shape_Circle',
     'sphere':   'HM2Shape_Sphere',
-    'arrow':    'HM2Shape_Arrow',
     'goggle':   'HM2Shape_Goggle',
     'shoulder': 'HM2Shape_Shoulder',
     'master':   'HM2Shape_Master',
+    'limb_end': 'HM2Shape_LimbEnd',
+    'line':     'HM2Shape_Line',
+    'pivot':    'HM2Shape_Pivot',
+    'twist':    'HM2Shape_Twist',
+    'hand':     'HM2Shape_Hand',
+    'foot':     'HM2Shape_Foot',
+    'finger_master': 'HM2Shape_FingerMaster',
 }
 
 
-def _create_box_mesh(name: str) -> Object:
-    """Wireframe box (edges only, no faces) so it looks like a cage in the viewport."""
+def _mesh_from_pydata(name: str, verts, edges) -> Object:
     mesh = bpy.data.meshes.new(name)
-    bm = bmesh.new()
-    # half-extents: wide left-right, moderate depth along bone, tall up-down
-    # Unit box ±0.5 so custom_shape_scale_xyz gives exact world dimensions:
-    # scale_xyz = (width, depth, height) -> box spans exactly that size.
-    w = d = h = 0.5
-    vs = [
-        bm.verts.new(Vector((-w, -d, -h))), bm.verts.new(Vector(( w, -d, -h))),
-        bm.verts.new(Vector(( w,  d, -h))), bm.verts.new(Vector((-w,  d, -h))),
-        bm.verts.new(Vector((-w, -d,  h))), bm.verts.new(Vector(( w, -d,  h))),
-        bm.verts.new(Vector(( w,  d,  h))), bm.verts.new(Vector((-w,  d,  h))),
-    ]
-    for a, b in [(0,1),(1,2),(2,3),(3,0), (4,5),(5,6),(6,7),(7,4),
-                 (0,4),(1,5),(2,6),(3,7)]:
-        bm.edges.new((vs[a], vs[b]))
-    bm.to_mesh(mesh)
-    bm.free()
-    obj = bpy.data.objects.new(name, mesh)
-    return obj
+    mesh.from_pydata(verts, edges, [])
+    mesh.update()
+    return bpy.data.objects.new(name, mesh)
+
+
+def _create_box_mesh(name: str) -> Object:
+    """Rigify create_cube_widget : wireframe cube at ±0.5."""
+    r = 0.5
+    return _mesh_from_pydata(name,
+        [(r,r,r),(r,-r,r),(-r,-r,r),(-r,r,r),(r,r,-r),(r,-r,-r),(-r,-r,-r),(-r,r,-r)],
+        [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)],
+    )
 
 
 def _create_circle_mesh(name: str) -> Object:
+    """Rigify create_circle_widget : 32-segment ring in the XZ plane (perpendicular to bone +Y)."""
     mesh = bpy.data.meshes.new(name)
     bm = bmesh.new()
     bmesh.ops.create_circle(bm, cap_ends=False, segments=32, radius=1.0)
-    # Rotate 90° around X so the circle lies in the bone's local XZ plane,
-    # i.e. perpendicular to the bone direction (+Y).  This makes the shape
-    # appear as a halo ring around the bone from any viewing angle.
     rot = mathutils.Matrix.Rotation(math.pi / 2, 4, 'X')
     bmesh.ops.transform(bm, matrix=rot, verts=bm.verts)
     bm.to_mesh(mesh)
     bm.free()
-    obj = bpy.data.objects.new(name, mesh)
-    return obj
+    return bpy.data.objects.new(name, mesh)
 
 
 def _create_sphere_mesh(name: str) -> Object:
-    """Three orthogonal great circles (XZ / XY / YZ) - same wireframe look as Blender's bone display."""
-    mesh = bpy.data.meshes.new(name)
-    bm = bmesh.new()
-    seg = 32
-    for ai, bi in ((0, 2), (0, 1), (1, 2)):   # XZ, XY, YZ planes
-        ring = []
-        for i in range(seg):
-            t = (i / seg) * 2 * math.pi
-            co = [0.0, 0.0, 0.0]
-            co[ai] = math.cos(t)
-            co[bi] = math.sin(t)
-            ring.append(bm.verts.new(Vector(co)))
-        for i in range(seg):
-            bm.edges.new((ring[i], ring[(i + 1) % seg]))
-    bm.to_mesh(mesh)
-    bm.free()
-    obj = bpy.data.objects.new(name, mesh)
-    return obj
-
-
-def _create_arrow_mesh(name: str) -> Object:
-    mesh = bpy.data.meshes.new(name)
-    bm = bmesh.new()
-    # Arrow pointing in +Y (= bone direction in Blender custom shapes).
-    # Stem 0->0.6, arrowhead 0.6->1.0.
+    """Rigify create_sphere_widget : three perpendicular 16-segment circles, scaled to radius 1."""
+    # Exact Rigify vertex data (original radius 0.5), scaled ×2 → radius 1.0
+    s = 2.0
     verts = [
-        bm.verts.new(Vector((-0.1, 0,   0))),
-        bm.verts.new(Vector(( 0.1, 0,   0))),
-        bm.verts.new(Vector(( 0.1, 0.6, 0))),
-        bm.verts.new(Vector((-0.1, 0.6, 0))),
-        bm.verts.new(Vector((-0.25, 0.6, 0))),
-        bm.verts.new(Vector(( 0.25, 0.6, 0))),
-        bm.verts.new(Vector(( 0,   1.0, 0))),
+        (0.3535533845424652*s, 0.3535533845424652*s, 0.0),
+        (0.4619397521018982*s, 0.19134171307086945*s, 0.0),
+        (0.5*s, -2.1855694143368964e-08*s, 0.0),
+        (0.4619397521018982*s, -0.19134175777435303*s, 0.0),
+        (0.3535533845424652*s, -0.3535533845424652*s, 0.0),
+        (0.19134174287319183*s, -0.4619397521018982*s, 0.0),
+        (7.549790126404332e-08*s, -0.5*s, 0.0),
+        (-0.1913416087627411*s, -0.46193981170654297*s, 0.0),
+        (-0.35355329513549805*s, -0.35355350375175476*s, 0.0),
+        (-0.4619397521018982*s, -0.19134178757667542*s, 0.0),
+        (-0.5*s, 5.962440319251527e-09*s, 0.0),
+        (-0.4619397222995758*s, 0.1913418024778366*s, 0.0),
+        (-0.35355326533317566*s, 0.35355350375175476*s, 0.0),
+        (-0.19134148955345154*s, 0.46193987131118774*s, 0.0),
+        (3.2584136988589307e-07*s, 0.5*s, 0.0),
+        (0.1913420855998993*s, 0.46193960309028625*s, 0.0),
+        (7.450580596923828e-08*s, 0.46193960309028625*s, 0.19134199619293213*s),
+        (5.9254205098113744e-08*s, 0.5*s, 2.323586443253589e-07*s),
+        (4.470348358154297e-08*s, 0.46193987131118774*s, -0.1913415789604187*s),
+        (2.9802322387695312e-08*s, 0.35355350375175476*s, -0.3535533547401428*s),
+        (2.9802322387695312e-08*s, 0.19134178757667542*s, -0.46193981170654297*s),
+        (5.960464477539063e-08*s, -1.1151834122813398e-08*s, -0.5000000596046448*s),
+        (5.960464477539063e-08*s, -0.1913418024778366*s, -0.46193984150886536*s),
+        (5.960464477539063e-08*s, -0.35355350375175476*s, -0.3535533845424652*s),
+        (7.450580596923828e-08*s, -0.46193981170654297*s, -0.19134166836738586*s),
+        (9.348272556053416e-08*s, -0.5*s, 1.624372103492533e-08*s),
+        (1.043081283569336e-07*s, -0.4619397521018982*s, 0.19134168326854706*s),
+        (1.1920928955078125e-07*s, -0.3535533845424652*s, 0.35355329513549805*s),
+        (1.1920928955078125e-07*s, -0.19134174287319183*s, 0.46193966269493103*s),
+        (1.1920928955078125e-07*s, -4.7414250303745575e-09*s, 0.49999991059303284*s),
+        (1.1920928955078125e-07*s, 0.19134172797203064*s, 0.46193966269493103*s),
+        (8.940696716308594e-08*s, 0.3535533845424652*s, 0.35355329513549805*s),
+        (0.3535534739494324*s, 0.0*s, 0.35355329513549805*s),
+        (0.1913418173789978*s, -2.9802322387695312e-08*s, 0.46193966269493103*s),
+        (8.303572940349113e-08*s, -5.005858838558197e-08*s, 0.49999991059303284*s),
+        (-0.19134165346622467*s, -5.960464477539063e-08*s, 0.46193966269493103*s),
+        (-0.35355329513549805*s, -8.940696716308594e-08*s, 0.35355329513549805*s),
+        (-0.46193963289260864*s, -5.960464477539063e-08*s, 0.19134168326854706*s),
+        (-0.49999991059303284*s, -5.960464477539063e-08*s, 1.624372103492533e-08*s),
+        (-0.4619397521018982*s, -2.9802322387695312e-08*s, -0.19134166836738586*s),
+        (-0.3535534143447876*s, -2.9802322387695312e-08*s, -0.3535533845424652*s),
+        (-0.19134171307086945*s, 0.0*s, -0.46193984150886536*s),
+        (7.662531942287387e-08*s, 9.546055501630235e-09*s, -0.5000000596046448*s),
+        (0.19134187698364258*s, 5.960464477539063e-08*s, -0.46193981170654297*s),
+        (0.3535535931587219*s, 5.960464477539063e-08*s, -0.3535533547401428*s),
+        (0.4619399905204773*s, 5.960464477539063e-08*s, -0.1913415789604187*s),
+        (0.5000000596046448*s, 5.960464477539063e-08*s, 2.323586443253589e-07*s),
+        (0.4619396924972534*s, 2.9802322387695312e-08*s, 0.19134199619293213*s),
     ]
-    bm.edges.new((verts[0], verts[1]))
-    bm.edges.new((verts[1], verts[2]))
-    bm.edges.new((verts[2], verts[3]))
-    bm.edges.new((verts[3], verts[0]))
-    bm.edges.new((verts[4], verts[5]))
-    bm.edges.new((verts[5], verts[6]))
-    bm.edges.new((verts[6], verts[4]))
-    bm.to_mesh(mesh)
-    bm.free()
-    obj = bpy.data.objects.new(name, mesh)
-    return obj
+    edges = [
+        (0,1),(1,2),(2,3),(3,4),(4,5),(5,6),(6,7),(7,8),(8,9),(9,10),
+        (10,11),(11,12),(12,13),(13,14),(14,15),(0,15),(16,31),(16,17),
+        (17,18),(18,19),(19,20),(20,21),(21,22),(22,23),(23,24),(24,25),
+        (25,26),(26,27),(27,28),(28,29),(29,30),(30,31),(32,33),(33,34),
+        (34,35),(35,36),(36,37),(37,38),(38,39),(39,40),(40,41),(41,42),
+        (42,43),(43,44),(44,45),(45,46),(46,47),(32,47),
+    ]
+    return _mesh_from_pydata(name, verts, edges)
+
+
+def _gen_circle_2d(verts: list, edges: list, center, radius: float,
+                   angle_range=None, steps: int = 24) -> None:
+    """Port of Rigify generate_circle_geometry working in a 2D (x, y) list.
+    Appends an open arc when angle_range is given, else a closed loop."""
+    assert steps >= 3
+    start = 0.0
+    delta = math.pi * 2 / steps
+    closed = True
+    if angle_range:
+        start, end = angle_range
+        closed = False
+        if start == end:
+            steps = 1
+        else:
+            steps = max(3, math.ceil(abs(end - start) / delta) + 1)
+            delta = (end - start) / (steps - 1)
+    base = len(verts)
+    for i in range(steps):
+        a = start + delta * i
+        verts.append((center[0] + math.cos(a) * radius, center[1] + math.sin(a) * radius))
+        if i > 0:
+            edges.append((base + i - 1, base + i))
+    if closed:
+        edges.append((len(verts) - 1, base))
+
+
+def _gen_circle_hull_2d(verts: list, edges: list, points: list,
+                        radius: float, gap: float, steps: int = 24) -> None:
+    """Port of Rigify generate_circle_hull_geometry : wraps a rounded outline
+    around a set of 2D points (a 'goggle' hull for two eyes)."""
+    assert radius >= gap
+    if len(points) <= 1:
+        if points:
+            _gen_circle_2d(verts, edges, points[0], radius, steps=steps)
+        return
+    base = len(verts)
+    points_ex = [points[-1], *points, points[0]]
+    angle_gap = math.asin(gap / radius)
+    for pt_prev, pt_cur, pt_next in zip(points_ex[0:], points_ex[1:], points_ex[2:]):
+        vec_prev = (pt_prev[0] - pt_cur[0], pt_prev[1] - pt_cur[1])
+        vec_next = (pt_next[0] - pt_cur[0], pt_next[1] - pt_cur[1])
+        len_prev = math.hypot(*vec_prev)
+        len_next = math.hypot(*vec_next)
+        angle_prev = math.atan2(vec_prev[1], vec_prev[0])
+        angle_next = math.atan2(vec_next[1], vec_next[0])
+        if angle_next <= angle_prev:
+            angle_next += math.pi * 2
+        angle_prev += max(angle_gap, math.acos(min(1, len_prev / radius / 2)))
+        angle_next -= max(angle_gap, math.acos(min(1, len_next / radius / 2)))
+        if angle_next > angle_prev:
+            if len(verts) > base:
+                edges.append((len(verts) - 1, len(verts)))
+            _gen_circle_2d(verts, edges, pt_cur, radius,
+                           angle_range=(angle_prev, angle_next), steps=steps)
+    if len(verts) > base:
+        edges.append((len(verts) - 1, base))
 
 
 def _create_goggle_mesh(name: str) -> Object:
-    """Two goggle rings in the bone's XZ plane (perpendicular to +Y bone dir)."""
-    mesh = bpy.data.meshes.new(name)
-    bm = bmesh.new()
-    seg = 20
-    r   = 0.38
-    off = 0.52  # X offset of each goggle's centre
-
-    for x_off in (off, -off):
-        ring = []
-        for i in range(seg):
-            a = (i / seg) * 2 * math.pi
-            ring.append(bm.verts.new(Vector((x_off + r * math.cos(a), 0.0, r * math.sin(a)))))
-        for i in range(seg):
-            bm.edges.new((ring[i], ring[(i + 1) % seg]))
-
-    # Nose-bridge connecting the two inner edges
-    v0 = bm.verts.new(Vector(( off - r, 0.0, 0.0)))
-    v1 = bm.verts.new(Vector((-off + r, 0.0, 0.0)))
-    bm.edges.new((v0, v1))
-
-    bm.to_mesh(mesh)
-    bm.free()
-    obj = bpy.data.objects.new(name, mesh)
-    return obj
+    """Rigify create_eye_cluster_widget : two nested rounded hulls ('goggles')
+    wrapping the pair of eye points. Ported from rigify.rigs.face.skin_eye:
+    the combined/master eye look target widget. Built in the bone's XZ plane
+    (perpendicular to the +Y bone direction) so it faces down the look axis."""
+    size = 0.4
+    points = [(-0.5, 0.0), (0.5, 0.0)]
+    verts2d: list = []
+    edges: list = []
+    _gen_circle_hull_2d(verts2d, edges, points, size * 0.75, size * 0.6)
+    _gen_circle_hull_2d(verts2d, edges, points, size, size * 0.85)
+    # Map 2D (x, y) into the bone's XZ plane (y = 0, perpendicular to bone +Y).
+    verts = [(x, 0.0, y) for (x, y) in verts2d]
+    return _mesh_from_pydata(name, verts, edges)
 
 
 def _create_master_mesh(name: str) -> Object:
-    """
-    Circle + 4 inward arrows in the XY plane.
-    Flat on the floor when the bone points forward (+Y world).
-    This is the standard master/ground-root control shape.
-    """
-    mesh = bpy.data.meshes.new(name)
-    bm = bmesh.new()
-
-    # Outer ring
-    seg = 32
-    ring = []
-    for i in range(seg):
-        a = (i / seg) * 2 * math.pi
-        ring.append(bm.verts.new(Vector((math.cos(a), math.sin(a), 0.0))))
-    for i in range(seg):
-        bm.edges.new((ring[i], ring[(i + 1) % seg]))
-
-    # 4 arrows pointing outward: +X, -X, +Y, -Y
-    sw  = 0.07   # stem half-width
-    hw  = 0.18   # arrowhead half-width
-    s0  = 0.12   # stem inner radius
-    s1  = 0.60   # stem outer / arrowhead base radius
-    tip = 0.85   # arrowhead tip radius
-
-    for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-        px, py = -dy, dx  # perpendicular to arrow direction (90° CCW)
-
-        # Stem - two side edges + inner cap
-        vs0 = bm.verts.new(Vector((dx*s0 + px*sw, dy*s0 + py*sw, 0.0)))
-        vs1 = bm.verts.new(Vector((dx*s0 - px*sw, dy*s0 - py*sw, 0.0)))
-        vs2 = bm.verts.new(Vector((dx*s1 + px*sw, dy*s1 + py*sw, 0.0)))
-        vs3 = bm.verts.new(Vector((dx*s1 - px*sw, dy*s1 - py*sw, 0.0)))
-        bm.edges.new((vs0, vs1))
-        bm.edges.new((vs0, vs2))
-        bm.edges.new((vs1, vs3))
-
-        # Arrowhead - base + two sides to tip
-        va0 = bm.verts.new(Vector((dx*s1 + px*hw, dy*s1 + py*hw, 0.0)))
-        va1 = bm.verts.new(Vector((dx*s1 - px*hw, dy*s1 - py*hw, 0.0)))
-        vt  = bm.verts.new(Vector((dx*tip, dy*tip, 0.0)))
-        bm.edges.new((va0, va1))
-        bm.edges.new((va0, vt))
-        bm.edges.new((va1, vt))
-
-    bm.to_mesh(mesh)
-    bm.free()
-    obj = bpy.data.objects.new(name, mesh)
-    return obj
+    """Rigify create_root_widget : 4-directional arrow root control."""
+    verts = [
+        (0.7071067690849304, 0.7071067690849304, 0.0), (0.7071067690849304, -0.7071067690849304, 0.0),
+        (-0.7071067690849304, 0.7071067690849304, 0.0), (-0.7071067690849304, -0.7071067690849304, 0.0),
+        (0.8314696550369263, 0.5555701851844788, 0.0), (0.8314696550369263, -0.5555701851844788, 0.0),
+        (-0.8314696550369263, 0.5555701851844788, 0.0), (-0.8314696550369263, -0.5555701851844788, 0.0),
+        (0.9238795042037964, 0.3826834261417389, 0.0), (0.9238795042037964, -0.3826834261417389, 0.0),
+        (-0.9238795042037964, 0.3826834261417389, 0.0), (-0.9238795042037964, -0.3826834261417389, 0.0),
+        (0.9807852506637573, 0.19509035348892212, 0.0), (0.9807852506637573, -0.19509035348892212, 0.0),
+        (-0.9807852506637573, 0.19509035348892212, 0.0), (-0.9807852506637573, -0.19509035348892212, 0.0),
+        (0.19509197771549225, 0.9807849526405334, 0.0), (0.19509197771549225, -0.9807849526405334, 0.0),
+        (-0.19509197771549225, 0.9807849526405334, 0.0), (-0.19509197771549225, -0.9807849526405334, 0.0),
+        (0.3826850652694702, 0.9238788485527039, 0.0), (0.3826850652694702, -0.9238788485527039, 0.0),
+        (-0.3826850652694702, 0.9238788485527039, 0.0), (-0.3826850652694702, -0.9238788485527039, 0.0),
+        (0.5555717945098877, 0.8314685821533203, 0.0), (0.5555717945098877, -0.8314685821533203, 0.0),
+        (-0.5555717945098877, 0.8314685821533203, 0.0), (-0.5555717945098877, -0.8314685821533203, 0.0),
+        (0.19509197771549225, 1.2807848453521729, 0.0), (0.19509197771549225, -1.2807848453521729, 0.0),
+        (-0.19509197771549225, 1.2807848453521729, 0.0), (-0.19509197771549225, -1.2807848453521729, 0.0),
+        (1.280785322189331, 0.19509035348892212, 0.0), (1.280785322189331, -0.19509035348892212, 0.0),
+        (-1.280785322189331, 0.19509035348892212, 0.0), (-1.280785322189331, -0.19509035348892212, 0.0),
+        (0.3950919806957245, 1.2807848453521729, 0.0), (0.3950919806957245, -1.2807848453521729, 0.0),
+        (-0.3950919806957245, 1.2807848453521729, 0.0), (-0.3950919806957245, -1.2807848453521729, 0.0),
+        (1.280785322189331, 0.39509034156799316, 0.0), (1.280785322189331, -0.39509034156799316, 0.0),
+        (-1.280785322189331, 0.39509034156799316, 0.0), (-1.280785322189331, -0.39509034156799316, 0.0),
+        (0.0, 1.5807849168777466, 0.0), (0.0, -1.5807849168777466, 0.0),
+        (1.5807852745056152, 0.0, 0.0), (-1.5807852745056152, 0.0, 0.0),
+    ]
+    edges = [
+        (0,4),(1,5),(2,6),(3,7),(4,8),(5,9),(6,10),(7,11),(8,12),
+        (9,13),(10,14),(11,15),(16,20),(17,21),(18,22),(19,23),(20,24),
+        (21,25),(22,26),(23,27),(0,24),(1,25),(2,26),(3,27),(16,28),
+        (17,29),(18,30),(19,31),(12,32),(13,33),(14,34),(15,35),(28,36),
+        (29,37),(30,38),(31,39),(32,40),(33,41),(34,42),(35,43),(36,44),
+        (37,45),(38,44),(39,45),(40,46),(41,46),(42,47),(43,47),
+    ]
+    return _mesh_from_pydata(name, verts, edges)
 
 
 def _create_shoulder_mesh(name: str) -> Object:
-    """240° arc in the XZ plane - scapula / shoulder-blade controller shape."""
-    mesh = bpy.data.meshes.new(name)
-    bm = bmesh.new()
-    seg = 20
-    start = math.radians(-120)
-    end   = math.radians(120)
-    verts = []
-    for i in range(seg + 1):
-        t = start + (end - start) * i / seg
-        verts.append(bm.verts.new(Vector((math.cos(t), 0.0, math.sin(t)))))
-    for i in range(seg):
-        bm.edges.new((verts[i], verts[i + 1]))
-    bm.to_mesh(mesh)
-    bm.free()
-    obj = bpy.data.objects.new(name, mesh)
-    return obj
+    """Rigify create_shoulder_widget : scapula/shoulder bone shape."""
+    r = 1.0  # radius * 2, default radius=0.5
+    verts = [
+        (0, 0, 0), (0, 1, 0),
+        (0.41214*r, 0.5+(0.276111-0.5)*r, 0.282165*r),
+        (0.469006*r, 0.5+(0.31436-0.5)*r, 0.168047*r),
+        (0.492711*r, 0.5+(0.370708-0.5)*r, 0.0740018*r),
+        (0.498419*r, 0.5+(0.440597-0.5)*r, 0.0160567*r),
+        (0.5*r, 0.5, 0),
+        (0.498419*r, 0.5+(0.559402-0.5)*r, 0.0160563*r),
+        (0.492712*r, 0.5+(0.629291-0.5)*r, 0.074001*r),
+        (0.469006*r, 0.5+(0.68564-0.5)*r, 0.168046*r),
+        (0.412141*r, 0.5+(0.723889-0.5)*r, 0.282164*r),
+        (0.316952*r, 0.5+(0.742335-0.5)*r, 0.383591*r),
+        (0.207152*r, 0.5+(0.74771-0.5)*r, 0.453489*r),
+        (0.0999976*r, 0.5+(0.74949-0.5)*r, 0.489649*r),
+        (0, 0.5+(0.75-0.5)*r, 0.5*r),
+        (-0.099997*r, 0.5+(0.74949-0.5)*r, 0.489649*r),
+        (-0.207152*r, 0.5+(0.74771-0.5)*r, 0.453489*r),
+        (-0.316951*r, 0.5+(0.742335-0.5)*r, 0.383592*r),
+        (-0.412141*r, 0.5+(0.723889-0.5)*r, 0.282165*r),
+        (-0.469006*r, 0.5+(0.68564-0.5)*r, 0.168046*r),
+        (-0.492711*r, 0.5+(0.629291-0.5)*r, 0.0740011*r),
+        (-0.498419*r, 0.5+(0.559402-0.5)*r, 0.0160563*r),
+        (-0.5*r, 0.5, 0),
+        (-0.498419*r, 0.5+(0.440598-0.5)*r, 0.0160563*r),
+        (-0.492711*r, 0.5+(0.370709-0.5)*r, 0.0740012*r),
+        (-0.469006*r, 0.5+(0.31436-0.5)*r, 0.168047*r),
+        (-0.41214*r, 0.5+(0.276111-0.5)*r, 0.282165*r),
+        (-0.316951*r, 0.5+(0.257665-0.5)*r, 0.383592*r),
+        (-0.207151*r, 0.5+(0.25229-0.5)*r, 0.453489*r),
+        (-0.0999959*r, 0.5+(0.25051-0.5)*r, 0.489649*r),
+        (0, 0.5+(0.25-0.5)*r, 0.5*r),
+        (0.0999986*r, 0.5+(0.25051-0.5)*r, 0.489648*r),
+        (0.207153*r, 0.5+(0.25229-0.5)*r, 0.453488*r),
+        (0.316953*r, 0.5+(0.257665-0.5)*r, 0.38359*r),
+    ]
+    edges = [
+        (0,1),(2,3),(4,3),(5,4),(5,6),(6,7),(8,7),(8,9),(10,9),(10,11),
+        (11,12),(13,12),(14,13),(14,15),(16,15),(16,17),(17,18),(19,18),(19,20),(21,20),
+        (21,22),(22,23),(24,23),(25,24),(25,26),(27,26),(27,28),(29,28),(29,30),(30,31),
+        (32,31),(32,33),(2,33),
+    ]
+    return _mesh_from_pydata(name, verts, edges)
+
+
+def _create_limb_end_mesh(name: str) -> Object:
+    """Rigify create_diamond_widget : octahedron IK end-effector, scaled to radius 1."""
+    r = 1.0  # Rigify default r=0.5, scaled ×2
+    verts = [(r,0,0),(0,-r,0),(0,r,0),(0,0,-r),(0,0,r),(-r,0,0)]
+    edges = [(0,1),(2,3),(4,5),(1,5),(5,2),(0,2),(4,2),(3,1),(1,4),(5,3),(3,0),(4,0)]
+    return _mesh_from_pydata(name, verts, edges)
+
+
+def _create_line_mesh(name: str) -> Object:
+    """Rigify create_line_widget : simple line spanning bone length."""
+    return _mesh_from_pydata(name, [(0,0,0),(0,1,0)], [(0,1)])
+
+
+def _create_pivot_mesh(name: str) -> Object:
+    """Rigify create_pivot_widget (square=True) : plain-axes with square caps, scaled to radius 1."""
+    # Rigify default radius=0.5 → axis=0.5, cap=0.05; scaled ×2 → axis=1.0, cap=0.1
+    a, c = 1.0, 0.1
+    verts = [
+        (0,0,-a),(-a,0,0),(0,0,a),(a,0,0),(a,c,-c),(a,c,c),(0,-a,0),(0,a,0),
+        (c,a,c),(c,a,-c),(a,-c,-c),(a,-c,c),(-c,a,c),(-c,a,-c),(-a,c,c),(-a,c,-c),
+        (-a,-c,c),(-a,-c,-c),(-c,-a,c),(-c,-a,-c),(c,-a,c),(c,-a,-c),
+        (-c,-c,-a),(-c,c,-a),(c,-c,-a),(c,c,-a),(-c,c,a),(-c,-c,a),(c,c,a),(c,-c,a),
+    ]
+    edges = [
+        (10,4),(4,5),(8,9),(0,2),(12,8),(6,7),(11,10),(13,12),(5,11),(9,13),(3,1),
+        (14,15),(16,14),(17,16),(15,17),(18,19),(20,18),(21,20),(19,21),
+        (22,23),(24,22),(25,24),(23,25),(26,27),(28,26),(29,28),(27,29),
+    ]
+    return _mesh_from_pydata(name, verts, edges)
+
+
+def _create_twist_mesh(name: str) -> Object:
+    """Twist control widget : a ring that encircles the limb (lying in the bone's
+    XZ plane, perpendicular to the +Y bone axis) with an inner curved arrow that
+    reads as the rotation/twist direction. Sized absolutely at assignment time so
+    it stays as visible as the FK/IK controllers."""
+    verts: list = []
+    edges: list = []
+
+    def _ring(radius: float, steps: int) -> None:
+        base = len(verts)
+        for i in range(steps):
+            a = 2 * math.pi * i / steps
+            verts.append((radius * math.sin(a), 0.0, radius * math.cos(a)))
+        for i in range(steps):
+            edges.append((base + i, base + (i + 1) % steps))
+
+    def _double_arrow() -> None:
+        # Rigify create_ik_arrow_widget : two parallel flat arrows offset in Z,
+        # forming one thick 3D arrow running along the bone axis (+Y).
+        s = 1.3   # a touch larger than the bare Rigify widget
+        base = len(verts)
+        av = [
+            (x * s, y * s, z * s) for (x, y, z) in (
+                ( 0.1, 0.0, -0.3), ( 0.1, 0.7, -0.3), (-0.1, 0.0, -0.3), (-0.1, 0.7, -0.3),
+                ( 0.2, 0.7, -0.3), ( 0.0, 1.0, -0.3), (-0.2, 0.7, -0.3),
+                ( 0.1, 0.0,  0.3), ( 0.1, 0.7,  0.3), (-0.1, 0.0,  0.3), (-0.1, 0.7,  0.3),
+                ( 0.2, 0.7,  0.3), ( 0.0, 1.0,  0.3), (-0.2, 0.7,  0.3),
+            )
+        ]
+        ae = [
+            (0, 1), (2, 3), (1, 4), (4, 5), (3, 6), (5, 6), (0, 2),           # front arrow
+            (7, 8), (9, 10), (8, 11), (11, 12), (10, 13), (12, 13), (7, 9),   # back arrow
+        ]
+        verts.extend(av)
+        edges.extend((base + a, base + b) for a, b in ae)
+
+    # Outer ring (the limb-encircling control) + the thick parallel arrow running
+    # along the bone direction.
+    _ring(1.0, 32)
+    _double_arrow()
+    return _mesh_from_pydata(name, verts, edges)
+
+
+def _chaikin_closed(pts: list, iterations: int = 2) -> list:
+    """Chaikin corner-cutting on a closed polygon : equivalent to Catmull-Clark on a
+    closed edge loop with no faces (which is what Rigify's subsurf= does to wire shapes).
+    Each iteration doubles the point count and smooths every corner.
+    """
+    for _ in range(iterations):
+        n = len(pts)
+        result = []
+        for i in range(n):
+            p0 = pts[i]
+            p1 = pts[(i + 1) % n]
+            result.append(tuple(0.75 * a + 0.25 * b for a, b in zip(p0, p1)))
+            result.append(tuple(0.25 * a + 0.75 * b for a, b in zip(p0, p1)))
+        pts = result
+    return pts
+
+
+def _create_hand_mesh(name: str) -> Object:
+    """Rigify create_hand_widget smoothed with 2 Chaikin iterations (= subsurf=2).
+
+    Control points are given in closed-loop order (front top → bottom → back bottom →
+    top → close), so Chaikin rounds the 4 corners into smooth arcs.
+    """
+    ctrl = [
+        (0.0,  1.5,   -0.7),   # top-front
+        (0.0,  0.723, -0.7),   # mid-upper-front
+        (0.0,  0.0,   -0.7),   # mid-lower-front
+        (0.0, -0.25,  -0.7),   # bottom-front
+        (0.0, -0.25,   0.7),   # bottom-back
+        (0.0,  0.0,    0.7),   # mid-lower-back
+        (0.0,  0.723,  0.7),   # mid-upper-back
+        (0.0,  1.5,    0.7),   # top-back
+    ]
+    pts = _chaikin_closed(ctrl, 2)
+    n = len(pts)
+    edges = [(i, (i + 1) % n) for i in range(n)]
+    return _mesh_from_pydata(name, pts, edges)
+
+
+def _create_foot_mesh(name: str) -> Object:
+    """Rigify create_foot_widget smoothed with 2 Chaikin iterations (= subsurf=2).
+
+    Same topology as the hand widget but lying flat in the XY plane (Z=0).
+    """
+    ctrl = [
+        (-0.7, -0.524, 0.0),   # bottom-left
+        (-0.7,  0.253, 0.0),   # mid-left
+        (-0.7,  0.976, 0.0),   # upper-mid-left
+        (-0.7,  1.226, 0.0),   # top-left
+        ( 0.7,  1.226, 0.0),   # top-right
+        ( 0.7,  0.976, 0.0),   # upper-mid-right
+        ( 0.7,  0.253, 0.0),   # mid-right
+        ( 0.7, -0.524, 0.0),   # bottom-right
+    ]
+    pts = _chaikin_closed(ctrl, 2)
+    n = len(pts)
+    edges = [(i, (i + 1) % n) for i in range(n)]
+    return _mesh_from_pydata(name, pts, edges)
+
+
+def _create_finger_master_mesh(name: str) -> Object:
+    """Rigify super_finger make_master_control_widget : a thin axis line along +Y
+    with a small flag at the tip. Spans Y 0..1.1 so it scales to the whole finger
+    when assigned with use_custom_shape_bone_size=True."""
+    verts = [
+        (0.0,   0.0, 0.0),   # 0 base
+        (0.0,   1.0, 0.0),   # 1 tip
+        (0.05,  1.0, 0.0),   # 2
+        (0.05,  1.1, 0.0),   # 3
+        (-0.05, 1.1, 0.0),   # 4
+        (-0.05, 1.0, 0.0),   # 5
+    ]
+    edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 1)]
+    return _mesh_from_pydata(name, verts, edges)
 
 
 def ensure_hm2_shapes(context) -> dict[str, Object]:
@@ -363,10 +589,16 @@ def ensure_hm2_shapes(context) -> dict[str, Object]:
         'box':      _create_box_mesh,
         'circle':   _create_circle_mesh,
         'sphere':   _create_sphere_mesh,
-        'arrow':    _create_arrow_mesh,
         'goggle':   _create_goggle_mesh,
         'shoulder': _create_shoulder_mesh,
         'master':   _create_master_mesh,
+        'limb_end': _create_limb_end_mesh,
+        'line':     _create_line_mesh,
+        'pivot':    _create_pivot_mesh,
+        'twist':    _create_twist_mesh,
+        'hand':     _create_hand_mesh,
+        'foot':     _create_foot_mesh,
+        'finger_master': _create_finger_master_mesh,
     }
 
     for key, shape_name in _SHAPE_NAMES.items():

@@ -552,7 +552,34 @@ class MESH_OT_CleanDuplicateMaterials(Operator):
 
         self.report({'INFO'}, f"Remapped {materials_remapped} duplicate material(s)")
         return {'FINISHED'}
-    
+
+
+def _find_mirror_bone_name(name: str):
+    """Return the opposite-side bone name for known side suffixes/prefixes, or None."""
+    pairs = [
+        ("_right", "_left"), ("_left", "_right"),
+        ("_Right", "_Left"), ("_Left", "_Right"),
+        ("_RIGHT", "_LEFT"), ("_LEFT", "_RIGHT"),
+        (".right", ".left"), (".left", ".right"),
+        (".Right", ".Left"), (".Left", ".Right"),
+        (".RIGHT", ".LEFT"), (".LEFT", ".RIGHT"),
+        ("_R", "_L"), ("_L", "_R"),
+        (".R", ".L"), (".L", ".R"),
+        ("_r", "_l"), ("_l", "_r"),
+        (".r", ".l"), (".l", ".r"),
+        ("right_", "left_"), ("left_", "right_"),
+        ("Right_", "Left_"), ("Left_", "Right_"),
+        ("RIGHT_", "LEFT_"), ("LEFT_", "RIGHT_"),
+        ("R_", "L_"), ("L_", "R_"),
+        ("r_", "l_"), ("l_", "r_"),
+    ]
+    for src, dst in pairs:
+        if name.endswith(src):
+            return name[: -len(src)] + dst
+        if name.startswith(src):
+            return dst + name[len(src) :]
+    return None
+
 
 class MESH_OT_convex_hull_selection(bpy.types.Operator):
     bl_idname = "kitsunetools.convex_hull_selection"
@@ -618,9 +645,54 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
         description="Remove all vertex groups from the physics mesh after hull conversion",
         default=True
     )
+    rig_to_bone: bpy.props.BoolProperty(
+        name="Rig to Single Bone",
+        description="Assign all vertices to a single bone; names the mesh {bone}_physicsmesh",
+        default=False
+    )
+    bone_name: bpy.props.StringProperty(
+        name="Bone Name",
+        description="Name of the bone to rig the physics mesh to",
+        default=""
+    )
+    add_mirror_mod: bpy.props.BoolProperty(
+        name="Add Mirror Modifier",
+        description="Add a Mirror (X-axis) modifier to supplement symmetry rigging",
+        default=True
+    )
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "keep_original")
+        layout.prop(self, "delete_unused_verts")
+        layout.prop(self, "use_existing_faces")
+        layout.prop(self, "make_holes")
+        layout.prop(self, "join_triangles")
+        layout.prop(self, "face_threshold")
+        layout.prop(self, "shape_threshold")
+        layout.prop(self, "decimation_factor")
+        layout.prop(self, "clean_modifiers")
+        layout.prop(self, "clean_vertex_groups")
+        layout.prop(self, "rig_to_bone")
+        if self.rig_to_bone:
+            armature_obj = None
+            if context.active_object:
+                for mod in context.active_object.modifiers:
+                    if mod.type == 'ARMATURE' and mod.object:
+                        armature_obj = mod.object
+                        break
+            if armature_obj:
+                layout.prop_search(self, "bone_name", armature_obj.data, "bones")
+            else:
+                layout.prop(self, "bone_name")
+            layout.prop(self, "add_mirror_mod")
+            if self.bone_name:
+                mirror = _find_mirror_bone_name(self.bone_name)
+                if mirror:
+                    layout.label(text=f"Mirror VG: {mirror}", icon='BONE_DATA')
 
     @classmethod
     def poll(cls, context):
@@ -656,7 +728,10 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
                 bpy.ops.object.join()
 
             new_obj = context.active_object
-            new_obj.name = f"{active_obj.name}_physicsmesh"
+            if self.rig_to_bone and self.bone_name:
+                new_obj.name = f"{self.bone_name}_physicsmesh"
+            else:
+                new_obj.name = f"{active_obj.name}_physicsmesh"
             new_obj.data.materials.clear()
 
             if self.clean_modifiers:
@@ -676,12 +751,47 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
             )
             bpy.ops.object.mode_set(mode='OBJECT')
 
+            if new_obj.data.shape_keys:
+                new_obj.shape_key_clear()
+
             if self.decimation_factor < 1.0:
                 mod = new_obj.modifiers.new(name="Decimate", type='DECIMATE')
                 mod.ratio = self.decimation_factor
                 bpy.ops.object.modifier_apply(modifier=mod.name)
 
             bpy.ops.object.shade_smooth()
+
+            if self.rig_to_bone and self.bone_name:
+                armature_obj = None
+                for mod in active_obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.object:
+                        armature_obj = mod.object
+                        break
+
+                vg = new_obj.vertex_groups.new(name=self.bone_name)
+                all_indices = [v.index for v in new_obj.data.vertices]
+                vg.add(all_indices, 1.0, 'REPLACE')
+                vg.lock_weight = True
+
+                mirror_bone = _find_mirror_bone_name(self.bone_name)
+                if mirror_bone:
+                    vg_mirror = new_obj.vertex_groups.new(name=mirror_bone)
+                    vg_mirror.lock_weight = True
+
+                if armature_obj:
+                    if self.add_mirror_mod:
+                        mir_mod = new_obj.modifiers.new(name="Mirror", type='MIRROR')
+                        mir_mod.mirror_object = armature_obj
+                    arm_mod = new_obj.modifiers.new(name="Armature", type='ARMATURE')
+                    arm_mod.object = armature_obj
+                    new_obj.parent = armature_obj
+                    new_obj.parent_type = 'OBJECT'
+                else:
+                    if self.add_mirror_mod:
+                        new_obj.modifiers.new(name="Mirror", type='MIRROR')
+                    self.report({'WARNING'}, "No armature found on source object; vertex group added but modifier/parent skipped")
+            elif self.rig_to_bone:
+                self.report({'WARNING'}, "Bone name is empty; rig setup skipped")
 
         self.report({'INFO'}, f"Convex hull created: {new_obj.name}")
         return {'FINISHED'}

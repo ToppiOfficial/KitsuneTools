@@ -14,8 +14,6 @@ from ..op.ops_humanoidmapper2 import (
 )
 
 
-# -- UIList ---------------------------------------------------------------------
-
 class HM2_UL_FingerList(UIList):
     def draw_item(self, context: Context, layout: UILayout, data: Any, item: Any,
                   icon: int, active_data: Any, active_property: str,
@@ -33,23 +31,32 @@ class HM2_UL_FingerList(UIList):
         remove_op.index = index
 
 
-# -- Base panel shared settings -------------------------------------------------
+class TOOLS_PT_KitsuneTool_HumanoidMapping(Panel):
+    bl_idname = 'TOOLS_PT_KitsuneTool_HumanoidMapping'
+    bl_label = 'Humanoid Mapping'
+    bl_category = 'KitsuneTools'
+    bl_region_type = 'UI'
+    bl_space_type = 'VIEW_3D'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        return is_armature(context.active_object)
+
+    def draw(self, context: Context) -> None:
+        pass
+
 
 class _HM2PanelBase(Panel):
     bl_category = 'KitsuneTools'
     bl_region_type = 'UI'
     bl_space_type = 'VIEW_3D'
 
-    @classmethod
-    def poll(cls, context: Context) -> bool:
-        return is_armature(context.active_object)
-
-
-# -- Bone pair draw helper ------------------------------------------------------
 
 def _draw_bone_pair(layout: UILayout, data, prop_l: str, prop_r: str, label: str, arm) -> None:
-    row = layout.row(align=True)
-    row.label(text=label)
+    split = layout.split(factor=0.15)
+    split.label(text=label)
+    row = split.row(align=True)
     row.prop_search(data, prop_l, arm.data, "bones", text="L")
     row.prop_search(data, prop_r, arm.data, "bones", text="R")
 
@@ -58,18 +65,14 @@ def _draw_bone_single(layout: UILayout, data, prop: str, label: str, arm) -> Non
     layout.prop_search(data, prop, arm.data, "bones", text=label)
 
 
-# -- Root panel ----------------------------------------------------------------
-
 class TOOLS_PT_KitsuneTool_HM2(_HM2PanelBase):
     bl_idname = 'TOOLS_PT_KitsuneTool_HM2'
     bl_label = 'Humanoid Mapper 2'
-    bl_options = {'DEFAULT_CLOSED'}
+    bl_parent_id = 'TOOLS_PT_KitsuneTool_HumanoidMapping'
 
     def draw(self, context: Context) -> None:
         pass
 
-
-# -- Core sub-panel ------------------------------------------------------------
 
 class TOOLS_PT_KitsuneTool_HM2_Core(_HM2PanelBase):
     bl_idname = 'TOOLS_PT_KitsuneTool_HM2_Core'
@@ -97,8 +100,6 @@ class TOOLS_PT_KitsuneTool_HM2_Core(_HM2PanelBase):
         col.operator(HM2_OT_MirrorBodyMapping.bl_idname, icon='MOD_MIRROR', text="Mirror Eyes").scope = 'EYES'
 
 
-# -- Arms sub-panel ------------------------------------------------------------
-
 class TOOLS_PT_KitsuneTool_HM2_Arms(_HM2PanelBase):
     bl_idname = 'TOOLS_PT_KitsuneTool_HM2_Arms'
     bl_label = 'Arms'
@@ -117,8 +118,6 @@ class TOOLS_PT_KitsuneTool_HM2_Arms(_HM2PanelBase):
         col.operator(HM2_OT_MirrorBodyMapping.bl_idname, icon='MOD_MIRROR', text="Mirror Arms").scope = 'ARMS'
 
 
-# -- Legs sub-panel ------------------------------------------------------------
-
 class TOOLS_PT_KitsuneTool_HM2_Legs(_HM2PanelBase):
     bl_idname = 'TOOLS_PT_KitsuneTool_HM2_Legs'
     bl_label = 'Legs'
@@ -136,8 +135,6 @@ class TOOLS_PT_KitsuneTool_HM2_Legs(_HM2PanelBase):
         col.separator()
         col.operator(HM2_OT_MirrorBodyMapping.bl_idname, icon='MOD_MIRROR', text="Mirror Legs").scope = 'LEGS'
 
-
-# -- Fingers sub-panel ---------------------------------------------------------
 
 class TOOLS_PT_KitsuneTool_HM2_Fingers(_HM2PanelBase):
     bl_idname = 'TOOLS_PT_KitsuneTool_HM2_Fingers'
@@ -172,8 +169,6 @@ class TOOLS_PT_KitsuneTool_HM2_Fingers(_HM2PanelBase):
             box.prop(item, "joint_count")
             box.prop(item, "generate_ik")
 
-
-# -- Twist sub-panel -----------------------------------------------------------
 
 class TOOLS_PT_KitsuneTool_HM2_Twist(_HM2PanelBase):
     bl_idname = 'TOOLS_PT_KitsuneTool_HM2_Twist'
@@ -227,8 +222,6 @@ class TOOLS_PT_KitsuneTool_HM2_Twist(_HM2PanelBase):
         )
 
 
-# -- IK sub-panel --------------------------------------------------------------
-
 class TOOLS_PT_KitsuneTool_HM2_IK(_HM2PanelBase):
     bl_idname = 'TOOLS_PT_KitsuneTool_HM2_IK'
     bl_label = 'IK Options'
@@ -243,18 +236,30 @@ class TOOLS_PT_KitsuneTool_HM2_IK(_HM2PanelBase):
         col.prop(hm2, 'hm2_generate_shapes')
 
         col.separator()
+        col.label(text="Bone Roll:")
+        col.prop(hm2, 'hm2_legacy_roll')
+
+        col.separator()
         col.label(text="Pole Angles:")
         col.prop(hm2, 'hm2_ik_pole_angle_arm', text="Arms")
         col.prop(hm2, 'hm2_ik_pole_angle_leg', text="Legs")
 
-        col.separator()
+
+class TOOLS_PT_KitsuneTool_HM2_Export(_HM2PanelBase):
+    bl_idname = 'TOOLS_PT_KitsuneTool_HM2_Export'
+    bl_label = 'Export'
+    bl_parent_id = 'TOOLS_PT_KitsuneTool_HM2'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context: Context) -> None:
+        layout = self.layout
+        hm2 = context.active_object.kitsunetools.hm2
+        col = layout.column(align=True)
         col.label(text="Optional JSON (export names):")
         row = col.row(align=True)
         row.prop(hm2, 'hm2_json_filepath', text="")
         row.operator(HM2_OT_JsonFormatHelp.bl_idname, text="", icon='QUESTION')
 
-
-# -- Actions sub-panel ---------------------------------------------------------
 
 class TOOLS_PT_KitsuneTool_HM2_Actions(_HM2PanelBase):
     bl_idname = 'TOOLS_PT_KitsuneTool_HM2_Actions'
