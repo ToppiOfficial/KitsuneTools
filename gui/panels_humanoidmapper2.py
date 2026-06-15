@@ -11,7 +11,33 @@ from ..op.ops_humanoidmapper2 import (
     HM2_OT_ValidateMapping,
     HM2_OT_Process,
     HM2_OT_JsonFormatHelp,
+    HM2_OT_FirstPersonArms,
+    HM2_OT_AddPuppet,
+    HM2_OT_RemovePuppet,
+    HM2_OT_ProcessPuppet,
+    HM2_OT_DisconnectPuppet,
+    HM2_OT_SyncPuppetExportConfig,
 )
+
+
+class HM2_UL_PuppetList(UIList):
+    def draw_item(self, context: Context, layout: UILayout, data: Any, item: Any,
+                  icon: int, active_data: Any, active_property: str,
+                  index: int, flt_flag: int) -> None:
+        arm_obj = item.armature
+        if arm_obj:
+            is_proc = arm_obj.kitsunetools.hm2.hm2_is_puppet
+            row = layout.row(align=True)
+            row.label(text=arm_obj.name, icon='ARMATURE_DATA')
+            sub = row.row(align=True)
+            sub.scale_x = 0.75
+            sub.prop(item, "mode", text="")
+            row.label(
+                text="Puppet" if is_proc else "Pending",
+                icon='CHECKMARK' if is_proc else 'QUESTION',
+            )
+        else:
+            layout.label(text="(None)", icon='ERROR')
 
 
 class HM2_UL_FingerList(UIList):
@@ -253,12 +279,46 @@ class TOOLS_PT_KitsuneTool_HM2_Export(_HM2PanelBase):
 
     def draw(self, context: Context) -> None:
         layout = self.layout
-        hm2 = context.active_object.kitsunetools.hm2
+        arm = context.active_object
+        hm2 = arm.kitsunetools.hm2
         col = layout.column(align=True)
         col.label(text="Optional JSON (export names):")
         row = col.row(align=True)
         row.prop(hm2, 'hm2_json_filepath', text="")
         row.operator(HM2_OT_JsonFormatHelp.bl_idname, text="", icon='QUESTION')
+
+
+
+class TOOLS_PT_KitsuneTool_HM2_FirstPersonArms(_HM2PanelBase):
+    bl_idname = 'TOOLS_PT_KitsuneTool_HM2_FirstPersonArms'
+    bl_label = 'First Person Arms'
+    bl_parent_id = 'TOOLS_PT_KitsuneTool_HumanoidMapping'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context: Context) -> None:
+        layout = self.layout
+        arm = context.active_object
+        hm2 = arm.kitsunetools.hm2
+
+        col = layout.column(align=True)
+        _draw_bone_pair(col, hm2, 'fpa_starting_bone_l', 'fpa_starting_bone_r', 'Start', arm)
+
+        col.separator()
+        col.prop(hm2, 'fpa_rig_type')
+        col.prop(hm2, 'fpa_preserve_ik')
+        col.prop(hm2, 'fpa_weight_threshold')
+
+        col.separator()
+        col.prop(hm2, 'fpa_use_bisect')
+        if hm2.fpa_use_bisect:
+            row = col.row(align=True)
+            row.prop(hm2, 'fpa_bisect_axis', text="")
+            row.prop(hm2, 'fpa_bisect_offset', text="Offset")
+
+        col.separator()
+        run = col.row()
+        run.scale_y = 1.5
+        run.operator(HM2_OT_FirstPersonArms.bl_idname, icon='MOD_ARRAY', text="Create First Person Arms")
 
 
 class TOOLS_PT_KitsuneTool_HM2_Actions(_HM2PanelBase):
@@ -284,3 +344,66 @@ class TOOLS_PT_KitsuneTool_HM2_Actions(_HM2PanelBase):
         copy_row = col.row()
         copy_row.enabled = has_multi
         copy_row.operator(HM2_OT_CopyMappingToSelected.bl_idname, icon='COPYDOWN')
+
+
+class TOOLS_PT_KitsuneTool_HM2_Puppets(_HM2PanelBase):
+    bl_idname = 'TOOLS_PT_KitsuneTool_HM2_Puppets'
+    bl_label = 'Puppet Armatures'
+    bl_parent_id = 'TOOLS_PT_KitsuneTool_HM2'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        return is_armature(context.active_object)
+
+    def draw(self, context: Context) -> None:
+        layout = self.layout
+        obj = context.active_object
+        hm2 = obj.kitsunetools.hm2
+
+        if hm2.hm2_is_puppet:
+            col = layout.column(align=True)
+            master = hm2.hm2_puppet_master
+            if master:
+                col.label(text=f"Puppet of: {master.name}", icon='ARMATURE_DATA')
+            else:
+                col.label(text="Puppet (master reference lost)", icon='ERROR')
+            col.separator()
+            col.operator(HM2_OT_DisconnectPuppet.bl_idname, icon='UNLINKED')
+            return
+
+        row = layout.row()
+        row.template_list(
+            "HM2_UL_PuppetList", "",
+            hm2, "hm2_puppets",
+            hm2, "hm2_puppets_index",
+            rows=3,
+        )
+        col = row.column(align=True)
+        col.operator(HM2_OT_AddPuppet.bl_idname, icon='ADD', text="")
+        col.operator(HM2_OT_RemovePuppet.bl_idname, icon='REMOVE', text="")
+
+        idx = hm2.hm2_puppets_index
+        if 0 <= idx < len(hm2.hm2_puppets):
+            puppet_arm = hm2.hm2_puppets[idx].armature
+            if puppet_arm:
+                is_processed = puppet_arm.kitsunetools.hm2.hm2_is_puppet
+                action_row = layout.row()
+                action_row.scale_y = 1.5
+                if is_processed:
+                    action_row.operator(
+                        HM2_OT_ProcessPuppet.bl_idname,
+                        text="Re-apply Mode", icon='FILE_REFRESH')
+                else:
+                    action_row.operator(
+                        HM2_OT_ProcessPuppet.bl_idname, icon='PLAY')
+            else:
+                layout.label(text="(No armature set in entry)", icon='ERROR')
+
+        has_active_puppets = any(
+            e.armature and e.armature.kitsunetools.hm2.hm2_is_puppet
+            for e in hm2.hm2_puppets
+        )
+        if HM2_OT_Process._is_hm2_applied(obj) and has_active_puppets:
+            layout.separator()
+            layout.operator(HM2_OT_SyncPuppetExportConfig.bl_idname, icon='LINKED')

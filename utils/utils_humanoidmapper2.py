@@ -602,16 +602,19 @@ def ensure_hm2_shapes(context) -> dict[str, Object]:
     }
 
     for key, shape_name in _SHAPE_NAMES.items():
-        # Always recreate so geometry changes (e.g. arrow direction fix) take effect.
-        old = bpy.data.objects.get(shape_name)
-        if old is not None:
-            old_mesh = old.data
-            bpy.data.objects.remove(old, do_unlink=True)
-            if old_mesh and old_mesh.users == 0:
-                bpy.data.meshes.remove(old_mesh)
-        obj = creators[key](shape_name)
-        shapes_coll.objects.link(obj)
-        obj.hide_render = True
+        obj = bpy.data.objects.get(shape_name)
+        if obj is None or obj.data is None:
+            # If object or its mesh data is missing, create it
+            obj = creators[key](shape_name)
+            shapes_coll.objects.link(obj)
+        else:
+            # If object exists and has data, ensure it's in the correct collection.
+            # Check by name, as bpy_prop_collection.__contains__ expects a string.
+            if obj.name not in shapes_coll.objects:
+                for coll in list(obj.users_collection):
+                    coll.objects.unlink(obj)
+                shapes_coll.objects.link(obj)
+        obj.hide_render = True # Ensure it's hidden
         shapes[key] = obj
 
     return shapes
@@ -675,3 +678,189 @@ def hm2_validate_mapping(arm: Object, hm2) -> list[str]:
             errors.append(f"Finger #{i+1}: bone '{finger.source_bone}' not found")
 
     return errors
+
+
+# -- First Person Arms ---------------------------------------------------------
+
+# Prefixes used by HM2_OT_Process for the bones it generates (controllers,
+# IK targets, mechanism, visualization and FK controls).
+HM2_CONTROLLER_PREFIXES = ('CTRL_', 'IK_', 'MCH_', 'VIS_', 'FK_')
+
+
+def get_hm2_shape(key: str) -> Object | None:
+    """Return an already-created HM2 custom-shape widget object by key (e.g. 'box'),
+    or None if it does not exist. Unlike ensure_hm2_shapes this never regenerates
+    the widgets, so it won't disturb shapes already referenced by other rigs."""
+    name = _SHAPE_NAMES.get(key)
+    return bpy.data.objects.get(name) if name else None
+
+
+def detect_hm2_rig(arm: Object) -> bool:
+    """Heuristic: an armature is treated as an HM2 rig if it contains any of the
+    controller bones that HM2_OT_Process generates."""
+    return any(b.name.startswith(HM2_CONTROLLER_PREFIXES) for b in arm.data.bones)
+
+
+def compute_fpa_kept_bones(arm: Object, start_l: str, start_r: str,
+                           preserve_ik: bool, is_hm2: bool) -> set[str]:
+    """Return the set of bone names to keep for a first-person-arms copy.
+
+    Always keeps each starting bone plus all of its descendants (this naturally
+    includes twist bones and, on an HM2 rig, the finger FK/MCH controls that are
+    parented under the hand/joint deform bones).
+
+    On an HM2 rig:
+      * preserve_ik=True  -> additionally keep arm IK / pole / visualization
+        controllers (which live under the root, not under the arm) by following
+        constraint references to/from the kept bones, plus their ancestor chain.
+      * preserve_ik=False -> drop every controller-prefixed bone, leaving plain
+        FK deform bones (twist bones are kept since they carry no controller prefix).
+    """
+    bones = arm.data.bones
+
+    desc: set[str] = set()
+    for start_name in (start_l, start_r):
+        b = bones.get(start_name) if start_name else None
+        if not b:
+            continue
+        desc.add(b.name)
+        for child in b.children_recursive:
+            desc.add(child.name)
+
+    if not is_hm2:
+        return desc
+
+    if not preserve_ik:
+        return {name for name in desc if not name.startswith(HM2_CONTROLLER_PREFIXES)}
+
+    kept = set(desc)
+
+    def add_with_ancestors(bone_name: str) -> bool:
+        cur = bones.get(bone_name)
+        added = False
+        while cur is not None and cur.name not in kept:
+            kept.add(cur.name)
+            added = True
+            cur = cur.parent
+        return added
+
+    # Follow constraint references in both directions until stable:
+    #   - a kept bone (e.g. arm deform) targeting a controller (IK_Hand / pole)
+    #   - a controller targeting an already-kept bone (e.g. VIS pole line)
+    pbones = arm.pose.bones
+    changed = True
+    while changed:
+        changed = False
+        for pb in pbones:
+            is_ctrl = pb.name.startswith(HM2_CONTROLLER_PREFIXES)
+            pb_kept = pb.name in kept
+            if not (pb_kept or is_ctrl):
+                continue
+            for con in pb.constraints:
+                tgt = getattr(con, 'target', None)
+                if tgt is not None and tgt != arm:
+                    continue
+                for attr in ('subtarget', 'pole_subtarget'):
+                    ref = getattr(con, attr, '')
+                    if not ref:
+                        continue
+                    if pb_kept and ref.startswith(HM2_CONTROLLER_PREFIXES) and ref not in kept:
+                        if add_with_ancestors(ref):
+                            changed = True
+                    if is_ctrl and not pb_kept and ref in kept:
+                        if add_with_ancestors(pb.name):
+                            changed = True
+                            pb_kept = True
+
+    return kept
+
+
+def cull_mesh_to_bones(mesh: Object, kept_deform_names: set[str], threshold: float = 0.5,
+                       use_bisect: bool = False, plane_cos_world=None, plane_nos_world=None) -> int:
+    """Cull a mesh to geometry weighted to ``kept_deform_names``.
+
+    A vertex is kept only when the kept vertex groups hold at least ``threshold``
+    of its total weight (a dominance test, so a vertex barely grazed by a kept
+    bone but mostly weighted elsewhere is dropped). Deleting a vertex removes its
+    incident faces. Optionally bisects the result with one plane per entry in
+    ``plane_cos_world``/``plane_nos_world`` (parallel lists), clearing the geometry
+    on the +normal side of each plane for a clean straight cut. Returns the
+    remaining polygon count.
+    """
+    kept_idx = {vg.index for vg in mesh.vertex_groups if vg.name in kept_deform_names}
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh.data)
+    bm.verts.ensure_lookup_table()
+
+    me_verts = mesh.data.vertices
+    del_verts = []
+    for v in bm.verts:
+        keep = False
+        if kept_idx:
+            total_w = 0.0
+            kept_w = 0.0
+            for g in me_verts[v.index].groups:
+                w = g.weight
+                if w <= 0.0:
+                    continue
+                total_w += w
+                if g.group in kept_idx:
+                    kept_w += w
+            keep = total_w > 1e-6 and (kept_w / total_w) >= threshold
+        if not keep:
+            del_verts.append(v)
+
+    if del_verts:
+        bmesh.ops.delete(bm, geom=del_verts, context='VERTS')
+
+    if use_bisect and plane_cos_world and plane_nos_world and len(bm.verts) > 0:
+        inv = mesh.matrix_world.inverted()
+        n3 = inv.to_3x3()
+
+        # When the planes have different normals (opposite-sides case, e.g. L/R arms on ±X),
+        # restrict each bisect to geometry on the same side as its plane so the two cuts don't
+        # cancel each other out.  The centroid of all plane positions is the dividing line.
+        normals_vary = (len(plane_nos_world) > 1 and any(
+            abs(plane_nos_world[i].dot(plane_nos_world[0]) - 1.0) > 1e-4
+            for i in range(1, len(plane_nos_world))
+        ))
+        if normals_vary:
+            centroid_local = sum((inv @ c for c in plane_cos_world), Vector()) / len(plane_cos_world)
+
+        for plane_co_w, plane_no_w in zip(plane_cos_world, plane_nos_world):
+            if not bm.verts:
+                break
+            plane_co = inv @ plane_co_w
+            plane_no = (n3 @ plane_no_w).normalized()
+
+            if normals_vary:
+                # Include only geometry on the keep side (same side as this bone relative to centroid).
+                # Geometry on the other arm is excluded from geom and therefore untouched.
+                keep_v = frozenset(
+                    v for v in bm.verts
+                    if (v.co - centroid_local).dot(plane_no) <= 0
+                )
+                keep_e = frozenset(
+                    e for e in bm.edges
+                    if e.verts[0] in keep_v or e.verts[1] in keep_v
+                )
+                keep_f = frozenset(
+                    f for f in bm.faces
+                    if any(v in keep_v for v in f.verts)
+                )
+                geom = list(keep_v) + list(keep_e) + list(keep_f)
+            else:
+                geom = list(bm.verts) + list(bm.edges) + list(bm.faces)
+
+            if geom:
+                bmesh.ops.bisect_plane(
+                    bm, geom=geom, dist=1e-6,
+                    plane_co=plane_co, plane_no=plane_no,
+                    clear_inner=False, clear_outer=True,
+                )
+
+    bm.to_mesh(mesh.data)
+    bm.free()
+    mesh.data.update()
+    return len(mesh.data.polygons)

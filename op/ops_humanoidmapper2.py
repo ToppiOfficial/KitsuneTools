@@ -1,10 +1,11 @@
-import bpy, traceback, math, re
+import bpy, traceback, math, re, json
 from mathutils import Vector, Matrix
 from bpy.types import Context, Object, Operator
-from bpy.props import IntProperty, StringProperty, BoolProperty, EnumProperty
+from bpy.props import IntProperty, StringProperty, BoolProperty, EnumProperty, FloatProperty
 
-from ..utils.utils_object import is_armature
+from ..utils.utils_object import is_armature, get_armature_meshes
 from ..utils.utils_bone import bonename_direction_map
+from ..utils.utils_contextmanagers import unhide_all_objects
 from ..utils.utils_humanoidmapper2 import (
     hm2_validate_mapping,
     collect_chain,
@@ -13,6 +14,11 @@ from ..utils.utils_humanoidmapper2 import (
     add_twist_driver,
     ensure_hm2_shapes,
     ensure_bone_collection,
+    detect_hm2_rig,
+    compute_fpa_kept_bones,
+    cull_mesh_to_bones,
+    get_hm2_shape,
+    HM2_CONTROLLER_PREFIXES,
 )
 
 def _try_mirror_bone_name(bone_name: str) -> str | None:
@@ -314,7 +320,9 @@ class HM2_OT_Process(Operator):
 
     @classmethod
     def poll(cls, context: Context) -> bool:
-        return context.mode == 'OBJECT' and is_armature(context.active_object)
+        if not (context.mode == 'OBJECT' and is_armature(context.active_object)):
+            return False
+        return not context.active_object.kitsunetools.hm2.hm2_is_puppet
 
     def invoke(self, context: Context, event) -> set:
         arm = context.active_object
@@ -339,15 +347,29 @@ class HM2_OT_Process(Operator):
         bpy.ops.ed.undo_push(message="Before HM2 Process")
         try:
             was_applied = self._is_hm2_applied(arm)
-            # Preserve per-bone export config (export name / rotation / location)
-            # so a rebuild doesn't wipe it - especially for twist bones, which are
-            # deleted and recreated during cleanup.
+            # Snapshot VS config and twist-child parenting before cleanup wipes them.
             vs_snapshot = self._snapshot_vs_config(arm) if was_applied else {}
+            twist_children_snapshot = self._snapshot_twist_children(arm) if was_applied else {}
             if was_applied:
                 self._cleanup_for_reapply(arm)
             self._run(context, arm, hm2)
-            if vs_snapshot and not self.reapply_config:
+            # Always restore the VS snapshot so manually-edited fields on bones not
+            # covered by the JSON are preserved. When reapply_config=True,
+            # _apply_export_config already ran inside _run and its values take
+            # precedence because _restore_vs_config only writes fields present in
+            # the snapshot — any bone the JSON touched was freshly written first,
+            # then the snapshot overwrites with the pre-rebuild value. To let the
+            # JSON win we restore BEFORE the config reapply, but since _run calls
+            # _apply_export_config at the end, we instead restore here and let
+            # the JSON re-run overwrite its own bones.
+            # Correct order: restore snapshot (catches all bones), then re-apply
+            # JSON (overwrites only its bones). Both only run when there is data.
+            if vs_snapshot:
                 self._restore_vs_config(arm, vs_snapshot)
+            if hm2.hm2_json_filepath.strip() and self.reapply_config:
+                self._apply_export_config(arm, hm2)
+            if twist_children_snapshot:
+                self._restore_twist_children(arm, twist_children_snapshot)
         except Exception as e:
             traceback.print_exc()
             self.report({'ERROR'}, f"HM2 failed and was reverted: {e}")
@@ -358,6 +380,24 @@ class HM2_OT_Process(Operator):
             # reverts and can corrupt the depsgraph.
             self._schedule_revert()
             return {'CANCELLED'}
+
+        # Auto-process every puppet in the master's list.
+        puppet_warnings: list[str] = []
+        for entry in hm2.hm2_puppets:
+            puppet_obj = entry.armature
+            if not puppet_obj or not is_armature(puppet_obj):
+                continue
+            self._twist_bone_names = {}
+            self._rename_map = {}
+            try:
+                for w in self._run_puppet(context, arm, puppet_obj, entry.mode):
+                    puppet_warnings.append(f"[{puppet_obj.name}] {w}")
+            except Exception as e:
+                traceback.print_exc()
+                puppet_warnings.append(f"[{puppet_obj.name}] Failed: {e}")
+        bpy.context.view_layer.objects.active = arm
+        for w in puppet_warnings:
+            self.report({'WARNING'}, w)
 
         self.report({'INFO'}, "HM2 processing complete")
         return {'FINISHED'}
@@ -417,11 +457,163 @@ class HM2_OT_Process(Operator):
                 except Exception:
                     pass
 
+    @classmethod
+    def _snapshot_twist_children(cls, arm: Object) -> dict:
+        """Record which user bones are parented to a twist bone, and which
+        positional slot (index) within that joint's twist list they reference.
+
+        Stored as {child_bone_name: (joint_name, twist_index)} so that after
+        twist bones are deleted and recreated the child can be re-parented to
+        the new bone at the same slot.
+
+        A twist bone is identified by the cleanup regex used in
+        _cleanup_for_reapply: name matches r'\\.\\d{3}$' and parent is in
+        _TWIST_PARENTS. We build the joint→[twist_names_in_order] map from
+        the armature's current state to resolve indices."""
+        twist_children: dict[str, tuple[str, int]] = {}
+
+        # Build joint → ordered twist bone list from current bones.
+        # Twist bones sort by their suffix number to get stable ordering.
+        joint_twists: dict[str, list[str]] = {}
+        for bone in arm.data.bones:
+            if (re.search(r'\.\d{3}$', bone.name)
+                    and bone.parent
+                    and bone.parent.name in cls._TWIST_PARENTS):
+                joint = bone.parent.name
+                joint_twists.setdefault(joint, []).append(bone.name)
+        for names in joint_twists.values():
+            names.sort()  # .001 < .002 < .003 — stable positional index
+
+        # Build reverse map: twist_bone_name → (joint, index)
+        twist_to_slot: dict[str, tuple[str, int]] = {}
+        for joint, names in joint_twists.items():
+            for idx, name in enumerate(names):
+                twist_to_slot[name] = (joint, idx)
+
+        # Find bones whose parent is a twist bone (not themselves twist bones).
+        twist_set = set(twist_to_slot)
+        for bone in arm.data.bones:
+            if bone.name in twist_set:
+                continue  # skip the twist bones themselves
+            if bone.parent and bone.parent.name in twist_set:
+                joint, idx = twist_to_slot[bone.parent.name]
+                twist_children[bone.name] = (joint, idx)
+
+        return twist_children
+
+    def _restore_twist_children(self, arm: Object, snapshot: dict) -> None:
+        """Re-parent bones that were previously children of twist bones, using
+        the joint name and positional index to find the new twist bone name."""
+        if not snapshot:
+            return
+
+        # Build joint → new twist bone names from self._twist_bone_names
+        # (populated by _create_all_twist_bones in _run).
+        joint_twists = getattr(self, '_twist_bone_names', {})
+        if not joint_twists:
+            return
+
+        # child_name → new parent name
+        reparent: dict[str, str] = {}
+        for child_name, (joint, idx) in snapshot.items():
+            names = joint_twists.get(joint, [])
+            if idx < len(names):
+                reparent[child_name] = names[idx]
+            elif names:
+                # Twist count decreased — use the last available bone.
+                reparent[child_name] = names[-1]
+
+        if not reparent:
+            return
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        eb = arm.data.edit_bones
+        for child_name, new_parent_name in reparent.items():
+            child_eb = eb.get(child_name)
+            new_parent_eb = eb.get(new_parent_name)
+            if child_eb and new_parent_eb:
+                child_eb.parent = new_parent_eb
+        bpy.ops.object.mode_set(mode='OBJECT')
+
     _ADDED_PREFIXES = ('CTRL_', 'IK_', 'MCH_', 'VIS_', 'FK_')
     _TWIST_PARENTS = frozenset({
         'L_Shoulder', 'R_Shoulder', 'L_Elbow', 'R_Elbow',
         'L_Hip', 'R_Hip', 'L_Knee', 'R_Knee',
     })
+
+    # Fixed HM2-managed deform bones (excludes spine - computed dynamically).
+    _HM2_CORE_BONES = frozenset({
+        'M_Root', 'M_Chest', 'M_Neck', 'M_Head',
+        'L_Scapula', 'R_Scapula',
+        'L_Shoulder', 'R_Shoulder', 'L_Elbow', 'R_Elbow', 'L_Hand', 'R_Hand',
+        'L_Hip', 'R_Hip', 'L_Knee', 'R_Knee', 'L_Ankle', 'R_Ankle',
+        'L_Toe', 'R_Toe',
+        'L_Eye', 'R_Eye',
+    })
+
+    @classmethod
+    def _hm2_managed_bone_names(cls, arm_obj: 'Object', hm2) -> frozenset:
+        """Return the set of HM2-managed deform bone names: core, spine, twist, fingers.
+        Used to limit .vs sync to bones HM2 controls, skipping hair/cloth/misc bones."""
+        names: set[str] = set(cls._HM2_CORE_BONES)
+
+        # Spine bones
+        count = getattr(hm2, 'hm2_spine_count', 1)
+        if count == 1:
+            names.add('M_Spine')
+        else:
+            for i in range(count):
+                names.add(f'M_Spine{i + 1}')
+
+        # Twist bones (identified by parent being in _TWIST_PARENTS + .NNN suffix)
+        for bone in arm_obj.data.bones:
+            if (re.search(r'\.\d{3}$', bone.name)
+                    and bone.parent
+                    and bone.parent.name in cls._TWIST_PARENTS):
+                names.add(bone.name)
+
+        # Finger bones
+        _ftm = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
+                'RING': 'Ring', 'PINKY': 'Pinky'}
+        for finger in hm2.hm2_fingers:
+            base      = _ftm.get(finger.finger_type, finger.finger_type)
+            side      = finger.side
+            start_idx = 0 if finger.finger_type == 'THUMB' else 1
+            for i in range(finger.joint_count):
+                names.add(f'{side}_{base}Finger{start_idx + i}')
+
+        return frozenset(names)
+
+    @classmethod
+    def _make_proc(cls) -> object:
+        """Return a plain-Python proxy with all HM2 instance methods bound to it.
+
+        Blender's bpy_struct.__new__ rejects direct instantiation of registered
+        operator classes (TypeError: expected a single argument), so other operators
+        that need to call HM2 processing methods use this factory instead of
+        HM2_OT_Process().
+        """
+        import types as _types, inspect as _inspect
+        proc = _types.SimpleNamespace(
+            _twist_bone_names={},
+            _rename_map={},
+            _computed_pole_angles={},
+        )
+        for name, val in cls.__dict__.items():
+            if name.startswith('__'):
+                continue
+            if isinstance(val, staticmethod):
+                setattr(proc, name, val.__func__)
+            elif isinstance(val, classmethod):
+                setattr(proc, name, val.__func__.__get__(cls))
+            elif _inspect.isfunction(val):
+                setattr(proc, name, val.__get__(proc))
+            else:
+                try:
+                    setattr(proc, name, val)
+                except Exception:
+                    pass
+        return proc
 
     def _cleanup_for_reapply(self, arm: Object) -> None:
         bpy.ops.object.mode_set(mode='POSE')
@@ -501,8 +693,13 @@ class HM2_OT_Process(Operator):
         bpy.ops.object.mode_set(mode='OBJECT')
         self._organize_collections(arm, hm2)
 
-        if hm2.hm2_json_filepath.strip() and self.reapply_config:
-            self._apply_export_config(arm, hm2)
+
+        # NOTE: export config is no longer applied here: execute() handles it
+        # after restoring the VS snapshot, so the JSON always wins over the
+        # snapshot for bones it covers, without losing manually-edited fields
+        # on bones the JSON doesn't mention.
+        #if hm2.hm2_json_filepath.strip() and self.reapply_config:
+        #    self._apply_export_config(arm, hm2)
 
     def _rename_core_bones(self, arm: Object, hm2) -> None:
         eb = arm.data.edit_bones
@@ -550,6 +747,16 @@ class HM2_OT_Process(Operator):
             temp = f"{prefix}{src_name}"
             if temp in eb:
                 eb[temp].name = target_name
+
+        # Persist original source names so puppet auto-mapping can find them later.
+        # Stored as {hm2_name: original_source_name} on the armature data.
+        try:
+            _sm = json.loads(arm.data.get("_hm2_src_map", "{}") or "{}")
+        except Exception:
+            _sm = {}
+        for src_name, target_name in rename_pairs:
+            _sm[target_name] = src_name
+        arm.data["_hm2_src_map"] = json.dumps(_sm)
 
         # Update hm2 props to reflect new names
         for src_attr, target_name in [
@@ -656,7 +863,15 @@ class HM2_OT_Process(Operator):
             # re-apply still resolves source_bone (mirrors _rename_core_bones,
             # which writes the new names back into the body mapping props).
             if cap > 0:
-                item.source_bone = f"{side}_{base}Finger{start_idx}"
+                new_first = f"{side}_{base}Finger{start_idx}"
+                # Persist original source → HM2 name for puppet auto-mapping.
+                try:
+                    _sm = json.loads(arm.data.get("_hm2_src_map", "{}") or "{}")
+                except Exception:
+                    _sm = {}
+                _sm[new_first] = item.source_bone
+                arm.data["_hm2_src_map"] = json.dumps(_sm)
+                item.source_bone = new_first
 
             hand_name = f"{side}_Hand"
             hand_eb = eb.get(hand_name)
@@ -1111,38 +1326,36 @@ class HM2_OT_Process(Operator):
         if head_bone and (hm2.hm2_map_eye_l or hm2.hm2_map_eye_r):
             eye_l = eb.get('L_Eye')
             eye_r = eb.get('R_Eye')
-            if eye_l and eye_r:
-                eye_mid = (eye_l.head + eye_r.head) / 2.0
-                lr_vec  = eye_r.head - eye_l.head
-            elif eye_l or eye_r:
-                e       = eye_l or eye_r
-                eye_mid = e.head.copy()
-                lr_vec  = Vector((1, 0, 0))
-            else:
-                eye_mid = head_bone.head.copy()
-                lr_vec  = Vector((1, 0, 0))
+            if eye_l or eye_r:
+                if eye_l and eye_r:
+                    eye_mid = (eye_l.head + eye_r.head) / 2.0
+                    lr_vec  = eye_r.head - eye_l.head
+                else:
+                    e       = eye_l or eye_r
+                    eye_mid = e.head.copy()
+                    lr_vec  = Vector((1, 0, 0))
 
-            if lr_vec.length > 1e-5:
-                lr_vec.normalize()
-                fwd = Vector((0, 0, 1)).cross(lr_vec)
-                if fwd.length < 1e-5:
+                if lr_vec.length > 1e-5:
+                    lr_vec.normalize()
+                    fwd = Vector((0, 0, 1)).cross(lr_vec)
+                    if fwd.length < 1e-5:
+                        fwd = Vector((0, -1, 0))
+                    fwd.normalize()
+                else:
                     fwd = Vector((0, -1, 0))
-                fwd.normalize()
-            else:
-                fwd = Vector((0, -1, 0))
 
-            dist     = head_bone.length * 2.0
-            eye_head = eye_mid + fwd * dist
-            eye_tail = eye_head + fwd * head_bone.length * 0.5
-            make_ik_bone('IK_EyeTarget', eye_head, tail=eye_tail, parent_name='M_Head')
+                dist     = head_bone.length * 2.0
+                eye_head = eye_mid + fwd * dist
+                eye_tail = eye_head + fwd * head_bone.length * 0.5
+                make_ik_bone('IK_EyeTarget', eye_head, tail=eye_tail, parent_name='M_Head')
 
-            _bone_len = head_bone.length * 0.3
-            for _eye_eb, _name in ((eye_l, 'IK_EyeTarget_L'), (eye_r, 'IK_EyeTarget_R')):
-                if _eye_eb is None:
-                    continue
-                _lh = Vector((_eye_eb.head.x, eye_head.y, eye_head.z))
-                _lt = _lh + fwd * _bone_len
-                make_ik_bone(_name, _lh, tail=_lt, parent_name='IK_EyeTarget')
+                _bone_len = head_bone.length * 0.3
+                for _eye_eb, _name in ((eye_l, 'IK_EyeTarget_L'), (eye_r, 'IK_EyeTarget_R')):
+                    if _eye_eb is None:
+                        continue
+                    _lh = Vector((_eye_eb.head.x, eye_head.y, eye_head.z))
+                    _lt = _lh + fwd * _bone_len
+                    make_ik_bone(_name, _lh, tail=_lt, parent_name='IK_EyeTarget')
 
         _ftype_map = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
                       'RING': 'Ring', 'PINKY': 'Pinky'}
@@ -1498,6 +1711,22 @@ class HM2_OT_Process(Operator):
         setup_joint_twists('R_Hip', 'hm2_twist_hip_target_r', 'hm2_twist_hip_mode_r')
         setup_joint_twists('L_Knee', 'hm2_twist_knee_target_l', 'hm2_twist_knee_mode_l')
         setup_joint_twists('R_Knee', 'hm2_twist_knee_target_r', 'hm2_twist_knee_mode_r')
+
+        self._setup_twist_vs(arm)
+
+    def _setup_twist_vs(self, arm: Object) -> None:
+        """Set rotation_copy_target on each twist bone's .vs to its parent joint name.
+        Uses direct dict assignment to avoid triggering the VS update callback during setup."""
+        pb = arm.pose.bones
+        for joint_name, names in self._twist_bone_names.items():
+            for twist_name in names:
+                twist_pb = pb.get(twist_name)
+                if not twist_pb:
+                    continue
+                try:
+                    twist_pb.bone.vs['rotation_copy_target'] = joint_name
+                except Exception:
+                    pass
 
     def _assign_custom_shapes(self, arm: Object, hm2, shapes: dict) -> None:
         pb = arm.pose.bones
@@ -1995,4 +2224,986 @@ class HM2_OT_Process(Operator):
         ctrl_coll.is_visible    = True
         spine_coll.is_visible   = True
         finger_coll.is_visible  = True
+
+    # ------------------------------------------------------------------
+    # Puppet helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_rest_pose_match(master_obj: Object, puppet_obj: Object,
+                                threshold: float = 0.05) -> list[str]:
+        """Return error strings for bones whose rest rotation differs > threshold radians.
+        Uses master's hm2_map_* source names to look up bones in both armatures."""
+        master_arm = master_obj.data
+        master_hm2 = master_obj.kitsunetools.hm2
+        puppet_arm = puppet_obj.data
+
+        mapping = [
+            ('hm2_map_root',       'M_Root'),
+            ('hm2_map_chest',      'M_Chest'),
+            ('hm2_map_neck',       'M_Neck'),
+            ('hm2_map_head',       'M_Head'),
+            ('hm2_map_scapula_l',  'L_Scapula'),
+            ('hm2_map_scapula_r',  'R_Scapula'),
+            ('hm2_map_shoulder_l', 'L_Shoulder'),
+            ('hm2_map_shoulder_r', 'R_Shoulder'),
+            ('hm2_map_elbow_l',    'L_Elbow'),
+            ('hm2_map_elbow_r',    'R_Elbow'),
+            ('hm2_map_hand_l',     'L_Hand'),
+            ('hm2_map_hand_r',     'R_Hand'),
+            ('hm2_map_hip_l',      'L_Hip'),
+            ('hm2_map_hip_r',      'R_Hip'),
+            ('hm2_map_knee_l',     'L_Knee'),
+            ('hm2_map_knee_r',     'R_Knee'),
+            ('hm2_map_ankle_l',    'L_Ankle'),
+            ('hm2_map_ankle_r',    'R_Ankle'),
+            ('hm2_map_toe_l',      'L_Toe'),
+            ('hm2_map_toe_r',      'R_Toe'),
+        ]
+
+        errors = []
+        for master_src_prop, master_bone_name in mapping:
+            # Master and puppet share the same source bone names — use master's mapping
+            # to look up the corresponding bone in both armatures.
+            puppet_src = getattr(master_hm2, master_src_prop, '').strip()
+            if not puppet_src:
+                continue
+            master_bone = master_arm.bones.get(master_bone_name)
+            puppet_bone = puppet_arm.bones.get(puppet_src)
+            if not (master_bone and puppet_bone):
+                continue
+            q_m = master_bone.matrix_local.to_3x3().to_quaternion()
+            q_p = puppet_bone.matrix_local.to_3x3().to_quaternion()
+            angle = q_m.rotation_difference(q_p).angle
+            if angle > threshold:
+                errors.append(
+                    f"{master_bone_name} ↔ {puppet_src}: {math.degrees(angle):.1f}°"
+                )
+        return errors
+
+    @staticmethod
+    def _auto_map_puppet_bones(master_obj: Object, puppet_obj: Object) -> list[str]:
+        """Populate puppet hm2_map_* and hm2_fingers using the original source bone names
+        stored in master's _hm2_src_map during its own rename phase.
+        Returns warnings for missing or structurally mismatched bones."""
+        master_hm2 = master_obj.kitsunetools.hm2
+        puppet_hm2 = puppet_obj.kitsunetools.hm2
+        puppet_arm  = puppet_obj.data
+        warnings: list[str] = []
+
+        # {hm2_bone_name: original_source_bone_name} — saved by _rename_core_bones/_rename_fingers
+        try:
+            src_map: dict[str, str] = json.loads(
+                master_obj.data.get("_hm2_src_map", "{}") or "{}")
+        except Exception:
+            src_map = {}
+
+        CORE_PROPS = [
+            ('hm2_map_root',       'M_Root',      True),
+            ('hm2_map_chest',      'M_Chest',     True),
+            ('hm2_map_neck',       'M_Neck',      True),
+            ('hm2_map_head',       'M_Head',      True),
+            ('hm2_map_scapula_l',  'L_Scapula',   False),
+            ('hm2_map_scapula_r',  'R_Scapula',   False),
+            ('hm2_map_shoulder_l', 'L_Shoulder',  True),
+            ('hm2_map_shoulder_r', 'R_Shoulder',  True),
+            ('hm2_map_elbow_l',    'L_Elbow',     True),
+            ('hm2_map_elbow_r',    'R_Elbow',     True),
+            ('hm2_map_hand_l',     'L_Hand',      True),
+            ('hm2_map_hand_r',     'R_Hand',      True),
+            ('hm2_map_hip_l',      'L_Hip',       True),
+            ('hm2_map_hip_r',      'R_Hip',       True),
+            ('hm2_map_knee_l',     'L_Knee',      True),
+            ('hm2_map_knee_r',     'R_Knee',      True),
+            ('hm2_map_ankle_l',    'L_Ankle',     True),
+            ('hm2_map_ankle_r',    'R_Ankle',     True),
+            ('hm2_map_toe_l',      'L_Toe',       False),
+            ('hm2_map_toe_r',      'R_Toe',       False),
+            ('hm2_map_eye_l',      'L_Eye',       False),
+            ('hm2_map_eye_r',      'R_Eye',       False),
+        ]
+
+        for prop, target_name, required in CORE_PROPS:
+            # Original name stored at rename time; fall back to current master prop
+            # (handles case where master was never renamed, e.g. names already matched).
+            orig_src = src_map.get(target_name, '').strip() \
+                       or getattr(master_hm2, prop, '').strip()
+            setattr(puppet_hm2, prop, orig_src)
+            if orig_src and not puppet_arm.bones.get(orig_src):
+                label = "Required" if required else "Optional"
+                warnings.append(f"{label} bone '{orig_src}' not found in puppet")
+
+        # Spine count + structural check.
+        puppet_hm2.hm2_spine_count = master_hm2.hm2_spine_count
+        root_src  = puppet_hm2.hm2_map_root.strip()
+        chest_src = puppet_hm2.hm2_map_chest.strip()
+        if root_src and chest_src:
+            root_b  = puppet_arm.bones.get(root_src)
+            chest_b = puppet_arm.bones.get(chest_src)
+            if root_b and chest_b:
+                spine_actual = 0
+                b = chest_b
+                seen: set[str] = set()
+                while b and b.name not in seen:
+                    seen.add(b.name)
+                    if not b.parent or b.parent.name == root_src:
+                        break
+                    b = b.parent
+                    spine_actual += 1
+                if spine_actual < master_hm2.hm2_spine_count:
+                    warnings.append(
+                        f"Spine: puppet has {spine_actual} bone(s) between root and chest, "
+                        f"master expects {master_hm2.hm2_spine_count} (missing bones will be created)"
+                    )
+
+        # Fingers — look up each finger's original source bone via src_map.
+        puppet_hm2.hm2_fingers.clear()
+        _fdisp = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
+                  'RING': 'Ring', 'PINKY': 'Pinky'}
+        for mf in master_hm2.hm2_fingers:
+            orig_src = src_map.get(mf.source_bone, '').strip() or mf.source_bone
+            nf = puppet_hm2.hm2_fingers.add()
+            nf.source_bone = orig_src
+            nf.finger_type = mf.finger_type
+            nf.side        = mf.side
+            nf.joint_count = mf.joint_count
+            nf.generate_ik = mf.generate_ik
+
+            if not puppet_arm.bones.get(orig_src):
+                label = f"{mf.side} {_fdisp.get(mf.finger_type, mf.finger_type)}"
+                warnings.append(
+                    f"Optional bone '{orig_src}' ({label} finger) not found in puppet")
+                continue
+
+            cur = puppet_arm.bones.get(orig_src)
+            actual = 0
+            while cur:
+                actual += 1
+                if actual >= mf.joint_count:
+                    break
+                children = list(cur.children)
+                cur = children[0] if len(children) == 1 else None
+
+            if actual < mf.joint_count:
+                label = f"{mf.side} {_fdisp.get(mf.finger_type, mf.finger_type)}"
+                warnings.append(
+                    f"{label} finger: puppet has {actual} joint(s), master expects {mf.joint_count}")
+                nf.joint_count = actual
+
+        return warnings
+
+    def _run_puppet(self, context: Context, master_obj: Object,
+                    puppet_obj: Object, mode: str = 'MIMIC') -> list[str]:
+        """Process puppet_obj against master_obj.
+
+        mode='MIMIC': puppet follows master via COPY_TRANSFORMS on all deform bones.
+        mode='SELF':  puppet gets its own IK controllers (like a standalone master);
+                      only VS export config is synced from master.
+
+        In both modes the HM2 base deform skeleton (core, spine, limbs, fingers, twist)
+        is renamed and structured to match master, and .vs export data is copied from master.
+
+        Returns list of non-fatal warnings from auto bone-mapping.
+        """
+        master_hm2 = master_obj.kitsunetools.hm2
+        puppet_hm2 = puppet_obj.kitsunetools.hm2
+
+        # Auto-populate puppet mapping from master (same source bone names).
+        warnings = self._auto_map_puppet_bones(master_obj, puppet_obj)
+
+        bpy.context.view_layer.objects.active = puppet_obj
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Re-apply cleanup: removes prior constraints, IK/FK/MCH bones, and twist bones.
+        # Also run cleanup if the puppet was previously processed as a standalone HM2 rig
+        # (hm2_is_puppet=False but IK/ctrl bones already present) to avoid duplicates.
+        if puppet_hm2.hm2_is_puppet or self._is_hm2_applied(puppet_obj):
+            self._cleanup_for_reapply(puppet_obj)
+
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+        # Sync core settings from master.
+        puppet_hm2.hm2_legacy_roll = master_hm2.hm2_legacy_roll
+        for attr in ('hm2_twist_shoulder', 'hm2_twist_elbow',
+                     'hm2_twist_hip', 'hm2_twist_knee'):
+            setattr(puppet_hm2, attr, getattr(master_hm2, attr))
+
+        if mode == 'SELF':
+            # Sync IK/shape/twist settings needed for full rig setup.
+            for attr in (
+                'hm2_generate_ik', 'hm2_generate_shapes',
+                'hm2_ik_pole_angle_arm', 'hm2_ik_pole_angle_leg',
+                'hm2_twist_shoulder_target_l', 'hm2_twist_shoulder_target_r',
+                'hm2_twist_shoulder_mode_l',   'hm2_twist_shoulder_mode_r',
+                'hm2_twist_elbow_target_l',    'hm2_twist_elbow_target_r',
+                'hm2_twist_elbow_mode_l',      'hm2_twist_elbow_mode_r',
+                'hm2_twist_hip_target_l',      'hm2_twist_hip_target_r',
+                'hm2_twist_hip_mode_l',        'hm2_twist_hip_mode_r',
+                'hm2_twist_knee_target_l',     'hm2_twist_knee_target_r',
+                'hm2_twist_knee_mode_l',       'hm2_twist_knee_mode_r',
+            ):
+                setattr(puppet_hm2, attr, getattr(master_hm2, attr))
+
+        # Sync bone head/tail/roll from master BEFORE rename, using original name map.
+        # In SELF mode, skip bones whose rest-pose direction differs > 10 degrees from
+        # master so the puppet keeps its own geometry for differently-posed bones.
+        # _sync_puppet_bone_positions leaves puppet in EDIT mode.
+        sync_skip = math.pi / 18 if mode == 'SELF' else None
+        self._sync_puppet_bone_positions(master_obj, puppet_obj, skip_threshold=sync_skip)
+
+        puppet_obj.data.use_mirror_x = False
+        for eb in puppet_obj.data.edit_bones:
+            eb.use_connect = False
+
+        self._rename_core_bones(puppet_obj, puppet_hm2)
+        self._setup_spine(puppet_obj, puppet_hm2)
+        self._rename_fingers(puppet_obj, puppet_hm2)
+        self._connect_chains(puppet_obj, puppet_hm2)
+        self._remove_intermediates(puppet_obj, puppet_hm2)
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        self._create_all_twist_bones(puppet_obj, puppet_hm2)
+
+        if mode == 'SELF':
+            self._computed_pole_angles = {}
+            self._create_ik_bones(puppet_obj, puppet_hm2)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.mode_set(mode='POSE')
+        self._unlock_all_bones(puppet_obj)
+
+        if mode == 'SELF':
+            if puppet_hm2.hm2_generate_ik:
+                self._setup_ik_constraints(puppet_obj, puppet_hm2)
+                self._setup_eye_constraints(puppet_obj)
+            self._setup_fk_controllers(puppet_obj)
+            self._setup_twist_drivers(puppet_obj, puppet_hm2)  # also calls _setup_twist_vs
+            if puppet_hm2.hm2_generate_shapes:
+                shapes = ensure_hm2_shapes(context)
+                self._assign_custom_shapes(puppet_obj, puppet_hm2, shapes)
+            self._assign_bone_colors(puppet_obj, puppet_hm2)
+        else:
+            # MIMIC: set rotation_copy_target on twist bones for VS auto-propagation.
+            self._setup_twist_vs(puppet_obj)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        if mode == 'SELF':
+            self._organize_collections(puppet_obj, puppet_hm2)
+        else:
+            self._organize_puppet_collections(puppet_obj)
+
+        # VS export config sync from master (both modes).
+        puppet_hm2.hm2_json_filepath = master_hm2.hm2_json_filepath
+        self._copy_vs_to_puppet(master_obj, puppet_obj)
+
+        # MIMIC mode: follow master deform bones via COPY_TRANSFORMS.
+        if mode == 'MIMIC':
+            self._add_puppet_constraints(master_obj, puppet_obj)
+
+        # Parent puppet object to master so Object-mode moves are shared.
+        if puppet_obj.parent != master_obj:
+            saved_world = puppet_obj.matrix_world.copy()
+            puppet_obj.parent = master_obj
+            puppet_obj.matrix_parent_inverse = master_obj.matrix_world.inverted()
+            puppet_obj.matrix_world = saved_world
+
+        puppet_hm2.hm2_is_puppet = True
+        puppet_hm2.hm2_puppet_master = master_obj
+
+        return warnings
+
+    @staticmethod
+    def _copy_vs_to_puppet(master_obj: Object, puppet_obj: Object) -> None:
+        """Copy .vs export fields from master to matching puppet bones.
+
+        Only HM2-managed bones (core, spine, twist, fingers) are synced - misc
+        hair/cloth/physics bones are left untouched.
+
+        This is preferred over re-parsing the JSON because it captures any manual
+        per-bone edits made in the panel after the config was last applied."""
+        master_hm2 = master_obj.kitsunetools.hm2
+        managed = HM2_OT_Process._hm2_managed_bone_names(master_obj, master_hm2)
+
+        # Snapshot only HM2-managed bones from master, then restore onto puppet.
+        snapshot = {
+            name: data
+            for name, data in HM2_OT_Process._snapshot_vs_config(master_obj).items()
+            if name in managed
+        }
+        HM2_OT_Process._restore_vs_config(puppet_obj, snapshot)
+
+        # Copy fields with update callbacks via direct dict assignment to avoid
+        # triggering VS callbacks during setup:
+        #   rotation_copy_target  - would fire _sync_rotation_from_target
+        #   location_offset_in_armature_space / export_location_offset_arm_* -
+        #     would fire _sync_local_to_arm / _sync_arm_to_local
+        _CALLBACK_FIELDS = (
+            'rotation_copy_target',
+            'location_offset_in_armature_space',
+            'export_location_offset_arm_x',
+            'export_location_offset_arm_y',
+            'export_location_offset_arm_z',
+        )
+        for bone in master_obj.data.bones:
+            if bone.name not in managed:
+                continue
+            vs = getattr(bone, 'vs', None)
+            if vs is None:
+                continue
+            puppet_bone = puppet_obj.data.bones.get(bone.name)
+            if puppet_bone is None:
+                continue
+            pvs = getattr(puppet_bone, 'vs', None)
+            if pvs is None:
+                continue
+            for field in _CALLBACK_FIELDS:
+                val = getattr(vs, field, None)
+                if val is None:
+                    continue
+                # Skip default/empty values to avoid spurious writes.
+                if isinstance(val, str) and not val:
+                    continue
+                try:
+                    puppet_bone.vs[field] = val
+                except Exception:
+                    pass
+
+    def _sync_puppet_bone_positions(self, master_obj: Object, puppet_obj: Object,
+                                     skip_threshold: float | None = None) -> None:
+        """Pre-rename sync: copy head/tail/roll from each master HM2 deform bone to the
+        corresponding puppet source bone using the stored original name map.
+        Must be called while in OBJECT mode. Leaves puppet in EDIT mode.
+
+        skip_threshold: if set, bones whose direction vector (in world space) differs from
+        master's by more than this angle (radians) are left untouched. Used in SELF mode to
+        preserve the puppet's own rest pose for bones that differ significantly from master."""
+        # {hm2_bone_name: original_src_bone_name} -> invert to puppet_bone -> master_bone
+        try:
+            src_map: dict[str, str] = json.loads(
+                master_obj.data.get("_hm2_src_map", "{}") or "{}")
+        except Exception:
+            src_map = {}
+        puppet_to_master = {orig: hm2 for hm2, orig in src_map.items()}
+
+        # Read master edit bones (roll only available in edit mode).
+        bpy.context.view_layer.objects.active = master_obj
+        bpy.ops.object.mode_set(mode='EDIT')
+        master_edit: dict[str, tuple] = {
+            eb.name: (eb.head.copy(), eb.tail.copy(), eb.roll)
+            for eb in master_obj.data.edit_bones
+        }
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        bpy.context.view_layer.objects.active = puppet_obj
+        bpy.ops.object.mode_set(mode='EDIT')
+
+        mw        = master_obj.matrix_world
+        mw_rot    = mw.to_3x3()
+        mw_inv    = puppet_obj.matrix_world.inverted()
+        pw_rot    = puppet_obj.matrix_world.to_3x3()
+        for eb in puppet_obj.data.edit_bones:
+            master_name = puppet_to_master.get(eb.name)
+            if master_name is None:
+                continue
+            md = master_edit.get(master_name)
+            if md is None:
+                continue
+            m_head, m_tail, m_roll = md
+
+            if skip_threshold is not None:
+                m_dir = mw_rot @ (m_tail - m_head)
+                p_dir = pw_rot @ (eb.tail - eb.head)
+                if m_dir.length > 1e-6 and p_dir.length > 1e-6:
+                    m_dir.normalize()
+                    p_dir.normalize()
+                    dot = max(-1.0, min(1.0, m_dir.dot(p_dir)))
+                    if math.acos(dot) > skip_threshold:
+                        continue
+
+            eb.head = mw_inv @ (mw @ m_head)
+            eb.tail = mw_inv @ (mw @ m_tail)
+            eb.roll = m_roll
+        # Leave in EDIT mode — caller continues the rename pipeline.
+
+    def _hm2_deform_names(self, hm2) -> set[str]:
+        """Return the explicit set of HM2 deform bone names for a given hm2 config."""
+        names: set[str] = {
+            'M_Root', 'M_Chest', 'M_Neck', 'M_Head',
+            'L_Eye', 'R_Eye',
+            'L_Scapula', 'R_Scapula',
+            'L_Shoulder', 'R_Shoulder',
+            'L_Elbow', 'R_Elbow',
+            'L_Hand', 'R_Hand',
+            'L_Hip', 'R_Hip',
+            'L_Knee', 'R_Knee',
+            'L_Ankle', 'R_Ankle',
+            'L_Toe', 'R_Toe',
+        }
+        count = hm2.hm2_spine_count
+        names.add('M_Spine') if count == 1 else names.update(
+            f'M_Spine{i}' for i in range(1, count + 1))
+        _fbase = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
+                  'RING': 'Ring', 'PINKY': 'Pinky'}
+        for f in hm2.hm2_fingers:
+            start = 0 if f.finger_type == 'THUMB' else 1
+            for i in range(start, start + f.joint_count):
+                names.add(f'{f.side}_{_fbase.get(f.finger_type, f.finger_type)}Finger{i}')
+        for twist_list in self._twist_bone_names.values():
+            names.update(twist_list)
+        return names
+
+    def _add_puppet_constraints(self, master_obj: Object, puppet_obj: Object) -> None:
+        """Add COPY_TRANSFORMS on HM2 deform bones only — core, spine, fingers, twist."""
+        puppet_hm2 = puppet_obj.kitsunetools.hm2
+        allowed = self._hm2_deform_names(puppet_hm2)
+        master_bones = {b.name for b in master_obj.data.bones}
+
+        bpy.context.view_layer.objects.active = puppet_obj
+        bpy.ops.object.mode_set(mode='POSE')
+        for pb in puppet_obj.pose.bones:
+            if pb.name not in allowed or pb.name not in master_bones:
+                continue
+            ct = pb.constraints.new('COPY_TRANSFORMS')
+            ct.target = master_obj
+            ct.subtarget = pb.name
+            ct.target_space = 'POSE'
+            ct.owner_space = 'POSE'
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    def _organize_puppet_collections(self, puppet_obj: Object) -> None:
+        """Assign bones to the same collection structure as the master.
+        HM2 deform bones → Twist / Spine / Fingers / Face / Default.
+        Non-HM2 bones (hair, cloth, physics) → Hair or Misc."""
+        hm2 = puppet_obj.kitsunetools.hm2
+        allowed = self._hm2_deform_names(hm2)
+
+        default_coll = ensure_bone_collection(puppet_obj, 'Default')
+        twist_coll   = ensure_bone_collection(puppet_obj, 'Twist')
+        finger_coll  = ensure_bone_collection(puppet_obj, 'Fingers', default_coll)
+        face_coll    = ensure_bone_collection(puppet_obj, 'Face',    default_coll)
+        spine_coll   = ensure_bone_collection(puppet_obj, 'Spine',   default_coll)
+        misc_coll    = ensure_bone_collection(puppet_obj, 'Misc')
+        hair_coll    = ensure_bone_collection(puppet_obj, 'Hair',    misc_coll)
+
+        twist_names = {n for names in self._twist_bone_names.values() for n in names}
+
+        for bone in puppet_obj.data.bones:
+            name = bone.name
+            if name in allowed:
+                if name in twist_names:
+                    target = twist_coll
+                elif name in ('M_Root', 'M_Neck', 'M_Chest', 'M_Head') \
+                        or name.startswith('M_Spine') or name == 'M_Spine':
+                    target = spine_coll
+                elif 'Finger' in name:
+                    target = finger_coll
+                elif 'Eye' in name:
+                    target = face_coll
+                else:
+                    target = default_coll
+            else:
+                if 'hair' in name.lower() or 'bangs' in name.lower():
+                    target = hair_coll
+                else:
+                    target = misc_coll
+
+            for c in list(bone.collections):
+                c.unassign(bone)
+            target.assign(bone)
+
+        default_coll.is_visible = False
+        face_coll.is_visible    = False
+        misc_coll.is_visible    = False
+        hair_coll.is_visible    = False
+        twist_coll.is_visible   = True
+        spine_coll.is_visible   = True
+        finger_coll.is_visible  = True
+
+
+class HM2_OT_AddPuppet(Operator):
+    bl_idname = "kitsunetools.hm2_add_puppet"
+    bl_label = "Add Selected as Puppet"
+    bl_description = "Add other selected armatures to the puppet list"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        return context.mode == 'OBJECT' and is_armature(context.active_object)
+
+    def execute(self, context: Context) -> set:
+        master_obj = context.active_object
+        master_hm2 = master_obj.kitsunetools.hm2
+
+        candidates = [
+            o for o in context.selected_objects
+            if o != master_obj and is_armature(o)
+        ]
+        if not candidates:
+            self.report({'WARNING'}, "Select one or more armatures in addition to the master")
+            return {'CANCELLED'}
+
+        existing = {e.armature for e in master_hm2.hm2_puppets if e.armature}
+        added = 0
+        for obj in candidates:
+            if obj in existing:
+                self.report({'WARNING'}, f"'{obj.name}' is already in the puppet list")
+                continue
+            if obj.kitsunetools.hm2.hm2_is_puppet:
+                self.report({'WARNING'}, f"'{obj.name}' is already a puppet of another master")
+                continue
+            entry = master_hm2.hm2_puppets.add()
+            entry.armature = obj
+            master_hm2.hm2_puppets_index = len(master_hm2.hm2_puppets) - 1
+            added += 1
+
+        if added:
+            self.report({'INFO'}, f"Added {added} armature(s) to puppet list")
+        return {'FINISHED'}
+
+
+class HM2_OT_RemovePuppet(Operator):
+    bl_idname = "kitsunetools.hm2_remove_puppet"
+    bl_label = "Remove Puppet Entry"
+    bl_description = "Remove the selected entry from the puppet list"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        if not (context.mode == 'OBJECT' and is_armature(context.active_object)):
+            return False
+        hm2 = context.active_object.kitsunetools.hm2
+        return 0 <= hm2.hm2_puppets_index < len(hm2.hm2_puppets)
+
+    def execute(self, context: Context) -> set:
+        master_hm2 = context.active_object.kitsunetools.hm2
+        idx = master_hm2.hm2_puppets_index
+        entry = master_hm2.hm2_puppets[idx]
+        puppet_obj = entry.armature
+
+        # Light disconnect: clear puppet markers without touching constraints.
+        if puppet_obj and is_armature(puppet_obj):
+            puppet_hm2 = puppet_obj.kitsunetools.hm2
+            if puppet_hm2.hm2_is_puppet and puppet_hm2.hm2_puppet_master == context.active_object:
+                puppet_hm2.hm2_is_puppet = False
+                puppet_hm2.hm2_puppet_master = None
+
+        master_hm2.hm2_puppets.remove(idx)
+        master_hm2.hm2_puppets_index = max(0, min(idx, len(master_hm2.hm2_puppets) - 1))
+        return {'FINISHED'}
+
+
+class HM2_OT_ProcessPuppet(Operator):
+    bl_idname = "kitsunetools.hm2_process_puppet"
+    bl_label = "Process as Puppet"
+    bl_description = (
+        "Process a newly-added puppet against the already-converted master. "
+        "Puppets added before running HM2 Setup are processed automatically"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    rest_pose_threshold: FloatProperty(
+        name="Rest Pose Threshold",
+        description=(
+            "Maximum allowed rotation difference (radians) between corresponding "
+            "rest-pose bones. Pairs beyond this threshold abort the operation"
+        ),
+        default=0.05, min=0.0, max=1.5707963, subtype='ANGLE',
+    )
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        if not (context.mode == 'OBJECT' and is_armature(context.active_object)):
+            return False
+        arm = context.active_object
+        if not HM2_OT_Process._is_hm2_applied(arm):
+            return False
+        hm2 = arm.kitsunetools.hm2
+        return 0 <= hm2.hm2_puppets_index < len(hm2.hm2_puppets)
+
+    def invoke(self, context: Context, event) -> set:
+        master_obj = context.active_object
+        master_hm2 = master_obj.kitsunetools.hm2
+        idx = master_hm2.hm2_puppets_index
+        entry = master_hm2.hm2_puppets[idx]
+        puppet_obj = entry.armature
+
+        if not puppet_obj or not is_armature(puppet_obj):
+            self.report({'ERROR'}, "Puppet entry has no valid armature")
+            return {'CANCELLED'}
+        if puppet_obj == master_obj:
+            self.report({'ERROR'}, "Puppet cannot be the same object as master")
+            return {'CANCELLED'}
+
+        # Hard stop only in MIMIC mode. SELF mode handles rest pose differences
+        # by skipping mismatched bones during position sync rather than aborting.
+        if entry.mode == 'MIMIC':
+            errors = HM2_OT_Process._check_rest_pose_match(
+                master_obj, puppet_obj, self.rest_pose_threshold)
+            if errors:
+                preview = '\n'.join(errors[:5])
+                if len(errors) > 5:
+                    preview += f'\n... and {len(errors) - 5} more'
+                self.report({'ERROR'}, f"Rest pose mismatch — puppet does not match master:\n{preview}")
+                return {'CANCELLED'}
+
+        return self.execute(context)
+
+    def draw(self, context: Context) -> None:
+        self.layout.prop(self, 'rest_pose_threshold')
+
+    def execute(self, context: Context) -> set:
+        master_obj = context.active_object
+        master_hm2 = master_obj.kitsunetools.hm2
+        idx = master_hm2.hm2_puppets_index
+
+        if not (0 <= idx < len(master_hm2.hm2_puppets)):
+            self.report({'ERROR'}, "Invalid puppet entry index")
+            return {'CANCELLED'}
+
+        puppet_entry = master_hm2.hm2_puppets[idx]
+        puppet_obj = puppet_entry.armature
+        if not puppet_obj or not is_armature(puppet_obj):
+            self.report({'ERROR'}, "Puppet entry has no valid armature")
+            return {'CANCELLED'}
+
+        bpy.ops.ed.undo_push(message="Before HM2 Process Puppet")
+        try:
+            proc = HM2_OT_Process._make_proc()
+            warnings = proc._run_puppet(context, master_obj, puppet_obj, puppet_entry.mode)
+        except Exception as e:
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Puppet processing failed and was reverted: {e}")
+            HM2_OT_Process._schedule_revert()
+            return {'CANCELLED'}
+
+        for w in warnings:
+            self.report({'WARNING'}, w)
+        context.view_layer.objects.active = master_obj
+        self.report({'INFO'}, f"Puppet '{puppet_obj.name}' processed successfully")
+        return {'FINISHED'}
+
+
+class HM2_OT_DisconnectPuppet(Operator):
+    bl_idname = "kitsunetools.hm2_disconnect_puppet"
+    bl_label = "Disconnect from Master"
+    bl_description = (
+        "Remove COPY_TRANSFORMS constraints and object parent, making this "
+        "armature a standalone rig. Run HM2 Setup to add IK controllers."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        if not (context.mode == 'OBJECT' and is_armature(context.active_object)):
+            return False
+        return context.active_object.kitsunetools.hm2.hm2_is_puppet
+
+    def execute(self, context: Context) -> set:
+        puppet_obj = context.active_object
+        puppet_hm2 = puppet_obj.kitsunetools.hm2
+        master_obj = puppet_hm2.hm2_puppet_master
+
+        bpy.ops.object.mode_set(mode='POSE')
+        for pb in puppet_obj.pose.bones:
+            for c in list(pb.constraints):
+                if c.type == 'COPY_TRANSFORMS' and getattr(c, 'target', None) == master_obj:
+                    pb.constraints.remove(c)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        saved_world = puppet_obj.matrix_world.copy()
+        puppet_obj.parent = None
+        puppet_obj.matrix_world = saved_world
+
+        puppet_coll = puppet_obj.data.collections.get("Puppet")
+        if puppet_coll:
+            puppet_coll.is_visible = True
+
+        puppet_hm2.hm2_is_puppet = False
+        puppet_hm2.hm2_puppet_master = None
+
+        if master_obj and is_armature(master_obj):
+            master_hm2 = master_obj.kitsunetools.hm2
+            for i, entry in enumerate(master_hm2.hm2_puppets):
+                if entry.armature == puppet_obj:
+                    master_hm2.hm2_puppets.remove(i)
+                    master_hm2.hm2_puppets_index = max(
+                        0, min(i, len(master_hm2.hm2_puppets) - 1))
+                    break
+
+        self.report({'INFO'}, f"'{puppet_obj.name}' disconnected from master")
+        return {'FINISHED'}
+
+
+class HM2_OT_SyncPuppetExportConfig(Operator):
+    bl_idname = "kitsunetools.hm2_sync_puppet_export"
+    bl_label = "Sync Export Config to Puppets"
+    bl_description = (
+        "Copy the master's current per-bone .vs export settings (names, offsets) "
+        "to all connected puppet armatures. Run this after manually editing any "
+        "bone's VS export data on the master"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        if not (context.mode == 'OBJECT' and is_armature(context.active_object)):
+            return False
+        arm = context.active_object
+        if not HM2_OT_Process._is_hm2_applied(arm):
+            return False
+        hm2 = arm.kitsunetools.hm2
+        return any(
+            e.armature and e.armature.kitsunetools.hm2.hm2_is_puppet
+            for e in hm2.hm2_puppets
+        )
+
+    def execute(self, context: Context) -> set:
+        master_obj = context.active_object
+        master_hm2 = master_obj.kitsunetools.hm2
+        synced = 0
+        for entry in master_hm2.hm2_puppets:
+            puppet_obj = entry.armature
+            if not puppet_obj or not puppet_obj.kitsunetools.hm2.hm2_is_puppet:
+                continue
+            HM2_OT_Process._copy_vs_to_puppet(master_obj, puppet_obj)
+            synced += 1
+        self.report({'INFO'}, f"Synced export config to {synced} puppet(s)")
+        return {'FINISHED'}
+
+
+class HM2_OT_FirstPersonArms(Operator):
+    bl_idname = "kitsunetools.hm2_first_person_arms"
+    bl_label = "Create First Person Arms"
+    bl_description = ("Duplicate the armature and its meshes into an arms-only version: keep each "
+                     "starting bone and its children, delete everything else, and cull the meshes "
+                     "to the geometry weighted to the kept bones")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bisect_use_bisect: BoolProperty(name="Bisect Seam", default=True)
+    bisect_axis: EnumProperty(
+        name="Bisect Axis",
+        items=[('X', 'World X', ''), ('Y', 'World Y', ''), ('Z', 'World Z', '')],
+        default='Z',
+    )
+    bisect_offset: FloatProperty(name="Bisect Offset", default=0.0, subtype='DISTANCE')
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        return context.mode == 'OBJECT' and is_armature(context.active_object)
+
+    def invoke(self, context: Context, event) -> set:
+        arm = context.active_object
+        hm2 = arm.kitsunetools.hm2
+        self.bisect_use_bisect = hm2.fpa_use_bisect
+        self.bisect_axis       = hm2.fpa_bisect_axis
+        self.bisect_offset     = hm2.fpa_bisect_offset
+        self._fpa_arm    = arm
+        self._fpa_starts = [s for s in (hm2.fpa_starting_bone_l, hm2.fpa_starting_bone_r) if s]
+        from ..utils.utils_fpa_preview import register_preview
+        register_preview(self)
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+        return context.window_manager.invoke_props_dialog(
+            self, title="First Person Arms – Bisect Preview", width=320
+        )
+
+    def draw(self, context: Context) -> None:
+        layout = self.layout
+        layout.prop(self, "bisect_use_bisect")
+        row = layout.row(align=True)
+        row.enabled = self.bisect_use_bisect
+        row.prop(self, "bisect_axis", text="")
+        row.prop(self, "bisect_offset", text="Offset")
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+    def cancel(self, context: Context) -> None:
+        from ..utils.utils_fpa_preview import unregister_preview
+        unregister_preview()
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+    def execute(self, context: Context) -> set:
+        from ..utils.utils_fpa_preview import unregister_preview
+        unregister_preview()
+        arm = context.active_object
+        hm2 = arm.kitsunetools.hm2
+        hm2.fpa_use_bisect    = self.bisect_use_bisect
+        hm2.fpa_bisect_axis   = self.bisect_axis
+        hm2.fpa_bisect_offset = self.bisect_offset
+
+        start_l = hm2.fpa_starting_bone_l
+        start_r = hm2.fpa_starting_bone_r
+        starts = [s for s in (start_l, start_r) if s]
+        if not starts:
+            self.report({'ERROR'}, "Assign at least one starting bone (L or R)")
+            return {'CANCELLED'}
+        for s in starts:
+            if s not in arm.data.bones:
+                self.report({'ERROR'}, f"Starting bone '{s}' not found in armature")
+                return {'CANCELLED'}
+
+        if hm2.fpa_rig_type == 'HM2':
+            is_hm2 = True
+        elif hm2.fpa_rig_type == 'PLAIN':
+            is_hm2 = False
+        else:
+            is_hm2 = detect_hm2_rig(arm)
+
+        try:
+            with unhide_all_objects():
+                return self._run(context, arm, hm2, starts, is_hm2)
+        except Exception as e:
+            traceback.print_exc()
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            self.report({'ERROR'}, f"First Person Arms failed: {e}")
+            return {'CANCELLED'}
+
+    def _run(self, context: Context, src_arm: Object, hm2, starts: list[str], is_hm2: bool) -> set:
+        # One bisect plane per starting bone, each through that bone's head in world space.
+        # When bones span opposite sides of the origin along the chosen axis (e.g. L/R shoulders
+        # at ±X), each normal is flipped inward so each plane only removes body-side geometry and
+        # leaves the other arm intact.  When all bones are on the same side (e.g. both shoulders
+        # above Z=0), all normals are identical and the cuts are parallel.
+        axis_index = {'X': 0, 'Y': 1, 'Z': 2}[hm2.fpa_bisect_axis]
+        base_no = Vector((0.0, 0.0, 0.0))
+        base_no[axis_index] = 1.0
+        heads = [src_arm.matrix_world @ src_arm.data.bones[s].head_local for s in starts]
+        positions = [h[axis_index] for h in heads]
+        opposite_sides = (len(positions) > 1
+                          and min(positions) < -1e-4
+                          and max(positions) > 1e-4)
+        plane_nos = []
+        plane_cos = []
+        for h in heads:
+            no = -base_no.copy() if (opposite_sides and h[axis_index] > 1e-4) else base_no.copy()
+            plane_nos.append(no)
+            plane_cos.append(h + no * hm2.fpa_bisect_offset)
+
+        # --- Duplicate armature + its meshes -------------------------------------
+        src_meshes = get_armature_meshes(src_arm)
+        src_colls = list(src_arm.users_collection) or [context.scene.collection]
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+        for ob in src_meshes:
+            ob.select_set(True)
+        src_arm.select_set(True)
+        context.view_layer.objects.active = src_arm
+        bpy.ops.object.duplicate(linked=False)
+
+        dup_arm = context.view_layer.objects.active
+        dup_arm.name = f"{src_arm.name}_FPArms"
+        dup_meshes = list(get_armature_meshes(dup_arm))
+
+        # Place all duplicated objects in the source armature's collection(s) so the
+        # first-person-arms set stays grouped together regardless of where the
+        # originals or the active collection were.
+        for ob in [dup_arm, *dup_meshes]:
+            for c in list(ob.users_collection):
+                c.objects.unlink(ob)
+            for c in src_colls:
+                c.objects.link(ob)
+
+        # --- Compute kept bones --------------------------------------------------
+        kept = compute_fpa_kept_bones(
+            dup_arm, hm2.fpa_starting_bone_l, hm2.fpa_starting_bone_r,
+            hm2.fpa_preserve_ik, is_hm2,
+        )
+        if not kept:
+            self.report({'ERROR'}, "No bones matched the starting selection")
+            return {'CANCELLED'}
+
+        # Deform bones that meshes are weighted to (controllers never deform).
+        kept_deform = {n for n in kept if not n.startswith(HM2_CONTROLLER_PREFIXES)}
+
+        # --- Delete unwanted bones ----------------------------------------------
+        context.view_layer.objects.active = dup_arm
+        bpy.ops.object.mode_set(mode='EDIT')
+        eb = dup_arm.data.edit_bones
+        for bone in eb:
+            if bone.name in kept and bone.parent and bone.parent.name not in kept:
+                bone.parent = None
+        for bone in [b for b in eb if b.name not in kept]:
+            eb.remove(bone)
+
+        # On an HM2 rig with IK kept, move the master controller (CTRL_Ground) to
+        # sit between the starting bones for a natural first-person pivot. Its IK
+        # children keep their own rest positions, so only the control origin moves.
+        relocate_ground = is_hm2 and hm2.fpa_preserve_ik
+        if relocate_ground:
+            cg = eb.get('CTRL_Ground')
+            heads = [eb[s].head.copy() for s in starts if s in eb]
+            if cg and heads:
+                delta = (sum(heads, Vector()) / len(heads)) - cg.head
+                cg.head = cg.head + delta
+                cg.tail = cg.tail + delta
+                # Rig the starting bones to the ground controller so the whole arm
+                # assembly follows it as a single first-person root.
+                for s in starts:
+                    sb = eb.get(s)
+                    if sb and sb is not cg:
+                        sb.use_connect = False
+                        sb.parent = cg
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # --- Strip constraints/drivers referencing deleted bones ----------------
+        bone_names = set(dup_arm.data.bones.keys())
+        bpy.ops.object.mode_set(mode='POSE')
+        for pb in dup_arm.pose.bones:
+            for con in list(pb.constraints):
+                tgt = getattr(con, 'target', None)
+                refs = [getattr(con, a, '') for a in ('subtarget', 'pole_subtarget')]
+                if tgt == dup_arm and any(r and r not in bone_names for r in refs):
+                    pb.constraints.remove(con)
+        if dup_arm.animation_data:
+            for fc in list(dup_arm.animation_data.drivers):
+                dp = fc.data_path
+                if dp.startswith('pose.bones['):
+                    try:
+                        bname = dp.split('"')[1]
+                    except IndexError:
+                        bname = None
+                    if bname is not None and bname not in bone_names:
+                        dup_arm.animation_data.drivers.remove(fc)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Give the relocated master controller a box widget for clearer FP control.
+        if relocate_ground:
+            cg_pb = dup_arm.pose.bones.get('CTRL_Ground')
+            box = get_hm2_shape('box')
+            if cg_pb and box is not None:
+                cg_pb.custom_shape = box
+                cg_pb.custom_shape_translation = Vector((0.0, 0.0, 0.0))
+
+        # --- Cull meshes ---------------------------------------------------------
+        culled, deleted = 0, 0
+        for mesh in dup_meshes:
+            poly_count = cull_mesh_to_bones(
+                mesh, kept_deform,
+                threshold=hm2.fpa_weight_threshold,
+                use_bisect=hm2.fpa_use_bisect,
+                plane_cos_world=plane_cos,
+                plane_nos_world=plane_nos,
+            )
+            if poly_count == 0:
+                bpy.data.objects.remove(mesh, do_unlink=True)
+                deleted += 1
+            else:
+                culled += 1
+
+        bpy.ops.object.select_all(action='DESELECT')
+        dup_arm.select_set(True)
+        context.view_layer.objects.active = dup_arm
+
+        self.report(
+            {'INFO'},
+            f"First Person Arms: kept {len(kept)} bones, {culled} mesh(es) culled, "
+            f"{deleted} empty mesh(es) deleted",
+        )
+        return {'FINISHED'}
 

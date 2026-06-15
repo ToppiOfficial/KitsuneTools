@@ -1,7 +1,7 @@
 import bpy, re
 from bpy.types import Object, Operator, Context, PoseBone
-from bpy.props import BoolProperty, StringProperty, EnumProperty, FloatProperty
-from ..utils.utils_armature import apply_current_pose_as_restpose, apply_current_pose_shapekey, get_selected_bones, copy_armature_visual_pose, merge_armatures, transfer_armature_bonedata
+from bpy.props import BoolProperty, StringProperty, EnumProperty, FloatProperty, IntProperty
+from ..utils.utils_armature import apply_current_pose_as_restpose, apply_current_pose_shapekey, get_selected_bones, copy_armature_visual_pose, fit_armature_pose_to_reference, merge_armatures, transfer_armature_bonedata
 from ..utils.utils_contextmanagers import preserve_context_mode
 from ..utils.utils_object import get_armature, is_armature, get_armature_meshes
 from ..utils.utils_vertexgroup import remove_unused_vertexgroups
@@ -22,9 +22,19 @@ class _apply_pose:
                 try:
                     if self.selected_only:
                         selected_bones = get_selected_bones(armature=armature, bone_type='POSEBONE')
-                        
+                        selected_names = {pb.name for pb in selected_bones}
+
+                        # Expand: include bones whose constraints target a selected bone
                         for posebone in armature.pose.bones:
-                            if posebone.name in {pb.name for pb in selected_bones}: continue
+                            if posebone.name in selected_names: continue
+                            for constraint in posebone.constraints:
+                                target_bone = getattr(constraint, 'subtarget', None)
+                                if target_bone and target_bone in selected_names:
+                                    selected_names.add(posebone.name)
+                                    break
+
+                        for posebone in armature.pose.bones:
+                            if posebone.name in selected_names: continue
                             posebone.matrix_basis.identity()
 
                     if as_shapekey:
@@ -190,7 +200,84 @@ class ARMATURE_OT_CopyVisPosture(Operator):
             copy_armature_visual_pose(base_armature=currArm,target_armature=otherArm,copy_type=self.copy_type,)
         
         return {'FINISHED'} if copiedcount > 0 else {'CANCELLED'}
-    
+
+
+class ARMATURE_OT_FitPoseToActive(Operator):
+    bl_idname = "kitsunetools.fit_pose_to_active"
+    bl_label = "Fit Pose to Active"
+    bl_description = ("Approximately pose the other selected armature(s) toward the active armature "
+                      "(matched by bone name or export name). Repositions joints to match while "
+                      "uniformly scaling each bone so limbs keep their proportions (width follows "
+                      "length) instead of going skinny. Result is left as a live pose to hand-tweak")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    strength: FloatProperty(
+        name="Strength", description="0 = no change, 1 = full match. Lower values keep the fit 'close but not exact'",
+        default=0.85, min=0.0, max=1.0, subtype='FACTOR')
+    use_translate: BoolProperty(name="Position Joints", description="Move each bone head onto the matching reference joint (non-distorting)", default=True)
+    use_rotate: BoolProperty(name="Aim at Child", description="Aim each bone from its head toward its matched child's target joint", default=True)
+    use_scale: BoolProperty(name="Keep Proportions", description="Uniformly scale each bone by its rest-span vs target-span so it gets proportionally wider as it gets longer (no skinny limbs). Turn off for a pure position+aim fit", default=True)
+    scale_smoothing: FloatProperty(
+        name="Scale Smoothing",
+        description="Blend each bone's scale toward its parent's so a short proximal bone (e.g. thumb base) doesn't balloon relative to its child. 0 = independent per bone, 1 = whole chain shares one scale",
+        default=0.5, min=0.0, max=1.0, subtype='FACTOR')
+    iterations: IntProperty(name="Iterations", description="Refinement sweeps; more iterations converge closer", default=3, min=1, max=20)
+    tolerance: FloatProperty(name="Tolerance", description="Skip bones whose head is already within this distance of the target", default=0.001, min=0.0, precision=4)
+    selected_only: BoolProperty(name="Selected Bones Only", description="Only fit selected bones of the source armature", default=False)
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        if context.mode != 'OBJECT': return False
+        currob = context.active_object
+        if not is_armature(currob): return False
+        return any(is_armature(ob) and ob != currob for ob in context.selected_objects)
+
+    def invoke(self, context: Context, event) -> set:
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context: Context) -> None:
+        layout = self.layout
+        layout.prop(self, "strength")
+        col = layout.column(align=True)
+        col.prop(self, "use_translate")
+        col.prop(self, "use_rotate")
+        col.prop(self, "use_scale")
+        sub = layout.row()
+        sub.enabled = self.use_scale
+        sub.prop(self, "scale_smoothing")
+        layout.prop(self, "iterations")
+        layout.prop(self, "tolerance")
+        layout.prop(self, "selected_only")
+
+    def execute(self, context: Context) -> set:
+        ref_arm = context.active_object
+        if ref_arm is None: return {'CANCELLED'}
+
+        sources = [ob for ob in context.selected_objects if is_armature(ob) and ob != ref_arm]
+        if not sources:
+            self.report({'ERROR'}, "No other selected armature to fit")
+            return {'CANCELLED'}
+
+        total_moved = 0
+        total_matched = 0
+        for src in sources:
+            moved, matched = fit_armature_pose_to_reference(
+                src, ref_arm,
+                strength=self.strength,
+                use_translate=self.use_translate, use_rotate=self.use_rotate,
+                use_scale=self.use_scale, scale_smoothing=self.scale_smoothing,
+                iterations=self.iterations, tolerance=self.tolerance,
+                selected_only=self.selected_only)
+            total_moved += moved
+            total_matched += matched
+
+        if total_matched == 0:
+            self.report({'WARNING'}, "No matching bones found (by name or export name)")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Fit {total_moved}/{total_matched} bone(s) across {len(sources)} armature(s)")
+        return {'FINISHED'}
+
 
 class ARMATURE_OT_CleanUnWeightedBones(Operator):
     bl_idname= 'kitsunetools.clean_unweighted_bones'

@@ -1,5 +1,5 @@
 import bpy, re
-from mathutils import Matrix
+from mathutils import Matrix, Vector, Quaternion
 from bpy.types import Object, Bone, PoseBone, EditBone
 from .utils_object import get_armature_meshes, is_armature
 from .utils_contextmanagers import selfreport, preserve_armature_state, preserve_context_mode, unhide_all_objects, report, copy_property_group, copy_addon_properties
@@ -246,6 +246,10 @@ def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "
             if total_diff > 1e-4:
                 posebones.add(pbone.name)
 
+        for pbone in armature.pose.bones:
+            if any(p.name in posebones for p in pbone.parent_recursive):
+                posebones.add(pbone.name)
+
         bpy.context.view_layer.update() 
         bpy.ops.object.select_all(action='DESELECT')
 
@@ -263,6 +267,11 @@ def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "
                 for sk in mesh.data.shape_keys.key_blocks:
                     original_shapekey_values[sk.name] = sk.value
                     sk.value = 0
+
+            print(f"=== {mesh.name} ===")
+            print(f"posebones: {posebones}")
+            print(f"used_vgroup_names: {used_vgroup_names}")
+            print(f"isdisjoint: {posebones.isdisjoint(used_vgroup_names)}")
             
             try:
                 mesh.select_set(True)
@@ -273,16 +282,21 @@ def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "
                 if 'FINISHED' in ret:
                     if mesh.data.shape_keys:
                         new_key = mesh.data.shape_keys.key_blocks[-1]
-
-                        if posebones.isdisjoint(used_vgroup_names):
+                        
+                        # Check if shapekey has any actual deformation
+                        basis = mesh.data.shape_keys.key_blocks[0]
+                        has_deformation = any(
+                            (new_key.data[i].co - basis.data[i].co).length > 1e-4
+                            for i in range(len(new_key.data))
+                        )
+                        
+                        if not has_deformation:
                             mesh.shape_key_remove(new_key)
-                            
-                            if not len(mesh.data.shape_keys.key_blocks) > 1:
+                            if len(mesh.data.shape_keys.key_blocks) <= 1:
                                 mesh.shape_key_remove(mesh.data.shape_keys.key_blocks[0])
                         else:
                             success_count += 1
-                            pose_name = shapekey_name if shapekey_name else 'Pose_Shape'
-                            new_key.name = pose_name
+                            new_key.name = shapekey_name if shapekey_name else 'Pose_Shape'
                         
                 else:
                     report('ERROR', f"Failed to apply modifier for {mesh.name}")
@@ -370,6 +384,190 @@ def copy_armature_visual_pose(base_armature: Object, target_armature: Object, co
                 rotcopy(target_pose_bone, mat)
             
             bpy.context.view_layer.update()
+
+
+def fit_armature_pose_to_reference(source_arm: Object, ref_arm: Object, *, strength: float = 0.85,
+                                   use_translate: bool = True, use_rotate: bool = True,
+                                   use_scale: bool = True, scale_smoothing: float = 0.5,
+                                   iterations: int = 3, tolerance: float = 0.001,
+                                   selected_only: bool = False) -> tuple[int, int]:
+    """Approximately pose ``source_arm`` so its matched joints align toward ``ref_arm``.
+
+    Proportion-preserving, position-first fit. Bones are matched by name or export name. The goal
+    is to land each joint (bone head) on the matching reference joint while keeping the source mesh
+    proportions, so the result is "close enough" for deformation without skinny/squashed limbs. The
+    source pose is refined in place (POSE mode) and left as a live pose; nothing is baked.
+
+    Per bone (parents first, repeated ``iterations`` times):
+      - ``use_translate``: move the bone head onto the reference joint (rigid, non-distorting).
+      - ``use_rotate``:    aim the bone from its head toward its matched CHILD's target joint
+                           (falls back to the reference bone's own direction if it has no matched child).
+      - ``use_scale``:     UNIFORMLY scale each bone by the ratio of its rest joint-span to the target
+                           joint-span, so a limb that must get longer also gets proportionally wider
+                           (width follows length) instead of going skinny. Scale is precomputed from
+                           fixed rest/target spans (so it never compounds or collapses to 1) and then
+                           ``scale_smoothing`` (0..1) blends each bone's scale toward its parent's so a
+                           short proximal bone doesn't balloon relative to its children (consistent
+                           per-chain width). 0 = independent per bone, 1 = whole chain shares one scale.
+
+    All channels are blended by ``strength`` (0..1). Returns ``(bones_moved, bones_matched)``.
+    """
+    from .utils_bone import get_bone_exportname
+
+    if not is_armature(source_arm) or not is_armature(ref_arm):
+        return (0, 0)
+
+    strength = max(0.0, min(1.0, strength))
+    if strength <= 0.0 or not (use_translate or use_rotate or use_scale):
+        return (0, 0)
+
+    # Reference lookup keyed by both export name and bone name.
+    ref_map = {get_bone_exportname(b, for_write=True): b for b in ref_arm.data.bones}
+    ref_map.update({b.name: b for b in ref_arm.data.bones})
+
+    selected_names = None
+    if selected_only:
+        selected_names = {b.name for b in (get_selected_bones(source_arm, bone_type='POSEBONE') or [])}
+
+    # Matched source->ref data bones, sources ordered parents-first.
+    matched: dict[Bone, Bone] = {}
+    ordered_src: list[Bone] = []
+    for src_bone in sort_bones_by_hierarchy(list(source_arm.data.bones)):
+        if selected_names is not None and src_bone.name not in selected_names:
+            continue
+        ref_bone = ref_map.get(src_bone.name) or ref_map.get(get_bone_exportname(src_bone, for_write=True))
+        if ref_bone is not None:
+            matched[src_bone] = ref_bone
+            ordered_src.append(src_bone)
+
+    if not ordered_src:
+        return (0, 0)
+
+    matched_set = set(matched)
+
+    def nearest_matched_descendants(bone: Bone) -> list[Bone]:
+        """Closest matched descendants (stop descending once a matched bone is reached)."""
+        found: list[Bone] = []
+        stack = list(bone.children)
+        while stack:
+            c = stack.pop()
+            if c in matched_set:
+                found.append(c)
+            else:
+                stack.extend(c.children)
+        return found
+
+    aim_children = {sb: nearest_matched_descendants(sb) for sb in ordered_src}
+    # Fixed rest joint-span per bone (avg rest distance from its head to each matched child's head).
+    rest_span: dict[Bone, float] = {}
+    for sb in ordered_src:
+        descs = aim_children[sb]
+        rest_span[sb] = (sum((c.head_local - sb.head_local).length for c in descs) / len(descs)) if descs else 0.0
+
+    EPS = 1e-6
+    ANGLE_EPS = 1e-4
+    moved_names: set[str] = set()
+
+    # --- Precompute per-bone uniform scale, then smooth it along chains ---------------------
+    # Spans are fixed (ref/source object transforms don't change while fitting), so compute once.
+    m_ref2src0 = source_arm.matrix_world.inverted() @ ref_arm.matrix_world
+
+    def _tgt_head(bone: Bone) -> 'Vector':
+        return (m_ref2src0 @ ref_arm.pose.bones[matched[bone].name].matrix).translation
+
+    raw_scale: dict[Bone, float | None] = {}
+    for sb in ordered_src:
+        descs = aim_children[sb]
+        rs = rest_span[sb]
+        if use_scale and descs and rs > EPS:
+            h = _tgt_head(sb)
+            tgt_span = sum((_tgt_head(c) - h).length for c in descs) / len(descs)
+            r = 1.0 + ((tgt_span / rs) - 1.0) * strength
+            raw_scale[sb] = max(0.05, min(20.0, r))
+        else:
+            raw_scale[sb] = None  # leaf / no span — inherit from parent
+
+    def nearest_matched_ancestor(bone: Bone) -> 'Bone | None':
+        p = bone.parent
+        while p is not None:
+            if p in matched_set:
+                return p
+            p = p.parent
+        return None
+
+    sm = max(0.0, min(1.0, scale_smoothing))
+    smoothed_scale: dict[Bone, float] = {}
+    for sb in ordered_src:  # parents-first, so the ancestor is already resolved
+        anc = nearest_matched_ancestor(sb)
+        parent_s = smoothed_scale.get(anc) if anc is not None else None
+        own = raw_scale[sb]
+        if own is None:
+            smoothed_scale[sb] = parent_s if parent_s is not None else 1.0
+        elif parent_s is None:
+            smoothed_scale[sb] = own
+        else:
+            smoothed_scale[sb] = own * (1.0 - sm) + parent_s * sm
+
+    with preserve_context_mode(source_arm, "POSE"):
+        for _ in range(max(1, iterations)):
+            m_ref2src = source_arm.matrix_world.inverted() @ ref_arm.matrix_world
+            any_moved = False
+
+            for src_bone in ordered_src:
+                ref_bone = matched[src_bone]
+                src_pb = source_arm.pose.bones[src_bone.name]
+                ref_pb = ref_arm.pose.bones[ref_bone.name]
+
+                S = src_pb.matrix.copy()
+                T = m_ref2src @ ref_pb.matrix
+
+                head_S = S.translation.copy()
+                head_T = T.translation.copy()
+
+                # --- Translate (head onto target joint) ---
+                new_head = head_S.lerp(head_T, strength) if use_translate else head_S
+
+                # --- Aim: point from new head toward the matched child's target joint ---
+                children = aim_children.get(src_bone, [])
+                child_tgts = [(m_ref2src @ ref_arm.pose.bones[matched[c].name].matrix).translation for c in children]
+
+                if child_tgts:
+                    aim_point = sum(child_tgts, Vector()) / len(child_tgts)
+                    desired_dir = (aim_point - new_head)
+                else:
+                    desired_dir = (T.col[1].xyz)  # reference bone's own direction (its Y axis)
+
+                rot = S.to_3x3()
+                if use_rotate and desired_dir.length > EPS:
+                    cur_dir = S.col[1].xyz
+                    if cur_dir.length > EPS:
+                        q_full = cur_dir.normalized().rotation_difference(desired_dir.normalized())
+                        rot = Quaternion().slerp(q_full, strength).to_matrix() @ rot
+
+                rot_n = rot.to_quaternion().to_matrix()
+
+                # --- Uniform scale: precomputed (rest->target span) and smoothed along the chain
+                # so width follows length without one short bone ballooning relative to its child.
+                s = Vector((smoothed_scale[src_bone],) * 3) if use_scale else S.to_scale()
+
+                # Early-out: already aligned this iteration.
+                head_err = (head_T - head_S).length
+                aim_err = (S.col[1].xyz).angle(desired_dir, 0.0) if desired_dir.length > EPS else 0.0
+                if head_err < tolerance and aim_err < ANGLE_EPS:
+                    continue
+
+                new_S = (Matrix.Translation(new_head)
+                         @ rot_n.to_4x4()
+                         @ Matrix.Diagonal(s.to_4d()))
+                src_pb.matrix = new_S
+                bpy.context.view_layer.update()
+                any_moved = True
+                moved_names.add(src_bone.name)
+
+            if not any_moved:
+                break
+
+    return (len(moved_names), len(ordered_src))
 
 
 def merge_armatures( source_arm: Object, target_arm: Object, match_posture: bool = True, anchor_bone: str = "",

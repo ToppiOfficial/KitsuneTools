@@ -11,7 +11,7 @@ from .op import (
     ops_armature,
     ops_object,
     ops_bone,
-    ops_humanoidmapper,
+    # ops_humanoidmapper,  # HM1 disabled
     ops_humanoidmapper2,
     ops_nodeeditor,
     ops_vertexgroup,
@@ -19,6 +19,7 @@ from .op import (
     ops_action,
 )
 from .utils import (
+    utils_fpa_preview,
     utils_armature,
     utils_contextmanagers,
     utils_panels,
@@ -85,7 +86,7 @@ def draw_select_edit_mesh_menu_items(self, context):
 def draw_object_menu_items(self, context):
     self.layout.separator(type='LINE')
     self.layout.operator(ops_armature.ARMATURE_OT_MergeArmatures.bl_idname)
-    self.layout.operator(ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected.bl_idname)
+    # self.layout.operator(ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected.bl_idname)  # HM1 disabled
 
 def draw_object_apply_menu_items(self, context):
     self.layout.separator()
@@ -221,6 +222,22 @@ class HM2_FingerItem(PropertyGroup):
     generate_ik: BoolProperty(name="Finger Rig", default=True)
 
 
+def _hm2_puppet_arm_poll(self, obj: bpy.types.Object) -> bool:
+    return obj.type == 'ARMATURE'
+
+
+class HM2_PuppetEntry(PropertyGroup):
+    armature: PointerProperty(name="Armature", type=bpy.types.Object, poll=_hm2_puppet_arm_poll)
+    mode: EnumProperty(
+        name="Mode",
+        items=[
+            ('MIMIC', "Mimic", "Copy all deform-bone transforms from master (follows master pose)"),
+            ('SELF',  "Self",  "Own IK controllers; only VS export config synced from master"),
+        ],
+        default='MIMIC',
+    )
+
+
 _HM2_TWIST_MODE_ITEMS = [
     ('FOLLOW',  'Follow',  'Twist rotates in the same direction as the target bone'),
     ('AGAINST', 'Against', 'Twist rotates opposite to the target bone'),
@@ -262,6 +279,16 @@ class KitsuneTool_HM2Properties(PropertyGroup):
     # Fingers
     hm2_fingers:       CollectionProperty(type=HM2_FingerItem)
     hm2_fingers_index: IntProperty(default=-1)
+
+    # Puppet armatures
+    hm2_puppets:       CollectionProperty(type=HM2_PuppetEntry)
+    hm2_puppets_index: IntProperty(default=-1)
+    hm2_is_puppet:     BoolProperty(name="Is Puppet", default=False)
+    hm2_puppet_master: PointerProperty(
+        name="Puppet Master",
+        type=bpy.types.Object,
+        poll=_hm2_puppet_arm_poll,
+    )
 
     # Twist counts
     hm2_twist_shoulder: IntProperty(name="Shoulder Twists", default=3, min=0, max=6)
@@ -308,6 +335,38 @@ class KitsuneTool_HM2Properties(PropertyGroup):
                                default=1.5707963, description="Pole angle for leg IK (radians)")
 
     hm2_json_filepath: StringProperty(name="Optional JSON", subtype='FILE_PATH', default="")
+
+    # First Person Arms
+    fpa_starting_bone_l: StringProperty(name="Starting Bone L")
+    fpa_starting_bone_r: StringProperty(name="Starting Bone R")
+    fpa_rig_type: EnumProperty(
+        name="Rig Type",
+        items=[
+            ('AUTO',  'Auto-Detect',    'Detect whether the armature is an HM2 rig or a plain skeleton'),
+            ('HM2',   'HM2 Rig',        'Treat as an HM2 rig (has IK/finger controllers)'),
+            ('PLAIN', 'Plain Skeleton', 'Treat as a plain deform skeleton (no controllers)'),
+        ],
+        default='AUTO',
+    )
+    fpa_preserve_ik: BoolProperty(
+        name="Preserve IK & Fingers", default=True,
+        description=("HM2 rigs only: keep the arm IK and finger controllers. When off, strip "
+                     "CTRL_/IK_/MCH_/VIS_/FK_ controllers leaving plain FK deform bones "
+                     "(twist bones are kept)"))
+    fpa_weight_threshold: FloatProperty(
+        name="Kept Weight Bias", default=0.5, min=0.0, max=1.0, subtype='FACTOR',
+        description=("A vertex is kept only when the kept bones hold at least this fraction of its "
+                     "total weight. Higher is stricter: e.g. a vertex weighted 0.9 to the shoulder "
+                     "and 0.1 to the kept upper arm is dropped at 0.5"))
+    fpa_use_bisect: BoolProperty(
+        name="Bisect Seam", default=True,
+        description=("After vertex-group culling, slice the mesh with a plane through the starting "
+                     "bones for a clean straight cut edge"))
+    fpa_bisect_axis: EnumProperty(
+        name="Bisect Axis",
+        items=[('X', 'World X', ''), ('Y', 'World Y', ''), ('Z', 'World Z', '')],
+        default='Z')
+    fpa_bisect_offset: FloatProperty(name="Bisect Offset", default=0.0, subtype='DISTANCE')
 
 
 class Humanoidmapper(PropertyGroup):
@@ -422,6 +481,7 @@ _classes = (
     BakeNodeItem,
     Humanoidmapper,
     HM2_FingerItem,
+    HM2_PuppetEntry,
     KitsuneTool_HM2Properties,
 
     KitsuneTool_SceneProperties,
@@ -430,8 +490,9 @@ _classes = (
     KitsuneTool_ArmatureProperties,
 
     # List
-    panels_view3d.HUMANOIDMAPPER_UL_ConfigList,
+    # panels_view3d.HUMANOIDMAPPER_UL_ConfigList,  # HM1 disabled
     panels_humanoidmapper2.HM2_UL_FingerList,
+    panels_humanoidmapper2.HM2_UL_PuppetList,
 
     # MENU
     panels_view3d.TOOLS_MT_KitsuneTool_PoseBoneTools,
@@ -441,7 +502,8 @@ _classes = (
     panels_view3d.TOOLS_PT_KitsuneTool_Bone,
     panels_view3d.TOOLS_PT_KitsuneTool_VertexGroup,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HumanoidMapping,
-    panels_view3d.TOOLS_PT_KitsuneTool_Humanoidmapper,
+    # panels_view3d.TOOLS_PT_KitsuneTool_Humanoidmapper,  # HM1 disabled
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_FirstPersonArms,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Core,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Arms,
@@ -450,8 +512,9 @@ _classes = (
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Twist,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_IK,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Export,
+    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Puppets,
     panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Actions,
-    
+
     panels_nodeeditor.NODE_UL_nodes_to_bake,
     panels_nodeeditor.NODE_UL_material_list,
     panels_nodeeditor.NODE_PT_KitsuneTool_NodeBaker,
@@ -460,6 +523,7 @@ _classes = (
     ops_armature.ARMATURE_OT_ApplyPoseAsRestPose,
     ops_armature.ARMATURE_OT_ApplyPoseAsShapekey,
     ops_armature.ARMATURE_OT_CopyVisPosture,
+    ops_armature.ARMATURE_OT_FitPoseToActive,
     ops_armature.ARMATURE_OT_MergeArmatures,
     ops_armature.ARMATURE_OT_CleanUnWeightedBones,
     ops_armature.ARMATURE_OT_TransferBoneData,
@@ -518,13 +582,13 @@ _classes = (
     ops_nodeeditor.NODE_OT_node_bake_copy,
     ops_nodeeditor.NODE_OT_node_bake_paste,
 
-    ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected,
-    ops_humanoidmapper.HUMANOIDMAPPER_OT_LoadPreset,
-    ops_humanoidmapper.HUMANOIDMAPPER_OT_LoadConfig,
-    ops_humanoidmapper.HUMANOIDMAPPER_OT_RemoveItem,
-    ops_humanoidmapper.HUMANOIDMAPPER_OT_AddItem,
-    ops_humanoidmapper.HUMANOIDMAPPER_OT_MirrorBoneNames,
-    ops_humanoidmapper.HUMANOIDMAPPER_OT_WriteConfig,
+    # ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected,  # HM1 disabled
+    # ops_humanoidmapper.HUMANOIDMAPPER_OT_LoadPreset,
+    # ops_humanoidmapper.HUMANOIDMAPPER_OT_LoadConfig,
+    # ops_humanoidmapper.HUMANOIDMAPPER_OT_RemoveItem,
+    # ops_humanoidmapper.HUMANOIDMAPPER_OT_AddItem,
+    # ops_humanoidmapper.HUMANOIDMAPPER_OT_MirrorBoneNames,
+    # ops_humanoidmapper.HUMANOIDMAPPER_OT_WriteConfig,
 
     ops_humanoidmapper2.HM2_OT_AddFinger,
     ops_humanoidmapper2.HM2_OT_RemoveFinger,
@@ -534,6 +598,12 @@ _classes = (
     ops_humanoidmapper2.HM2_OT_ValidateMapping,
     ops_humanoidmapper2.HM2_OT_Process,
     ops_humanoidmapper2.HM2_OT_JsonFormatHelp,
+    ops_humanoidmapper2.HM2_OT_AddPuppet,
+    ops_humanoidmapper2.HM2_OT_RemovePuppet,
+    ops_humanoidmapper2.HM2_OT_ProcessPuppet,
+    ops_humanoidmapper2.HM2_OT_DisconnectPuppet,
+    ops_humanoidmapper2.HM2_OT_SyncPuppetExportConfig,
+    ops_humanoidmapper2.HM2_OT_FirstPersonArms,
 )
 
 def register():
@@ -565,6 +635,7 @@ def register():
     utils_contextmanagers.register_keymap('Window', 'EMPTY', 'wm.call_menu', 'P', ctrl=True, shift=True, properties={'name': panels_view3d.TOOLS_MT_KitsuneTool_PoseBoneTools.bl_idname})
 
 def unregister():
+    utils_fpa_preview.unregister_preview()
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 

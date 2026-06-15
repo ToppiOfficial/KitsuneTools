@@ -12,6 +12,7 @@ from ..op.ops_armature import (
     ARMATURE_OT_ApplyPoseAsShapekey, 
     ARMATURE_OT_MergeArmatures,
     ARMATURE_OT_CopyVisPosture,
+    ARMATURE_OT_FitPoseToActive,
     ARMATURE_OT_CleanUnWeightedBones,
     ARMATURE_OT_TransferBoneData
 )
@@ -140,6 +141,7 @@ class TOOLS_PT_KitsuneTool_Armature(TOOLS_PT_KitsuneTool_Panel):
         col.operator(ARMATURE_OT_CopyVisPosture.bl_idname, icon='POSE_HLT', text=f'{ARMATURE_OT_CopyVisPosture.bl_label} (LOCATION)').copy_type = 'ORIGIN'
         col.operator(ARMATURE_OT_CopyVisPosture.bl_idname, icon='POSE_HLT', text=f'{ARMATURE_OT_CopyVisPosture.bl_label} (ROTATION)').copy_type = 'ANGLES'
         col.operator(ARMATURE_OT_CopyVisPosture.bl_idname, icon='POSE_HLT', text=f'{ARMATURE_OT_CopyVisPosture.bl_label} (SCALE)').copy_type = 'SCALE'
+        col.operator(ARMATURE_OT_FitPoseToActive.bl_idname, icon='CON_ARMATURE', text='Fit Pose to Active')
 
 
 class TOOLS_PT_KitsuneTool_Bone(TOOLS_PT_KitsuneTool_Panel):
