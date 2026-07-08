@@ -253,6 +253,18 @@ class KitsuneTool_HM2Properties(PropertyGroup):
     hm2_map_eye_l: StringProperty(name="Eye L")
     hm2_map_eye_r: StringProperty(name="Eye R")
 
+    # Rig mode
+    hm2_first_person_mode: BoolProperty(
+        name="First Person Mode",
+        default=False,
+        description=(
+            "Build an arms-only rig: only Shoulder, Elbow and Hand are required "
+            "(Scapula optional). Legs, hips, spine, neck, head and eyes are ignored. "
+            "If no Root is assigned, one is generated at the average of the shoulder "
+            "(or scapula) positions and given the standard root control shape"
+        ),
+    )
+
     # Arms
     hm2_map_scapula_l:  StringProperty(name="Scapula L")
     hm2_map_scapula_r:  StringProperty(name="Scapula R")

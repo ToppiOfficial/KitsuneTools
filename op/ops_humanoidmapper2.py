@@ -665,6 +665,8 @@ class HM2_OT_Process(Operator):
             eb.use_connect = False
 
         self._rename_core_bones(arm, hm2)
+        if hm2.hm2_first_person_mode:
+            self._ensure_first_person_root(arm, hm2)
         self._setup_spine(arm, hm2)
         self._rename_fingers(arm, hm2)
         self._connect_chains(arm, hm2)
@@ -672,6 +674,7 @@ class HM2_OT_Process(Operator):
 
         bpy.ops.object.mode_set(mode='EDIT')
         self._align_bone_rolls(arm, hm2)
+        self._realign_finger_bones(arm, hm2)
         self._create_all_twist_bones(arm, hm2)
         self._create_ik_bones(arm, hm2)
 
@@ -829,6 +832,55 @@ class HM2_OT_Process(Operator):
                 last_parent = new_bone
             if chest_eb and last_parent:
                 chest_eb.parent = last_parent
+
+    def _ensure_first_person_root(self, arm: Object, hm2) -> None:
+        """First person mode: guarantee an 'M_Root' control and parent the arms to it.
+
+        Must run in EDIT mode, after _rename_core_bones. If no Root was mapped, a new
+        M_Root is created at the average of the shoulder (or scapula, when scapula bones
+        are mapped) head positions. The top-of-arm bones (scapula if present, else
+        shoulder) are then parented to M_Root so the whole arm assembly follows it -
+        there is no spine/chest to hang them from in an arms-only rig."""
+        eb = arm.data.edit_bones
+
+        # Top-of-arm bone per side: scapula when present, else shoulder.
+        top_names = []
+        for side in ('L', 'R'):
+            top = eb.get(f'{side}_Scapula') or eb.get(f'{side}_Shoulder')
+            if top:
+                top_names.append(top.name)
+        if not top_names:
+            return
+
+        # Averaging anchors: scapula heads if any scapula is mapped, else shoulder heads.
+        use_scap = any(eb.get(f'{s}_Scapula') for s in ('L', 'R'))
+        anchor_names = []
+        for side in ('L', 'R'):
+            b = eb.get(f'{side}_Scapula') if use_scap else eb.get(f'{side}_Shoulder')
+            if b:
+                anchor_names.append(b.name)
+        if not anchor_names:
+            anchor_names = top_names
+
+        heads = [eb[n].head.copy() for n in anchor_names]
+        center = sum(heads, Vector()) / len(heads)
+
+        root_eb = eb.get('M_Root')
+        if root_eb is None:
+            # Length from L/R separation (or the anchor bone length for a single arm).
+            span = (heads[0] - heads[-1]).length if len(heads) >= 2 else eb[anchor_names[0]].length
+            length = max(span * 0.5, 1e-3)
+            root_eb = eb.new('M_Root')
+            root_eb.head = center
+            root_eb.tail = center + Vector((0.0, 0.0, length))
+            root_eb.use_connect = False
+
+        # Parent the arm roots to M_Root so they move with the first-person root.
+        for n in top_names:
+            b = eb.get(n)
+            if b and b is not root_eb:
+                b.use_connect = False
+                b.parent = root_eb
 
     def _rename_fingers(self, arm: Object, hm2) -> None:
         eb = arm.data.edit_bones
@@ -1129,10 +1181,37 @@ class HM2_OT_Process(Operator):
         if root_eb:
             root_eb.align_roll(Vector((0, -1, 0)))
 
-        for scap_n in ('L_Scapula', 'R_Scapula'):
-            scap_eb = eb.get(scap_n)
-            if scap_eb:
-                scap_eb.align_roll(Vector((0, 0, 1)))
+        for name in ('L_Scapula', 'R_Scapula'):
+            b = eb.get(name)
+            if b:
+                b.align_roll(Vector((0, 0, 1)))
+
+    def _realign_finger_bones(self, arm: Object, hm2) -> None:
+        """Snap every finger joint's tail onto the next joint's head so the
+        chain is contiguous with no kinks. The outermost tip joint is left
+        untouched (nothing points past it), and bone roll is preserved - only
+        head/tail positions change. Runs in edit mode."""
+        eb = arm.data.edit_bones
+        _ftype_map = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
+                      'RING': 'Ring', 'PINKY': 'Pinky'}
+        for finger in hm2.hm2_fingers:
+            base      = _ftype_map.get(finger.finger_type, finger.finger_type)
+            side      = finger.side
+            start_idx = 0 if finger.finger_type == 'THUMB' else 1
+            # Ordered joint chain; the last entry is the outermost tip (skipped).
+            joints = [eb.get(f"{side}_{base}Finger{start_idx + i}")
+                      for i in range(finger.joint_count)]
+            for i in range(len(joints) - 1):
+                cur, nxt = joints[i], joints[i + 1]
+                if not (cur and nxt):
+                    continue
+                new_tail = nxt.head.copy()
+                # Skip if it would collapse the bone to zero length.
+                if (new_tail - cur.head).length <= 1e-4:
+                    continue
+                saved_roll = cur.roll
+                cur.tail = new_tail
+                cur.roll = saved_roll  # realign position only, keep roll
 
     def _create_all_twist_bones(self, arm: Object, hm2) -> None:
         self._twist_bone_names = {}
@@ -1150,6 +1229,53 @@ class HM2_OT_Process(Operator):
             names = create_twist_bones(arm, bone_name, count)
             if names:
                 self._twist_bone_names[bone_name] = names
+
+        self._reparent_children_to_twist(arm, hm2)
+
+    def _reparent_children_to_twist(self, arm: Object, hm2) -> None:
+        """Re-parent user bones that hang off a twisting joint onto whichever
+        twist segment sits closest to them.
+
+        For every joint that received twist bones, each of its direct children
+        that is a user bone (not an HM2-managed deform bone, twist bone, or
+        HM2-added control bone) is projected onto the joint's head->tail axis.
+        The projection parameter selects the twist segment covering that spot,
+        so accessory bones (cloth, muscle, jiggle, ...) follow the twist that
+        matches their position instead of the whole joint. Runs in edit mode.
+        """
+        eb = arm.data.edit_bones
+        managed = self._hm2_managed_bone_names(arm, hm2)
+        # arm.data.bones is stale in edit mode, so the just-created twist bones
+        # are not yet caught by _hm2_managed_bone_names' regex - exclude them
+        # explicitly using the names we just recorded.
+        all_twist = {n for names in self._twist_bone_names.values() for n in names}
+
+        def is_user_bone(name: str) -> bool:
+            if name in managed or name in all_twist:
+                return False
+            return not any(name.startswith(p) for p in self._ADDED_PREFIXES)
+
+        for joint_name, twist_names in self._twist_bone_names.items():
+            joint = eb.get(joint_name)
+            if not joint or not twist_names:
+                continue
+
+            axis = joint.tail - joint.head
+            len_sq = axis.length_squared
+            count = len(twist_names)
+
+            # Snapshot children first: reassigning .parent mutates the collection.
+            children = [c for c in joint.children if is_user_bone(c.name)]
+            for child in children:
+                if len_sq > 0.0:
+                    t = (child.head - joint.head).dot(axis) / len_sq
+                else:
+                    t = 0.0
+                idx = min(count - 1, max(0, int(t * count)))
+                new_parent = eb.get(twist_names[idx])
+                if new_parent and child.parent is not new_parent:
+                    child.parent = new_parent
+                    child.use_connect = False
 
     def _create_ik_bones(self, arm: Object, hm2) -> None:
         eb = arm.data.edit_bones
@@ -2069,6 +2195,7 @@ class HM2_OT_Process(Operator):
             if loc_str:
                 try:
                     x, y, z = (float(v) for v in loc_str.split())
+                    setattr(vs, 'ignore_location_offset', False)
                     setattr(vs, 'export_location_offset_x', x)
                     setattr(vs, 'export_location_offset_y', y)
                     setattr(vs, 'export_location_offset_z', z)
@@ -2137,7 +2264,21 @@ class HM2_OT_Process(Operator):
                 dir_r = entry.get('dir_r', 'R_')
                 start = entry.get('starting_count', 1)
                 ignore_zero = entry.get('ignore_zero', False)
-                for side, dir_str in (('L', dir_l), ('R', dir_r)):
+
+                rot_l = entry.get('exportrot_l', '') or entry.get('exportrot', '')
+                rot_r = entry.get('exportrot_r', '') or entry.get('exportrot', '')
+                loc_l = entry.get('exportloc_l', '') or entry.get('exportloc', '')
+                loc_r = entry.get('exportloc_r', '') or entry.get('exportloc', '')
+                if rot_l and not rot_r:
+                    rot_r = rot_l
+                elif rot_r and not rot_l:
+                    rot_l = rot_r
+                if loc_l and not loc_r:
+                    loc_r = loc_l
+                elif loc_r and not loc_l:
+                    loc_l = loc_r
+
+                for side, dir_str, rot_str, loc_str in (('L', dir_l, rot_l, loc_l), ('R', dir_r, rot_r, loc_r)):
                     for i in range(10):
                         joint_name = f"{side}_{base}Finger{joint_start + i}"
                         if not pb.get(joint_name):
@@ -2146,7 +2287,7 @@ class HM2_OT_Process(Operator):
                         num_str = '' if (ignore_zero and num == 0) else str(num)
                         _apply(joint_name,
                             name_pat.replace('{dir}', dir_str).replace('{*}', num_str),
-                            entry)
+                            entry, rot_str=rot_str, loc_str=loc_str)
 
     def _unlock_all_bones(self, arm: Object) -> None:
         for pb in arm.pose.bones:
@@ -2424,6 +2565,7 @@ class HM2_OT_Process(Operator):
 
         # Sync core settings from master.
         puppet_hm2.hm2_legacy_roll = master_hm2.hm2_legacy_roll
+        puppet_hm2.hm2_first_person_mode = master_hm2.hm2_first_person_mode
         for attr in ('hm2_twist_shoulder', 'hm2_twist_elbow',
                      'hm2_twist_hip', 'hm2_twist_knee'):
             setattr(puppet_hm2, attr, getattr(master_hm2, attr))
@@ -2456,6 +2598,8 @@ class HM2_OT_Process(Operator):
             eb.use_connect = False
 
         self._rename_core_bones(puppet_obj, puppet_hm2)
+        if puppet_hm2.hm2_first_person_mode:
+            self._ensure_first_person_root(puppet_obj, puppet_hm2)
         self._setup_spine(puppet_obj, puppet_hm2)
         self._rename_fingers(puppet_obj, puppet_hm2)
         self._connect_chains(puppet_obj, puppet_hm2)

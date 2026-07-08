@@ -626,46 +626,75 @@ def hm2_validate_mapping(arm: Object, hm2) -> list[str]:
     errors = []
     bones = arm.data.bones
 
-    required = {
-        'Root': hm2.hm2_map_root,
-        'Chest': hm2.hm2_map_chest,
-        'Neck': hm2.hm2_map_neck,
-        'Head': hm2.hm2_map_head,
-    }
-    for label, val in required.items():
-        if not val:
-            errors.append(f"Required: {label} is not assigned")
-        elif val not in bones:
-            errors.append(f"Required: {label} bone '{val}' not found in armature")
-
-    if hm2.hm2_spine_count < 1:
-        errors.append("Spine Count must be at least 1")
+    first_person = getattr(hm2, 'hm2_first_person_mode', False)
 
     chain_checks = []
-    if hm2.hm2_map_root and hm2.hm2_map_chest:
-        chain_checks.append((hm2.hm2_map_root, hm2.hm2_map_chest, "Root → Chest"))
-    if hm2.hm2_map_chest and hm2.hm2_map_head:
-        chain_checks.append((hm2.hm2_map_chest, hm2.hm2_map_head, "Chest → Head"))
 
-    for side, attrs in [
-        ('L', ('hm2_map_hip_l', 'hm2_map_knee_l', 'hm2_map_ankle_l')),
-        ('R', ('hm2_map_hip_r', 'hm2_map_knee_r', 'hm2_map_ankle_r')),
-    ]:
-        hip, knee, ankle = (getattr(hm2, a) for a in attrs)
-        if hip and knee:
-            chain_checks.append((hip, knee, f"{side} Hip → Knee"))
-        if knee and ankle:
-            chain_checks.append((knee, ankle, f"{side} Knee → Ankle"))
+    if first_person:
+        # First person: arms only. Each side that has any arm bone assigned must
+        # have Shoulder, Elbow and Hand all set; at least one full arm is required.
+        # Root is optional (generated if absent). Legs/spine/neck/head are ignored.
+        complete_sides = 0
+        for side, attrs in [
+            ('L', ('hm2_map_shoulder_l', 'hm2_map_elbow_l', 'hm2_map_hand_l')),
+            ('R', ('hm2_map_shoulder_r', 'hm2_map_elbow_r', 'hm2_map_hand_r')),
+        ]:
+            shoulder, elbow, hand = (getattr(hm2, a) for a in attrs)
+            if not (shoulder or elbow or hand):
+                continue
+            for label, val in (('Shoulder', shoulder), ('Elbow', elbow), ('Hand', hand)):
+                if not val:
+                    errors.append(f"Required: {side} {label} is not assigned")
+                elif val not in bones:
+                    errors.append(f"Required: {side} {label} bone '{val}' not found in armature")
+            if shoulder and elbow:
+                chain_checks.append((shoulder, elbow, f"{side} Shoulder → Elbow"))
+            if elbow and hand:
+                chain_checks.append((elbow, hand, f"{side} Elbow → Hand"))
+            if shoulder and elbow and hand:
+                complete_sides += 1
+        if complete_sides == 0:
+            errors.append("First Person mode requires at least one full arm (Shoulder, Elbow, Hand)")
+    else:
+        required = {
+            'Root': hm2.hm2_map_root,
+            'Chest': hm2.hm2_map_chest,
+            'Neck': hm2.hm2_map_neck,
+            'Head': hm2.hm2_map_head,
+        }
+        for label, val in required.items():
+            if not val:
+                errors.append(f"Required: {label} is not assigned")
+            elif val not in bones:
+                errors.append(f"Required: {label} bone '{val}' not found in armature")
 
-    for side, attrs in [
-        ('L', ('hm2_map_shoulder_l', 'hm2_map_elbow_l', 'hm2_map_hand_l')),
-        ('R', ('hm2_map_shoulder_r', 'hm2_map_elbow_r', 'hm2_map_hand_r')),
-    ]:
-        shoulder, elbow, hand = (getattr(hm2, a) for a in attrs)
-        if shoulder and elbow:
-            chain_checks.append((shoulder, elbow, f"{side} Shoulder → Elbow"))
-        if elbow and hand:
-            chain_checks.append((elbow, hand, f"{side} Elbow → Hand"))
+        if hm2.hm2_spine_count < 1:
+            errors.append("Spine Count must be at least 1")
+
+        if hm2.hm2_map_root and hm2.hm2_map_chest:
+            chain_checks.append((hm2.hm2_map_root, hm2.hm2_map_chest, "Root → Chest"))
+        if hm2.hm2_map_chest and hm2.hm2_map_head:
+            chain_checks.append((hm2.hm2_map_chest, hm2.hm2_map_head, "Chest → Head"))
+
+        for side, attrs in [
+            ('L', ('hm2_map_hip_l', 'hm2_map_knee_l', 'hm2_map_ankle_l')),
+            ('R', ('hm2_map_hip_r', 'hm2_map_knee_r', 'hm2_map_ankle_r')),
+        ]:
+            hip, knee, ankle = (getattr(hm2, a) for a in attrs)
+            if hip and knee:
+                chain_checks.append((hip, knee, f"{side} Hip → Knee"))
+            if knee and ankle:
+                chain_checks.append((knee, ankle, f"{side} Knee → Ankle"))
+
+        for side, attrs in [
+            ('L', ('hm2_map_shoulder_l', 'hm2_map_elbow_l', 'hm2_map_hand_l')),
+            ('R', ('hm2_map_shoulder_r', 'hm2_map_elbow_r', 'hm2_map_hand_r')),
+        ]:
+            shoulder, elbow, hand = (getattr(hm2, a) for a in attrs)
+            if shoulder and elbow:
+                chain_checks.append((shoulder, elbow, f"{side} Shoulder → Elbow"))
+            if elbow and hand:
+                chain_checks.append((elbow, hand, f"{side} Elbow → Hand"))
 
     for start, end, label in chain_checks:
         if start in bones and end in bones:

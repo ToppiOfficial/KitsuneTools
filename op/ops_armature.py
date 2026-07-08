@@ -20,21 +20,52 @@ class _apply_pose:
             
             for armature in armatures:
                 try:
+                    if not is_armature(armature): continue
+
                     if self.selected_only:
                         selected_bones = get_selected_bones(armature=armature, bone_type='POSEBONE')
-                        selected_names = {pb.name for pb in selected_bones}
+                        kept = {pb.name for pb in selected_bones if pb}
 
-                        # Expand: include bones whose constraints target a selected bone
-                        for posebone in armature.pose.bones:
-                            if posebone.name in selected_names: continue
-                            for constraint in posebone.constraints:
-                                target_bone = getattr(constraint, 'subtarget', None)
-                                if target_bone and target_bone in selected_names:
-                                    selected_names.add(posebone.name)
-                                    break
+                        # A selected bone's final pose can depend on other bones through
+                        # constraint targets or drivers. Those dependency bones must stay
+                        # posed for the selected bones to evaluate correctly, so treat them
+                        # as selected even though the user did not select them.
+                        pose_bones = armature.pose.bones
 
-                        for posebone in armature.pose.bones:
-                            if posebone.name in selected_names: continue
+                        # Map each driven bone -> the bones its drivers read from.
+                        driver_deps : dict[str, set[str]] = {}
+                        anim = armature.animation_data
+                        if anim and anim.drivers:
+                            path_re = re.compile(r'pose\.bones\["([^"]+)"\]')
+                            for fc in anim.drivers:
+                                match = path_re.match(fc.data_path or "")
+                                if not match: continue
+                                srcs = driver_deps.setdefault(match.group(1), set())
+                                for var in fc.driver.variables:
+                                    for tgt in var.targets:
+                                        if tgt.id == armature and getattr(tgt, 'bone_target', ""):
+                                            srcs.add(tgt.bone_target)
+
+                        # Transitively pull in every dependency of the kept bones.
+                        frontier = list(kept)
+                        while frontier:
+                            pbone = pose_bones.get(frontier.pop())
+                            if pbone is None: continue
+
+                            for constraint in pbone.constraints:
+                                for tgt_attr, sub_attr in (('target', 'subtarget'), ('pole_target', 'pole_subtarget')):
+                                    sub = getattr(constraint, sub_attr, "")
+                                    if getattr(constraint, tgt_attr, None) == armature and sub and sub not in kept and sub in pose_bones:
+                                        kept.add(sub)
+                                        frontier.append(sub)
+
+                            for src in driver_deps.get(pbone.name, ()):
+                                if src not in kept and src in pose_bones:
+                                    kept.add(src)
+                                    frontier.append(src)
+
+                        for posebone in pose_bones:
+                            if posebone.name in kept: continue
                             posebone.matrix_basis.identity()
 
                     if as_shapekey:

@@ -110,6 +110,16 @@ class TOOLS_PT_KitsuneTool_HM2_Core(_HM2PanelBase):
         arm = context.active_object
         hm2 = arm.kitsunetools.hm2
 
+        layout.prop(hm2, 'hm2_first_person_mode', icon='VIEW_CAMERA')
+
+        if hm2.hm2_first_person_mode:
+            col = layout.column(align=True)
+            col.label(text="Arms-only rig. Assign arms below.", icon='INFO')
+            col.separator()
+            col.label(text="Optional:")
+            _draw_bone_single(col, hm2, 'hm2_map_root', 'Root (auto if empty)', arm)
+            return
+
         col = layout.column(align=True)
         col.label(text="Required:", icon='ERROR')
         _draw_bone_single(col, hm2, 'hm2_map_root',  'Root',  arm)
@@ -136,6 +146,8 @@ class TOOLS_PT_KitsuneTool_HM2_Arms(_HM2PanelBase):
         arm = context.active_object
         hm2 = arm.kitsunetools.hm2
         col = layout.column(align=True)
+        if hm2.hm2_first_person_mode:
+            col.label(text="Required (Scapula optional):", icon='ERROR')
         _draw_bone_pair(col, hm2, 'hm2_map_scapula_l',  'hm2_map_scapula_r',  'Scapula',  arm)
         _draw_bone_pair(col, hm2, 'hm2_map_shoulder_l', 'hm2_map_shoulder_r', 'Shoulder', arm)
         _draw_bone_pair(col, hm2, 'hm2_map_elbow_l',    'hm2_map_elbow_r',    'Elbow',    arm)
@@ -153,6 +165,9 @@ class TOOLS_PT_KitsuneTool_HM2_Legs(_HM2PanelBase):
         layout = self.layout
         arm = context.active_object
         hm2 = arm.kitsunetools.hm2
+        if hm2.hm2_first_person_mode:
+            layout.label(text="Ignored in First Person mode", icon='INFO')
+            return
         col = layout.column(align=True)
         _draw_bone_pair(col, hm2, 'hm2_map_hip_l',   'hm2_map_hip_r',   'Hip',   arm)
         _draw_bone_pair(col, hm2, 'hm2_map_knee_l',  'hm2_map_knee_r',  'Knee',  arm)

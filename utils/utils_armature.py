@@ -238,41 +238,43 @@ def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "
         if not meshes: return
         
         success_count = 0
+
+        # Evaluate constraints/drivers/parenting before measuring what actually moved.
+        bpy.context.view_layer.update()
+
+        # A bone counts as "posed" when its evaluated pose matrix differs from its rest
+        # matrix. Using the evaluated matrix (not matrix_basis) catches bones moved only by
+        # a constraint, and children that inherit motion from a driven/constrained parent -
+        # neither of which touches matrix_basis.
+        identity = Matrix.Identity(4)
         posebones = set()
-
         for pbone in armature.pose.bones:
-            diff_matrix = pbone.matrix_basis - Matrix.Identity(4)
-            total_diff = sum(abs(val) for row in diff_matrix for val in row)
-            if total_diff > 1e-4:
+            delta = pbone.bone.matrix_local.inverted_safe() @ pbone.matrix
+            if sum(abs(val) for row in (delta - identity) for val in row) > 1e-4:
                 posebones.add(pbone.name)
 
-        for pbone in armature.pose.bones:
-            if any(p.name in posebones for p in pbone.parent_recursive):
-                posebones.add(pbone.name)
-
-        bpy.context.view_layer.update() 
         bpy.ops.object.select_all(action='DESELECT')
 
         for mesh in meshes:
             arm_mod = next((mod for mod in mesh.modifiers if mod.type == 'ARMATURE' and mod.object == armature), None)
             
             if not arm_mod:
-                report('WARNING', "Mesh {mesh.name} has no Armature modifier for {armature.name}")
+                report('WARNING', f"Mesh {mesh.name} has no Armature modifier for {armature.name}")
                 continue
             
-            original_shapekey_values = {}
             used_vgroup_names = get_used_vertexgroups(mesh, return_names=True)
-            
+
+            # If none of the posed bones weight this mesh it cannot deform, so skip it
+            # entirely instead of applying the modifier and adding an empty shapekey.
+            if posebones.isdisjoint(used_vgroup_names):
+                continue
+
+            original_shapekey_values = {}
             if mesh.data.shape_keys and mesh.data.shape_keys.key_blocks:
                 for sk in mesh.data.shape_keys.key_blocks:
                     original_shapekey_values[sk.name] = sk.value
                     sk.value = 0
 
-            print(f"=== {mesh.name} ===")
-            print(f"posebones: {posebones}")
-            print(f"used_vgroup_names: {used_vgroup_names}")
-            print(f"isdisjoint: {posebones.isdisjoint(used_vgroup_names)}")
-            
             try:
                 mesh.select_set(True)
                 context_override = {'object': mesh, 'active_object': mesh, 'selected_objects': [mesh]}
