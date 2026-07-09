@@ -18,6 +18,7 @@ def get_bone_exportname(bone: Bone | PoseBone | None, for_write=False) -> str:
     _EXPORTNAME_MODULES = (
         "...kitsune_source_tools.utils",
         "...io_scene_valvesource.utils",
+        "...pulse_src_ops.utils",
     )
 
     if is_addon_enabled("kitsune_source_tools"):
