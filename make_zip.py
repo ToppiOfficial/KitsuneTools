@@ -7,7 +7,8 @@ EXTRA_IGNORE = [
     "pyrightconfig.json",
     "*.md",
     "download_pillow.py",
-    ".git"
+    ".git",
+    ".github"
 ]
 
 def load_gitignore_patterns(base_dir: str) -> list:

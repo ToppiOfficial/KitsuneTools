@@ -433,6 +433,122 @@ class MESH_OT_Select_Faces_by_ImageMask(Operator, faces_by_imagemask):
         return {'FINISHED'}
     
 
+class MESH_OT_SelectLinkedMergeDistance(Operator):
+    # Uses the "mesh." namespace (not "kitsunetools.") so Blender's WM_keymap_guess_opname
+    # maps it to the Mesh keymap, which makes the right-click "Assign Shortcut" option appear.
+    bl_idname = "mesh.select_linked_merge_distance"
+    bl_label = "Select Linked All (Merge Distance)"
+    bl_description = (
+        "Select all geometry linked to the current selection, exactly like Select Linked All, "
+        "but also treats vertices close enough to be merged as if they were linked. "
+        "Useful for selecting across coincident but disconnected geometry without actually merging vertices"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    delimit: EnumProperty(
+        name="Delimit",
+        description="Delimit selected regions",
+        options={'ENUM_FLAG'},
+        items=[
+            ('NORMAL', "Normal", "Delimit by face directions"),
+            ('MATERIAL', "Material", "Delimit by material"),
+            ('SEAM', "Seam", "Delimit by edge seams"),
+            ('SHARP', "Sharp", "Delimit by sharp edges"),
+            ('UV', "UVs", "Delimit by UV coordinates"),
+        ],
+        default={'SEAM'},
+    )
+
+    merge_distance: FloatProperty(
+        name="Merge Distance",
+        description="Vertices closer together than this world-space distance are treated as linked",
+        default=0.0001,
+        min=0.0,
+        soft_max=0.1,
+        precision=6,
+        subtype='DISTANCE',
+    )
+
+    @classmethod
+    def poll(cls, context : Context) -> bool:
+        return context.mode == 'EDIT_MESH' and is_mesh(context.active_object)
+
+    def execute(self, context) -> set:
+        objects = [ob for ob in context.objects_in_mode if ob.type == 'MESH']
+        if not objects:
+            objects = [context.edit_object]
+
+        # Bridging selects individual vertices, so we must run in vertex select mode:
+        # in edge/face mode a lone selected vertex marks no edge/face as selected, and
+        # the next select_linked pass would ignore it. Restore the user's mode afterward.
+        original_select_mode = tuple(context.tool_settings.mesh_select_mode)
+        context.tool_settings.mesh_select_mode = (True, False, False)
+
+        try:
+            # Precompute, per object, the map of each vertex to its coincident neighbours.
+            # Coordinates are taken in world space so the threshold matches scene units and
+            # is unaffected by object scale. Geometry never changes here (only selection
+            # flags), so vertex indices stay stable across the loop below.
+            object_data = []
+            for ob in objects:
+                bm = bmesh.from_edit_mesh(ob.data)
+                bm.verts.ensure_lookup_table()
+
+                mw = ob.matrix_world
+                world_co = [mw @ v.co for v in bm.verts]
+
+                kd = mathutils.kdtree.KDTree(len(world_co))
+                for i, co in enumerate(world_co):
+                    kd.insert(co, i)
+                kd.balance()
+
+                coincident = collections.defaultdict(set)
+                for i, co in enumerate(world_co):
+                    for (_co, idx, _dist) in kd.find_range(co, self.merge_distance):
+                        if idx != i:
+                            coincident[i].add(idx)
+
+                object_data.append((ob, coincident))
+
+            bridged_total = 0
+
+            # Alternate between Blender's own linked-flood and bridging coincident vertices
+            # until the selection stops growing.
+            for _ in range(10000):
+                bpy.ops.mesh.select_linked(delimit=self.delimit)
+
+                changed = False
+                for ob, coincident in object_data:
+                    if not coincident:
+                        continue
+
+                    bm = bmesh.from_edit_mesh(ob.data)
+                    bm.verts.ensure_lookup_table()
+
+                    to_select = set()
+                    for i, v in enumerate(bm.verts):
+                        if v.select:
+                            for j in coincident.get(i, ()):
+                                if not bm.verts[j].select:
+                                    to_select.add(j)
+
+                    if to_select:
+                        for j in to_select:
+                            bm.verts[j].select_set(True)
+                        bm.select_flush(True)
+                        bmesh.update_edit_mesh(ob.data)
+                        bridged_total += len(to_select)
+                        changed = True
+
+                if not changed:
+                    break
+        finally:
+            context.tool_settings.mesh_select_mode = original_select_mode
+
+        self.report({'INFO'}, f"Bridged {bridged_total} coincident vertices")
+        return {'FINISHED'}
+
+
 class MESH_OT_transfer_topology_shapekeys(bpy.types.Operator):
     bl_idname = "kitsunetools.transfer_topology_shapekeys"
     bl_label = "Transfer Topology Shape Keys"
@@ -691,8 +807,13 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
             layout.prop(self, "add_mirror_mod")
             if self.bone_name:
                 mirror = _find_mirror_bone_name(self.bone_name)
-                if mirror:
+                valid = mirror is not None
+                if valid and armature_obj:
+                    valid = mirror in armature_obj.data.bones
+                if valid:
                     layout.label(text=f"Mirror VG: {mirror}", icon='BONE_DATA')
+                else:
+                    layout.label(text="No valid mirror bone (non-mirror)", icon='INFO')
 
     @classmethod
     def poll(cls, context):
@@ -774,12 +895,20 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
                 vg.lock_weight = True
 
                 mirror_bone = _find_mirror_bone_name(self.bone_name)
-                if mirror_bone:
+                # Only treat as a mirror setup when a valid opposite bone exists.
+                # If an armature is present the mirror bone must actually exist in it;
+                # otherwise fall back to the name-based match. When invalid, this is
+                # processed as a non-mirror mesh (no mirror vertex group / modifier).
+                has_valid_mirror = mirror_bone is not None
+                if has_valid_mirror and armature_obj:
+                    has_valid_mirror = mirror_bone in armature_obj.data.bones
+
+                if has_valid_mirror:
                     vg_mirror = new_obj.vertex_groups.new(name=mirror_bone)
                     vg_mirror.lock_weight = True
 
                 if armature_obj:
-                    if self.add_mirror_mod:
+                    if self.add_mirror_mod and has_valid_mirror:
                         mir_mod = new_obj.modifiers.new(name="Mirror", type='MIRROR')
                         mir_mod.mirror_object = armature_obj
                     arm_mod = new_obj.modifiers.new(name="Armature", type='ARMATURE')
@@ -787,7 +916,7 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
                     new_obj.parent = armature_obj
                     new_obj.parent_type = 'OBJECT'
                 else:
-                    if self.add_mirror_mod:
+                    if self.add_mirror_mod and has_valid_mirror:
                         new_obj.modifiers.new(name="Mirror", type='MIRROR')
                     self.report({'WARNING'}, "No armature found on source object; vertex group added but modifier/parent skipped")
             elif self.rig_to_bone:

@@ -30,6 +30,62 @@ def _dict_to_item(d: dict, item) -> None:
         setattr(item, f, v)
 
 
+def _get_target_material(context):
+    """Resolve the material the Node Baker panel is currently acting on.
+
+    In 'ALL' list mode this is the material selected in the global material
+    list; otherwise it is the active object's active material.
+    """
+    kt = context.scene.kitsunetools
+    if kt.node_baker_material_listmode == 'ALL':
+        idx = kt.node_baker_material_list_index
+        mats = bpy.data.materials
+        return mats[idx] if 0 <= idx < len(mats) else None
+    obj = context.active_object
+    return obj.active_material if obj else None
+
+
+def _resolve_material(context, material_name):
+    """Prefer an explicit material_name (set by the panel), else fall back to
+    the context-derived target so operators also work when run from search."""
+    if material_name:
+        mat = bpy.data.materials.get(material_name)
+        if mat:
+            return mat
+    return _get_target_material(context)
+
+
+# ---------------------------------------------------------------------------
+# Bake console logging - kept compact and scannable
+# ---------------------------------------------------------------------------
+_LOG_W = 60
+
+
+def _log_header(title, subtitle=""):
+    print()
+    print("=" * _LOG_W)
+    print(f"  {title}")
+    if subtitle:
+        print(f"  {subtitle}")
+    print("=" * _LOG_W)
+
+
+def _log_footer(summary):
+    print("-" * _LOG_W)
+    print(f"  {summary}")
+    print("=" * _LOG_W)
+    print()
+
+
+def _item_summary(item, node, socket):
+    """One-line 'node | socket | res | colorspace [| +alpha]' description."""
+    res = str(int(item.resolution_x)) if item.sync_y_with_x else f"{int(item.resolution_x)}x{int(item.resolution_y)}"
+    parts = [node.name, socket.name, res, item.color_space]
+    if item.has_alpha_channel:
+        parts.append("+alpha")
+    return "  |  ".join(parts)
+
+
 class NODE_OT_node_bake_add(Operator):
     bl_idname = "kitsunetools.node_bake_node_add"
     bl_label = "Add Bake Item"
@@ -106,24 +162,30 @@ def _collect_tex_nodes_upstream(start_node):
 
 
 def _run_bake_for_material(operator, context, obj, mat, export_path):
+    """Bake every item on `mat`. Returns (baked, skipped) counts."""
     items = list(mat.kitsunetools.node_baker_list)
     total = len(items)
+    fmt = context.scene.kitsunetools.node_baker_file_format
+    ext = ".png" if fmt == 'PNG' else ".tga"
 
     if total == 0:
-        print(f"  [skip] '{mat.name}' has no items.")
-        return
+        print("    (no items)")
+        return 0, 0
 
+    baked = skipped = 0
     for item_idx, item in enumerate(items):
         node = mat.node_tree.nodes.get(item.node_name)
         if not node:
-            print(f"  [{item_idx + 1}/{total}] WARNING: Node '{item.node_name}' not found in '{mat.name}', skipping.")
+            print(f"    [{item_idx + 1}/{total}] SKIP  node '{item.node_name}' not found")
+            skipped += 1
             continue
 
         socket = node.outputs[int(item.socket_index)]
         suffix = item.name if item.name else socket.name
         filename = f"{mat.name}_{suffix}"
 
-        print(f"  [{item_idx + 1}/{total}] Baking '{filename}' | node: '{node.name}' | socket: '{socket.name}'")
+        print(f"    [{item_idx + 1}/{total}] {filename}{ext}")
+        print(f"          {_item_summary(item, node, socket)}")
 
         temp_col = os.path.join(export_path, f"_temp_col_{mat.name}.tga")
         temp_alpha = os.path.join(export_path, f"_temp_alpha_{mat.name}.tga")
@@ -132,16 +194,12 @@ def _run_bake_for_material(operator, context, obj, mat, export_path):
         bake_obj = temp_plane
 
         try:
-            print(f"    Baking color channel...")
             operator._process_bake(context, bake_obj, mat, node, int(item.socket_index), item, temp_col, save_alpha=item.has_alpha_channel)
 
             if item.has_alpha_channel:
-                print(f"    Baking alpha channel (socket index: {item.alpha_socket_index})...")
                 operator._process_bake(context, bake_obj, mat, node, int(item.alpha_socket_index), item, temp_alpha, force_colorspace='Non-Color')
-                print(f"    Merging color + alpha...")
-                operator._merge_with_pil(temp_col, temp_alpha, export_path, filename, context.scene.kitsunetools.node_baker_file_format)
+                operator._merge_with_pil(temp_col, temp_alpha, export_path, filename, fmt)
             else:
-                ext = ".png" if context.scene.kitsunetools.node_baker_file_format == 'PNG' else ".tga"
                 final_path = os.path.normpath(os.path.join(export_path, filename + ext))
                 if os.path.exists(final_path): os.remove(final_path)
                 os.rename(temp_col, final_path)
@@ -153,8 +211,9 @@ def _run_bake_for_material(operator, context, obj, mat, export_path):
                     except: pass
             _restore_after_plane(context, temp_plane, prev_active, prev_selected)
 
-        print(f"    Done -> {os.path.join(export_path, filename)}")
-        operator.report({'INFO'}, f"Baked '{filename}' -> {os.path.join(export_path, filename)}")
+        baked += 1
+
+    return baked, skipped
 
 #
 #   FIXME: Somewhere in the process can cause a hang that even keyboard interrupt doesn't seem to work !!
@@ -163,11 +222,13 @@ class NODE_OT_node_bake_run(Operator):
     bl_idname = "kitsunetools.node_bake_run"
     bl_label = "Run Node Bake"
     all_items: bpy.props.BoolProperty(default=False)
+    material_name: bpy.props.StringProperty(default="")
 
     def execute(self, context) -> set:
-        obj = context.active_object
-        mat = obj.active_material
-        if not mat or not mat.node_tree: return {'CANCELLED'}
+        mat = _resolve_material(context, self.material_name)
+        if not mat or not mat.node_tree:
+            self.report({'WARNING'}, "No target material with nodes")
+            return {'CANCELLED'}
 
         kt = mat.kitsunetools
         
@@ -184,24 +245,29 @@ class NODE_OT_node_bake_run(Operator):
             return {'CANCELLED'}
 
         total = len(items)
+        fmt = context.scene.kitsunetools.node_baker_file_format
+        ext = ".png" if fmt == 'PNG' else ".tga"
 
         raw_path = bpy.path.abspath(context.scene.kitsunetools.node_baker_export_dir)
         export_path = os.path.normpath(raw_path)
         os.makedirs(export_path, exist_ok=True)
 
-        print(f"\n[Node Baker] Starting bake: {total} item(s) from material '{mat.name}'")
+        _log_header(f"Node Baker  -  {mat.name}", f"{total} item(s)  ->  {export_path}")
 
+        baked = skipped = 0
         for item_idx, item in enumerate(items):
             node = mat.node_tree.nodes.get(item.node_name)
             if not node:
-                print(f"  [{item_idx + 1}/{total}] WARNING: Node '{item.node_name}' not found, skipping.")
+                print(f"  [{item_idx + 1}/{total}] SKIP  node '{item.node_name}' not found")
+                skipped += 1
                 continue
 
             socket = node.outputs[int(item.socket_index)]
             suffix = item.name if item.name else socket.name
             filename = f"{mat.name}_{suffix}"
 
-            print(f"  [{item_idx + 1}/{total}] Baking '{filename}' | node: '{node.name}' | socket: '{socket.name}'")
+            print(f"  [{item_idx + 1}/{total}] {filename}{ext}")
+            print(f"        {_item_summary(item, node, socket)}")
 
             temp_col = os.path.join(export_path, f"_temp_col_{mat.name}.tga")
             temp_alpha = os.path.join(export_path, f"_temp_alpha_{mat.name}.tga")
@@ -210,16 +276,12 @@ class NODE_OT_node_bake_run(Operator):
             bake_obj = temp_plane
 
             try:
-                print(f"    Baking color channel...")
                 self._process_bake(context, bake_obj, mat, node, int(item.socket_index), item, temp_col, save_alpha=item.has_alpha_channel)
 
                 if item.has_alpha_channel:
-                    print(f"    Baking alpha channel (socket index: {item.alpha_socket_index})...")
                     self._process_bake(context, bake_obj, mat, node, int(item.alpha_socket_index), item, temp_alpha, force_colorspace='Non-Color')
-                    print(f"    Merging color + alpha...")
-                    self._merge_with_pil(temp_col, temp_alpha, export_path, filename, context.scene.kitsunetools.node_baker_file_format)
+                    self._merge_with_pil(temp_col, temp_alpha, export_path, filename, fmt)
                 else:
-                    ext = ".png" if context.scene.kitsunetools.node_baker_file_format == 'PNG' else ".tga"
                     final_path = os.path.normpath(os.path.join(export_path, filename + ext))
                     if os.path.exists(final_path): os.remove(final_path)
                     os.rename(temp_col, final_path)
@@ -231,10 +293,10 @@ class NODE_OT_node_bake_run(Operator):
                         except: pass
                 _restore_after_plane(context, temp_plane, prev_active, prev_selected)
 
-            print(f"    Done -> {os.path.join(export_path, filename)}")
-            self.report({'INFO'}, f"Baked '{filename}' -> {os.path.join(export_path, filename)}")
+            baked += 1
 
-        print(f"[Node Baker] Finished. {total} item(s) baked from '{mat.name}'.\n")
+        _log_footer(f"Done  -  {baked} baked, {skipped} skipped")
+        self.report({'INFO'}, f"Baked {baked} item(s) from '{mat.name}'")
         return {'FINISHED'}
 
     def _process_bake(self, context, obj, mat, node, socket_idx, item, filepath, force_colorspace=None, save_alpha=False):
@@ -243,20 +305,12 @@ class NODE_OT_node_bake_run(Operator):
         res_y = int(item.resolution_y) if not item.sync_y_with_x else res_x
         colorspace = force_colorspace if force_colorspace else item.color_space
 
-        print(f"      _process_bake | res_x={res_x} | res_y={res_y} | colorspace='{colorspace}' | save_alpha={save_alpha}")
-
-        print(f"      >> creating image...")
-        bake_img = bpy.data.images.new("_temp_bake", width=res_x, height=res_y, alpha=save_alpha)
-        print(f"      >> setting colorspace '{colorspace}'...")
-        bake_img.colorspace_settings.name = colorspace
-        print(f"      >> image ready.")
-
         bake_img = bpy.data.images.new("_temp_bake", width=res_x, height=res_y, alpha=save_alpha)
         bake_img.colorspace_settings.name = colorspace
 
         mat_out = next((n for n in ntree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
         if not mat_out:
-            print(f"      ERROR: No active Material Output node in '{mat.name}'.")
+            print(f"        ERROR: no active Material Output node in '{mat.name}'")
             bpy.data.images.remove(bake_img)
             return
 
@@ -279,7 +333,7 @@ class NODE_OT_node_bake_run(Operator):
 
         socket = node.outputs[socket_idx]
         if socket.type == 'VECTOR':
-            print(f"      Socket type VECTOR - inserting SeparateXYZ + CombineRGB.")
+            print("        note: vector socket - inserting SeparateXYZ + CombineRGB")
             sep = ntree.nodes.new('ShaderNodeSeparateXYZ')
             comb = ntree.nodes.new('ShaderNodeCombineRGB')
             temp_nodes.extend([sep, comb])
@@ -313,7 +367,6 @@ class NODE_OT_node_bake_run(Operator):
 
         if not obj.data.uv_layers:
             obj.data.uv_layers.new(name="UVMap")
-            print(f"      Added missing UV layer to bake target '{obj.name}'.")
 
         vector_links = []
         if item.bypass_texture_mapping:
@@ -324,9 +377,8 @@ class NODE_OT_node_bake_run(Operator):
                         vector_links.append((link.from_socket, link.to_socket))
                         ntree.links.remove(link)
             if vector_links:
-                print(f"      bypass_texture_mapping: disconnected {len(vector_links)} vector link(s).")
+                print(f"        note: bypass mapping - disconnected {len(vector_links)} vector link(s)")
 
-        print(f"      Running bpy.ops.object.bake (device={scene.cycles.device})...")
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
         context.view_layer.objects.active = obj
@@ -344,7 +396,6 @@ class NODE_OT_node_bake_run(Operator):
         bake_img.filepath_raw = os.path.normpath(filepath)
         bake_img.file_format = 'TARGA'
         bake_img.save()
-        print(f"      Saved temp image -> '{filepath}'")
 
         for n in temp_nodes: ntree.nodes.remove(n)
         for f, t in old_links: ntree.links.new(f, t)
@@ -357,7 +408,6 @@ class NODE_OT_node_bake_run(Operator):
         scene.render.image_settings.file_format = old_format
 
     def _merge_with_pil(self, col_path, alpha_path, export_dir, filename, fmt):
-        print(f"      PIL merge: '{col_path}' + '{alpha_path}'")
         with Image.open(col_path).convert("RGBA") as base_img:
             with Image.open(alpha_path).convert("L") as alpha_mask:
                 r, g, b, _ = base_img.split()
@@ -365,7 +415,6 @@ class NODE_OT_node_bake_run(Operator):
                 ext = ".png" if fmt == 'PNG' else ".tga"
                 save_path = os.path.normpath(os.path.join(export_dir, filename + ext))
                 final_rgba.save(save_path)
-                print(f"      Merged image saved -> '{save_path}'")
 
 
 class NODE_OT_node_bake_all_materials(Operator):
@@ -404,18 +453,20 @@ class NODE_OT_node_bake_all_materials(Operator):
         export_path = os.path.normpath(raw_path)
         os.makedirs(export_path, exist_ok=True)
 
-        print(f"\n[Node Baker] Bake All Materials - '{obj.name}' | {total_mats} material(s)")
-        print(f"[Node Baker] Export path: {export_path}")
+        _log_header(f"Node Baker  -  Bake All Materials", f"'{obj.name}'  |  {total_mats} material(s)  ->  {export_path}")
 
+        tot_baked = tot_skipped = 0
         for mat_idx, slot in enumerate(material_slots):
             mat = slot.material
             total_items = len(mat.kitsunetools.node_baker_list)
-            print(f"\n[Node Baker] Material [{mat_idx + 1}/{total_mats}]: '{mat.name}' | {total_items} item(s)")
+            print(f"\n  Material [{mat_idx + 1}/{total_mats}]  {mat.name}  ({total_items} item(s))")
             obj.active_material_index = mat_idx
-            _run_bake_for_material(self, context, obj, mat, export_path)
+            b, s = _run_bake_for_material(self, context, obj, mat, export_path)
+            tot_baked += b
+            tot_skipped += s
 
-        print(f"\n[Node Baker] All done. {total_mats} material(s) processed on '{obj.name}'.\n")
-        self.report({'INFO'}, f"Baked all materials on '{obj.name}'.")
+        _log_footer(f"All done  -  {tot_baked} baked, {tot_skipped} skipped, {total_mats} material(s)")
+        self.report({'INFO'}, f"Baked {tot_baked} item(s) across {total_mats} material(s) on '{obj.name}'")
         return {'FINISHED'}
 
     def _process_bake(self, context, obj, mat, node, socket_idx, item, filepath, force_colorspace=None, save_alpha=False):
@@ -940,22 +991,25 @@ class NODE_OT_node_bake_copy(Operator):
     bl_description = "Copy active or all node baker list items to clipboard"
  
     all_items: BoolProperty(default=False, name="All Items")
- 
+    material_name: StringProperty(default="")
+
     @classmethod
     def poll(cls, context) -> bool:
-        obj = context.active_object
-        mat = obj.active_material if obj else None
+        mat = _get_target_material(context)
         return bool(mat and mat.use_nodes and len(mat.kitsunetools.node_baker_list) > 0)
-    
+
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
-    
+
     def draw(self, context):
         self.layout.prop(self, "all_items", toggle=True)
- 
+
     def execute(self, context) -> set:
         global _clipboard
-        mat = context.active_object.active_material
+        mat = _resolve_material(context, self.material_name)
+        if not mat:
+            self.report({'WARNING'}, "No target material")
+            return {'CANCELLED'}
         baker_list = mat.kitsunetools.node_baker_list
  
         if self.all_items:
@@ -975,15 +1029,19 @@ class NODE_OT_node_bake_paste(Operator):
     bl_idname = "node.node_bake_paste"
     bl_label = "Paste Node Bake Item(s)"
     bl_description = "Paste copied node baker items into the active material's list"
- 
+
+    material_name: StringProperty(default="")
+
     @classmethod
     def poll(cls, context) -> bool:
-        obj = context.active_object
-        mat = obj.active_material if obj else None
+        mat = _get_target_material(context)
         return bool(mat and mat.use_nodes and bool(_clipboard))
- 
+
     def execute(self, context) -> set:
-        mat = context.active_object.active_material
+        mat = _resolve_material(context, self.material_name)
+        if not mat:
+            self.report({'WARNING'}, "No target material")
+            return {'CANCELLED'}
         baker_list = mat.kitsunetools.node_baker_list
  
         for d in _clipboard:

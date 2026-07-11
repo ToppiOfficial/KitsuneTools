@@ -81,6 +81,7 @@ def draw_edit_mesh_menu_items(self, context):
 
 def draw_select_edit_mesh_menu_items(self, context):
     self.layout.separator(type='LINE')
+    self.layout.operator(ops_mesh.MESH_OT_SelectLinkedMergeDistance.bl_idname)
     self.layout.operator(ops_mesh.MESH_OT_Select_Faces_by_ImageMask.bl_idname)
 
 def draw_object_menu_items(self, context):
@@ -559,6 +560,7 @@ _classes = (
     ops_mesh.MESH_OT_CleanDuplicateMaterials,
     ops_mesh.MESH_OT_SelectShapekeyVerts,
     ops_mesh.MESH_OT_Select_Faces_by_ImageMask,
+    ops_mesh.MESH_OT_SelectLinkedMergeDistance,
     ops_mesh.MESH_OT_transfer_topology_shapekeys,
     ops_mesh.MESH_OT_convex_hull_selection,
     ops_mesh.MESH_OT_replace_verts_with_spheres,

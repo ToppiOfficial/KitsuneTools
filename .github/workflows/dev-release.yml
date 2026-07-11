@@ -1,0 +1,63 @@
+name: Dev Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Allow the workflow to create tags/releases.
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read addon version
+        id: version
+        run: |
+          version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([0-9.]*\)".*/\1/p' blender_manifest.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build platform ZIPs
+        run: python make_zip.py
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          # make_zip.py writes ZIPs to the parent directory.
+          mv ../kitsunetools_*.zip dist/
+          ls -la dist
+
+      - name: Remove previous dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dev --cleanup-tag --yes || true
+
+      - name: Create dev release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          name: Dev v${{ steps.version.outputs.version }} (${{ steps.version.outputs.short_sha }})
+          body: |
+            Automated development build from commit ${{ github.sha }}.
+
+            > [!WARNING]
+            > This is an untested rolling development build, not a stable release.
+          prerelease: true
+          files: dist/*.zip
