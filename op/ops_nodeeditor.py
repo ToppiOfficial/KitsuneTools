@@ -161,6 +161,30 @@ def _collect_tex_nodes_upstream(start_node):
     return tex_nodes
 
 
+def _collect_channel_packed_tex_nodes(start_node):
+    """Return TEX_IMAGE nodes upstream from start_node whose Alpha output is
+    connected. When a texture's alpha is used, its RGB and alpha are independent
+    channels packed together, so the image must be treated as Channel Packed
+    during bake - otherwise Blender premultiplies the RGB by the alpha and the
+    color pass gets corrupted in transparent regions."""
+    visited, packed = set(), []
+
+    def traverse(node):
+        if node in visited:
+            return
+        visited.add(node)
+        if node.type == 'TEX_IMAGE' and node.image:
+            alpha_out = node.outputs.get('Alpha')
+            if alpha_out and alpha_out.is_linked:
+                packed.append(node)
+        for inp in node.inputs:
+            for link in inp.links:
+                traverse(link.from_node)
+
+    traverse(start_node)
+    return packed
+
+
 def _run_bake_for_material(operator, context, obj, mat, export_path):
     """Bake every item on `mat`. Returns (baked, skipped) counts."""
     items = list(mat.kitsunetools.node_baker_list)
@@ -379,10 +403,24 @@ class NODE_OT_node_bake_run(Operator):
             if vector_links:
                 print(f"        note: bypass mapping - disconnected {len(vector_links)} vector link(s)")
 
+        # Force upstream textures whose Alpha output is connected to Channel Packed
+        # so the color pass isn't premultiplied by the alpha. Restored after bake.
+        alpha_mode_overrides = {}
+        for tex_node in _collect_channel_packed_tex_nodes(node):
+            img = tex_node.image
+            if img.name not in alpha_mode_overrides and img.alpha_mode != 'CHANNEL_PACKED':
+                alpha_mode_overrides[img.name] = (img, img.alpha_mode)
+                img.alpha_mode = 'CHANNEL_PACKED'
+        if alpha_mode_overrides:
+            print(f"        note: alpha connection - forced channel-packed on {len(alpha_mode_overrides)} image(s)")
+
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
         context.view_layer.objects.active = obj
         bpy.ops.object.bake(type='EMIT')
+
+        for img, mode in alpha_mode_overrides.values():
+            img.alpha_mode = mode
 
         for f, t in vector_links:
             ntree.links.new(f, t)

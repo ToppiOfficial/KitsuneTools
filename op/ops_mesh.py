@@ -499,11 +499,15 @@ class MESH_OT_SelectLinkedMergeDistance(Operator):
 
                 kd = mathutils.kdtree.KDTree(len(world_co))
                 for i, co in enumerate(world_co):
+                    if bm.verts[i].hide:
+                        continue
                     kd.insert(co, i)
                 kd.balance()
 
                 coincident = collections.defaultdict(set)
                 for i, co in enumerate(world_co):
+                    if bm.verts[i].hide:
+                        continue
                     for (_co, idx, _dist) in kd.find_range(co, self.merge_distance):
                         if idx != i:
                             coincident[i].add(idx)
