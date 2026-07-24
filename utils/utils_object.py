@@ -5,6 +5,22 @@ import numpy as np
 
 shape_types = ('MESH' , 'SURFACE', 'CURVE')
 
+# Blender 5.0 moved the bone selection flags (select / select_head / select_tail)
+# off Bone (armature data) and onto PoseBone, so selection is no longer synced
+# across armature instances. These helpers read/write selection on both 4.5 and 5.0+.
+_SELECT_ON_POSEBONE = bpy.app.version >= (5, 0, 0)
+
+def is_bone_selected(pose_bone: PoseBone) -> bool:
+    """Return whether a pose bone is selected, on Blender 4.5 and 5.0+."""
+    return pose_bone.select if _SELECT_ON_POSEBONE else pose_bone.bone.select
+
+def set_bone_selected(pose_bone: PoseBone, state: bool) -> None:
+    """Set a pose bone's selection, on Blender 4.5 and 5.0+."""
+    if _SELECT_ON_POSEBONE:
+        pose_bone.select = state
+    else:
+        pose_bone.bone.select = state
+
 #
 #   BOOL FUNCTIONS
 #
@@ -41,7 +57,7 @@ def has_selected_bones() -> bool:
     if not is_armature(armature): return False
     
     if bpy.context.mode in 'EDIT_ARMATURE': return (any([bone.select for bone in armature.data.edit_bones]))
-    else: return any([bone.select for bone in armature.data.bones])
+    else: return any([is_bone_selected(pb) for pb in armature.pose.bones])
 
 def has_shapes(ob, valid_only = True):
     return bool(ob.type in shape_types and ob.data.shape_keys and len(ob.data.shape_keys.key_blocks))

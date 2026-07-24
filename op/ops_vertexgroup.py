@@ -1,7 +1,7 @@
 import bpy, bmesh
 from bpy.types import Operator, PoseBone
 from bpy.props import FloatProperty, BoolProperty, StringProperty, EnumProperty
-from ..utils.utils_object import is_armature, is_mesh, get_armature_meshes, get_armature
+from ..utils.utils_object import is_armature, is_mesh, get_armature_meshes, get_armature, is_bone_selected
 from ..utils.utils_armature import get_selected_bones
 from ..utils.utils_contextmanagers import preserve_context_mode, preserve_armature_state
 from ..utils.utils_vertexgroup import reapply_vertexgroup_as_curve
@@ -46,7 +46,7 @@ class VERTEXGROUP_OT_WeightMath(Operator):
         if not curr_bone:
             self.report({'WARNING'}, "No active bone")
             return {'CANCELLED'}
-        selected_bones = [b for b in arm.data.bones if b.select]
+        selected_bones = [arm.data.bones[pb.name] for pb in arm.pose.bones if is_bone_selected(pb)]
         if len(selected_bones) < 2:
             self.report({'WARNING'}, "Select at least 2 bones")
             return {'CANCELLED'}

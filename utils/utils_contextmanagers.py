@@ -1,4 +1,5 @@
 import bpy, inspect
+from .utils_object import is_bone_selected, set_bone_selected
 from bpy.props import PointerProperty
 from functools import wraps
 from contextlib import contextmanager
@@ -299,7 +300,7 @@ def preserve_context_mode(obj: bpy.types.Object | None = None, mode: str = "EDIT
                 elif prev_mode == "POSE" and data.bones.active:
                     prev_bone_name = data.bones.active.name
                     prev_bone_mode = "POSE"
-                    prev_bone_selected = target_obj.pose.bones[prev_bone_name].bone.select
+                    prev_bone_selected = is_bone_selected(target_obj.pose.bones[prev_bone_name])
  
         if target_obj and target_obj.name in bpy.data.objects:
             try:
@@ -372,7 +373,9 @@ def preserve_context_mode(obj: bpy.types.Object | None = None, mode: str = "EDIT
                             bone = data.bones.get(prev_bone_name)
                             if bone:
                                 data.bones.active = bone
-                                bone.select = prev_bone_selected
+                                pose_bone = prev_active.pose.bones.get(prev_bone_name)
+                                if pose_bone:
+                                    set_bone_selected(pose_bone, prev_bone_selected)
                 except ReferenceError:
                     pass
 

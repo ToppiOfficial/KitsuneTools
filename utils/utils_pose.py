@@ -37,6 +37,38 @@ def _find_mirror_bone(armature, source_bone, tolerance):
     return best
 
 
+def _rotation_data_path(pose_bone):
+    if pose_bone.rotation_mode == "QUATERNION":
+        return "rotation_quaternion"
+    if pose_bone.rotation_mode == "AXIS_ANGLE":
+        return "rotation_axis_angle"
+    return "rotation_euler"
+
+
+def _auto_keyframe(target_pb):
+    scene = bpy.context.scene
+    if not scene.tool_settings.use_keyframe_insert_auto:
+        return
+
+    options = set()
+    # "Only Insert Needed" for auto-keying lives in Preferences, not ToolSettings
+    if getattr(bpy.context.preferences.edit, "use_auto_keyframe_insert_needed", False):
+        options.add('INSERTKEY_NEEDED')
+    if getattr(scene.tool_settings, "use_keyframe_cycle_aware", False):
+        options.add('INSERTKEY_CYCLE_AWARE')
+
+    for path in ("location", _rotation_data_path(target_pb), "scale"):
+        try:
+            target_pb.keyframe_insert(
+                data_path=path,
+                frame=scene.frame_current,
+                group=target_pb.name,
+                options=options,
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            print(f"[KitsuneTools] mirror auto-key failed on {target_pb.name}.{path}: {exc}")
+
+
 def _copy_mirrored_pose(source_pb, target_pb):
     src = source_pb.matrix_basis
     loc = src.to_translation()
@@ -113,5 +145,6 @@ def mirror_pose_handler(scene, depsgraph):
             mirror = _find_mirror_bone(obj, pb, props.x_mirror_tolerance)
             if mirror:
                 _copy_mirrored_pose(pb, mirror)
+                _auto_keyframe(mirror)
     finally:
         _is_mirroring = False

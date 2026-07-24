@@ -69,7 +69,8 @@ def find_intermediate_bones_in_chain(start_bone: EditBone, end_bone: EditBone) -
 
 # -- Twist bones ---------------------------------------------------------------
 
-def create_twist_bones(arm: Object, bone_name: str, count: int) -> list[str]:
+def create_twist_bones(arm: Object, bone_name: str, count: int,
+                       chained: bool = False) -> list[str]:
     if count <= 0:
         return []
 
@@ -82,6 +83,7 @@ def create_twist_bones(arm: Object, bone_name: str, count: int) -> list[str]:
     seg = 1.0 / count
     names = []
 
+    prev = None
     for i in range(count):
         twist_name = f"{bone_name}.{str(i + 1).zfill(3)}"
         existing = arm.data.edit_bones.get(twist_name)
@@ -89,9 +91,16 @@ def create_twist_bones(arm: Object, bone_name: str, count: int) -> list[str]:
         tb.head = base_head + total_vec * (i * seg)
         tb.tail = base_head + total_vec * ((i + 1) * seg)
         tb.roll = bone.roll
-        tb.parent = bone
+        # Flat by default - every twist hangs straight off the joint, which is
+        # what a realistic rig wants. When chained, each one hangs off the
+        # previous instead so a stretch carries its successors' heads along;
+        # flat parenting pins every head and a stretch cannot propagate past the
+        # first segment. Callers that chain must also drive the twist as a delta
+        # per segment rather than an absolute share, since rotation accumulates.
+        tb.parent = prev if (chained and prev is not None) else bone
         tb.use_connect = False
         names.append(twist_name)
+        prev = tb
 
     return names
 

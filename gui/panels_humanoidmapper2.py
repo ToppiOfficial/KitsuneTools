@@ -262,6 +262,10 @@ class TOOLS_PT_KitsuneTool_HM2_Twist(_HM2PanelBase):
             'hm2_twist_knee_target_r', 'hm2_twist_knee_mode_r',
         )
 
+        layout.separator()
+        layout.prop(hm2, 'hm2_twist_stretch')
+        layout.prop(hm2, 'hm2_twist_auto_weights')
+
 
 class TOOLS_PT_KitsuneTool_HM2_IK(_HM2PanelBase):
     bl_idname = 'TOOLS_PT_KitsuneTool_HM2_IK'

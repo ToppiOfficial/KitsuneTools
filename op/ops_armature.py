@@ -1,4 +1,4 @@
-import bpy, re
+import bpy, re, fnmatch
 from bpy.types import Object, Operator, Context, PoseBone
 from bpy.props import BoolProperty, StringProperty, EnumProperty, FloatProperty, IntProperty
 from ..utils.utils_armature import apply_current_pose_as_restpose, apply_current_pose_shapekey, get_selected_bones, copy_armature_visual_pose, fit_armature_pose_to_reference, merge_armatures, transfer_armature_bonedata
@@ -8,68 +8,145 @@ from ..utils.utils_vertexgroup import remove_unused_vertexgroups
 from ..utils.utils_bone import remove_bone
 
 
+def _closure(seed : set, graph : dict, valid) -> set:
+    """Transitively expand `seed` along `graph`, keeping only names present in `valid`."""
+    result = set(seed)
+    frontier = list(seed)
+
+    while frontier:
+        for name in graph.get(frontier.pop(), ()):
+            if name not in result and name in valid:
+                result.add(name)
+                frontier.append(name)
+
+    return result
+
+
 class _apply_pose:
     selected_only : BoolProperty(name='Selected Bones Only', default=False)
+    debug : BoolProperty(name='Debug Print', description='Print what got kept, muted and applied to the system console', default=False)
 
     def execute(self, context : Context) -> set:
         as_shapekey = hasattr(self, 'as_shapekey')
-        
+        dbg = (lambda *a: print('[KitsuneTools][ApplyPose]', *a)) if self.debug else (lambda *a: None)
+
         with preserve_context_mode(None, 'OBJECT'):
             armatures : set[Object | None] = {get_armature(o) for o in context.selected_objects}
             success_count = 0
             
             for armature in armatures:
+                restore_funcs = []
+
                 try:
                     if not is_armature(armature): continue
 
                     if self.selected_only:
                         selected_bones = get_selected_bones(armature=armature, bone_type='POSEBONE')
-                        kept = {pb.name for pb in selected_bones if pb}
+                        selected = {pb.name for pb in selected_bones if pb}
 
-                        # A selected bone's final pose can depend on other bones through
-                        # constraint targets or drivers. Those dependency bones must stay
-                        # posed for the selected bones to evaluate correctly, so treat them
-                        # as selected even though the user did not select them.
                         pose_bones = armature.pose.bones
 
-                        # Map each driven bone -> the bones its drivers read from.
-                        driver_deps : dict[str, set[str]] = {}
+                        # Build "bone -> bones it reads from" out of constraint targets and
+                        # driver variables. The driver fcurves are kept around so unselected
+                        # bones can be muted later on.
+                        sources : dict[str, set[str]] = {}
+                        bone_drivers : dict[str, list] = {}
+
                         anim = armature.animation_data
                         if anim and anim.drivers:
                             path_re = re.compile(r'pose\.bones\["([^"]+)"\]')
                             for fc in anim.drivers:
                                 match = path_re.match(fc.data_path or "")
                                 if not match: continue
-                                srcs = driver_deps.setdefault(match.group(1), set())
+                                bone_drivers.setdefault(match.group(1), []).append(fc)
+                                srcs = sources.setdefault(match.group(1), set())
                                 for var in fc.driver.variables:
                                     for tgt in var.targets:
                                         if tgt.id == armature and getattr(tgt, 'bone_target', ""):
                                             srcs.add(tgt.bone_target)
 
-                        # Transitively pull in every dependency of the kept bones.
-                        frontier = list(kept)
-                        while frontier:
-                            pbone = pose_bones.get(frontier.pop())
-                            if pbone is None: continue
+                        dependents : dict[str, set[str]] = {}
+                        kept = set(selected)
 
-                            for constraint in pbone.constraints:
-                                for tgt_attr, sub_attr in (('target', 'subtarget'), ('pole_target', 'pole_subtarget')):
-                                    sub = getattr(constraint, sub_attr, "")
-                                    if getattr(constraint, tgt_attr, None) == armature and sub and sub not in kept and sub in pose_bones:
-                                        kept.add(sub)
-                                        frontier.append(sub)
+                        # Only the shapekey pass widens the selection. It captures deformation,
+                        # so every bone the selection makes move has to be included or the
+                        # shape comes out incomplete. Baking a rest pose is a different job -
+                        # it rewrites exactly the bones the user picked and nothing else.
+                        if as_shapekey:
+                            for pbone in pose_bones:
+                                for constraint in pbone.constraints:
+                                    for tgt_attr, sub_attr in (('target', 'subtarget'), ('pole_target', 'pole_subtarget')):
+                                        sub = getattr(constraint, sub_attr, "")
+                                        if getattr(constraint, tgt_attr, None) == armature and sub:
+                                            sources.setdefault(pbone.name, set()).add(sub)
 
-                            for src in driver_deps.get(pbone.name, ()):
-                                if src not in kept and src in pose_bones:
-                                    kept.add(src)
-                                    frontier.append(src)
+                            # Reverse edges: "bone -> bones that follow it".
+                            for dependent, srcs in sources.items():
+                                for src in srcs:
+                                    dependents.setdefault(src, set()).add(dependent)
 
+                            # A child follows its parent through the bone hierarchy, which no
+                            # amount of clearing matrix_basis can cancel, so posing a bone
+                            # always drags its descendants along. This edge only goes parent ->
+                            # child: clearing an unselected *ancestor* back to rest is both
+                            # possible and wanted, which is why it is not mirrored into sources.
+                            for pbone in pose_bones:
+                                if pbone.parent is not None:
+                                    dependents.setdefault(pbone.parent.name, set()).add(pbone.name)
+
+                            # A bone constrained to, driven by, or parented under a selected
+                            # bone moves *because* the user posed that selection - an eye
+                            # tracking the child of a selected controller, for instance - so
+                            # its motion belongs in the result.
+                            kept = _closure(kept, dependents, pose_bones)
+
+                            # Going the other way, whatever the kept bones read from must stay
+                            # posed or they cannot evaluate correctly. This does not expand
+                            # downstream again, so unrelated siblings stay at rest.
+                            kept = _closure(kept, sources, pose_bones)
+
+                        dbg(f"armature={armature.name} bones={len(pose_bones)} mode={'shapekey' if as_shapekey else 'restpose'}")
+                        dbg(f"  selected ({len(selected)}): {sorted(selected)}")
+                        if as_shapekey:
+                            dbg(f"  constraint/driver edges: {len(sources)} bones read from something")
+                            for name in sorted(selected):
+                                dbg(f"    '{name}' reads from {sorted(sources.get(name, ()))} | followed by {sorted(dependents.get(name, ()))}")
+                            dbg(f"  kept after both walks ({len(kept)}): {sorted(kept)}")
+                            dbg(f"  added by walks: {sorted(kept - selected)}")
+                        else:
+                            dbg(f"  kept (selection only, no walks): {sorted(kept)}")
+
+                        muted = []
+
+                        # Clearing matrix_basis alone does not neutralize a bone posed by a
+                        # constraint or a driver - both re-apply on the next depsgraph
+                        # evaluation, so the unselected bone still deforms and its motion
+                        # leaks into the result. Mute them so the bone truly sits at rest.
                         for posebone in pose_bones:
                             if posebone.name in kept: continue
+
+                            if as_shapekey:
+                                basis = posebone.matrix_basis.copy()
+                                restore_funcs.append(lambda pb=posebone, m=basis: setattr(pb, 'matrix_basis', m))
                             posebone.matrix_basis.identity()
 
+                            for constraint in posebone.constraints:
+                                if constraint.mute: continue
+                                constraint.mute = True
+                                muted.append(f"{posebone.name}.{constraint.name}")
+                                restore_funcs.append(lambda c=constraint: setattr(c, 'mute', False))
+
+                            for fcurve in bone_drivers.get(posebone.name, ()):
+                                if fcurve.mute: continue
+                                fcurve.mute = True
+                                muted.append(f"{posebone.name} driver {fcurve.data_path}[{fcurve.array_index}]")
+                                restore_funcs.append(lambda f=fcurve: setattr(f, 'mute', False))
+
+                        context.view_layer.update()
+                        dbg(f"  muted ({len(muted)}): {muted}")
+
                     if as_shapekey:
-                        apply_current_pose_shapekey(armature=armature, shapekey_name=self.shapekey_name.strip())
+                        apply_current_pose_shapekey(armature=armature, shapekey_name=self.shapekey_name.strip(), debug=self.debug)
                     else:
                         apply_current_pose_as_restpose(armature=armature)
 
@@ -78,6 +155,11 @@ class _apply_pose:
                 except Exception as e:
                     self.report({'ERROR'}, f"Failed to apply pose: {str(e)}")
                     continue
+
+                finally:
+                    for restore in reversed(restore_funcs):
+                        try: restore()
+                        except Exception: pass
 
         if success_count > 0:
             if len(armatures) == 1: message = 'Applied as Rest Pose'
@@ -125,6 +207,7 @@ class ARMATURE_OT_ApplyPoseAsShapekey(_apply_pose, Operator):
         layout = self.layout
         layout.prop(self, 'selected_only')
         layout.prop(self, 'shapekey_name')
+        layout.prop(self, 'debug')
 
 
 class ARMATURE_OT_MergeArmatures(Operator):
@@ -314,6 +397,12 @@ class ARMATURE_OT_CleanUnWeightedBones(Operator):
     bl_idname= 'kitsunetools.clean_unweighted_bones'
     bl_label= 'Clean Unweighted Bones'
     bl_options = {'REGISTER', 'UNDO'}
+
+    preserve_pattern: StringProperty(
+        name='Preserve Pattern',
+        description='Bones matching this pattern (wildcards: * ?) are always preserved, regardless of Cleaning Mode. Leave empty to disable',
+        default=''
+    )
     
     cleaning_mode: EnumProperty(
         name='Cleaning Mode',
@@ -374,6 +463,7 @@ class ARMATURE_OT_CleanUnWeightedBones(Operator):
         col.prop(self, 'preserve_deform_bones')
         col.prop(self, 'respect_mirror')
         col.prop(self, 'remove_unused_bonecollections')
+        col.prop(self, 'preserve_pattern')
         col.prop(self, 'remove_empty_vertex_groups')
         
         subcol = col.column(align=True)
@@ -389,7 +479,11 @@ class ARMATURE_OT_CleanUnWeightedBones(Operator):
             
     def is_excluded_bone(self, bone_name) -> bool:
         twist_pattern = re.compile(r'.+ twist( \d+)?$', re.IGNORECASE)
-        return bool(twist_pattern.match(bone_name))
+        if twist_pattern.match(bone_name):
+            return True
+        if self.preserve_pattern and fnmatch.fnmatchcase(bone_name, self.preserve_pattern):
+            return True
+        return False
 
     def execute(self, context: Context) -> set:
         armatures: set[Object | None] = {get_armature(ob) for ob in context.selected_objects}

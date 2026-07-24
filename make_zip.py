@@ -50,17 +50,19 @@ with open(toml_path) as toml_file:
     
     wheel_lines = re.findall(r'[\'"](.+?)[\'"]', wheels_section.group(1))
 
-platforms = {
-    'win_amd64': 'windows',
-    'macosx_11_0_arm64': 'macos_arm',
-    'macosx_10_10_x86_64': 'macos_intel',
-    'manylinux': 'linux'
-}
-
 def get_platform_from_wheel(wheel_path):
-    for platform_tag, platform_name in platforms.items():
-        if platform_tag in wheel_path:
-            return platform_name
+    # Match on ABI-independent platform traits so both the cp311 and cp313
+    # wheels for a platform land in the same per-platform zip (macOS Intel
+    # wheels vary between macosx_10_10 and macosx_10_13 across Python versions).
+    name = os.path.basename(wheel_path)
+    if 'win_amd64' in name:
+        return 'windows'
+    if 'macosx' in name and 'arm64' in name:
+        return 'macos_arm'
+    if 'macosx' in name and 'x86_64' in name:
+        return 'macos_intel'
+    if 'manylinux' in name:
+        return 'linux'
     return None
 
 wheel_platform_map = {}

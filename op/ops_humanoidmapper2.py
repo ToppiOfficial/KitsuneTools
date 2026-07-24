@@ -4,7 +4,7 @@ from bpy.types import Context, Object, Operator
 from bpy.props import IntProperty, StringProperty, BoolProperty, EnumProperty, FloatProperty
 
 from ..utils.utils_object import is_armature, get_armature_meshes
-from ..utils.utils_bone import bonename_direction_map
+from ..utils.utils_bone import bonename_direction_map, subdivide_bone
 from ..utils.utils_contextmanagers import unhide_all_objects
 from ..utils.utils_humanoidmapper2 import (
     hm2_validate_mapping,
@@ -251,7 +251,8 @@ class HM2_OT_JsonFormatHelp(Operator):
         layout.separator()
 
         layout.label(text='Single bones  (no direction substitution):')
-        layout.label(text='  Keys: Root, Chest, Neck, Head', icon='DOT')
+        layout.label(text='  Keys: Root, Pelvis, Chest, Neck, Head', icon='DOT')
+        layout.label(text='  ("Pelvis" is M_Hip - "Hip" below is the bilateral leg bone)', icon='BLANK1')
         layout.label(text='  "Root": { "name": "Hips", "exportrot": "0 0 0", "exportloc": "0 0 0" }', icon='BLANK1')
         layout.separator()
 
@@ -466,20 +467,17 @@ class HM2_OT_Process(Operator):
         twist bones are deleted and recreated the child can be re-parented to
         the new bone at the same slot.
 
-        A twist bone is identified by the cleanup regex used in
-        _cleanup_for_reapply: name matches r'\\.\\d{3}$' and parent is in
-        _TWIST_PARENTS. We build the joint→[twist_names_in_order] map from
-        the armature's current state to resolve indices."""
+        Twist bones are identified by _twist_joint_of, the same helper
+        _cleanup_for_reapply uses. We build the joint→[twist_names_in_order] map
+        from the armature's current state to resolve indices."""
         twist_children: dict[str, tuple[str, int]] = {}
 
         # Build joint → ordered twist bone list from current bones.
         # Twist bones sort by their suffix number to get stable ordering.
         joint_twists: dict[str, list[str]] = {}
         for bone in arm.data.bones:
-            if (re.search(r'\.\d{3}$', bone.name)
-                    and bone.parent
-                    and bone.parent.name in cls._TWIST_PARENTS):
-                joint = bone.parent.name
+            joint = cls._twist_joint_of(bone)
+            if joint:
                 joint_twists.setdefault(joint, []).append(bone.name)
         for names in joint_twists.values():
             names.sort()  # .001 < .002 < .003 — stable positional index
@@ -536,6 +534,33 @@ class HM2_OT_Process(Operator):
         bpy.ops.object.mode_set(mode='OBJECT')
 
     _ADDED_PREFIXES = ('CTRL_', 'IK_', 'MCH_', 'VIS_', 'FK_')
+    @classmethod
+    def _twist_joint_of(cls, bone) -> str | None:
+        """Return the joint a twist bone belongs to, or None if it is not one.
+
+        Twist bones are named {joint}.NNN and chain off each other, so the first
+        segment's parent is the joint but the rest sit further down. Walk up
+        through .NNN-named ancestors until a joint in _TWIST_PARENTS turns up.
+        Works on both Bone and EditBone."""
+        if not re.search(r'\.\d{3}$', bone.name):
+            return None
+        parent = bone.parent
+        while parent is not None:
+            if parent.name in cls._TWIST_PARENTS:
+                return parent.name
+            if not re.search(r'\.\d{3}$', parent.name):
+                return None
+            parent = parent.parent
+        return None
+
+    # Next joint down the chain, for the twist-bone stretch targets.
+    _TWIST_STRETCH_TARGETS = {
+        'L_Shoulder': 'L_Elbow', 'R_Shoulder': 'R_Elbow',
+        'L_Elbow':    'L_Hand',  'R_Elbow':    'R_Hand',
+        'L_Hip':      'L_Knee',  'R_Hip':      'R_Knee',
+        'L_Knee':     'L_Ankle', 'R_Knee':     'R_Ankle',
+    }
+
     _TWIST_PARENTS = frozenset({
         'L_Shoulder', 'R_Shoulder', 'L_Elbow', 'R_Elbow',
         'L_Hip', 'R_Hip', 'L_Knee', 'R_Knee',
@@ -543,7 +568,7 @@ class HM2_OT_Process(Operator):
 
     # Fixed HM2-managed deform bones (excludes spine - computed dynamically).
     _HM2_CORE_BONES = frozenset({
-        'M_Root', 'M_Chest', 'M_Neck', 'M_Head',
+        'M_Root', 'M_Hip', 'M_Chest', 'M_Neck', 'M_Head',
         'L_Scapula', 'R_Scapula',
         'L_Shoulder', 'R_Shoulder', 'L_Elbow', 'R_Elbow', 'L_Hand', 'R_Hand',
         'L_Hip', 'R_Hip', 'L_Knee', 'R_Knee', 'L_Ankle', 'R_Ankle',
@@ -565,11 +590,9 @@ class HM2_OT_Process(Operator):
             for i in range(count):
                 names.add(f'M_Spine{i + 1}')
 
-        # Twist bones (identified by parent being in _TWIST_PARENTS + .NNN suffix)
+        # Twist bones (.NNN suffix, chaining up to a joint in _TWIST_PARENTS)
         for bone in arm_obj.data.bones:
-            if (re.search(r'\.\d{3}$', bone.name)
-                    and bone.parent
-                    and bone.parent.name in cls._TWIST_PARENTS):
+            if cls._twist_joint_of(bone):
                 names.add(bone.name)
 
         # Finger bones
@@ -624,11 +647,12 @@ class HM2_OT_Process(Operator):
 
         bpy.ops.object.mode_set(mode='EDIT')
         eb = arm.data.edit_bones
+        # Computed before any removal, so the chained twist parents are still
+        # intact while _twist_joint_of walks up them.
         to_delete = [
             bone for bone in eb
             if any(bone.name.startswith(p) for p in self._ADDED_PREFIXES)
-            or (re.search(r'\.\d{3}$', bone.name)
-                and bone.parent and bone.parent.name in self._TWIST_PARENTS)
+            or self._twist_joint_of(bone) is not None
         ]
         for bone in to_delete:
             eb.remove(bone)
@@ -673,12 +697,16 @@ class HM2_OT_Process(Operator):
         self._remove_intermediates(arm, hm2)
 
         bpy.ops.object.mode_set(mode='EDIT')
+        self._create_hip_bone(arm, hm2)
         self._align_bone_rolls(arm, hm2)
         self._realign_finger_bones(arm, hm2)
+        self._align_finger_rolls(arm, hm2)  # after realign - align_roll needs final tails
         self._create_all_twist_bones(arm, hm2)
         self._create_ik_bones(arm, hm2)
+        self._auto_weight_twist_bones(arm, hm2)
 
         bpy.ops.object.mode_set(mode='OBJECT')
+        self._transfer_root_weights_to_hip(arm)
         bpy.ops.object.mode_set(mode='POSE')
 
         self._unlock_all_bones(arm)
@@ -687,6 +715,7 @@ class HM2_OT_Process(Operator):
             self._setup_eye_constraints(arm)
         self._setup_fk_controllers(arm)
         self._setup_twist_drivers(arm, hm2)
+        self._setup_twist_stretch(arm, hm2)
 
         if hm2.hm2_generate_shapes:
             shapes = ensure_hm2_shapes(context)
@@ -882,6 +911,96 @@ class HM2_OT_Process(Operator):
                 b.use_connect = False
                 b.parent = root_eb
 
+    def _create_hip_bone(self, arm: Object, hm2) -> None:
+        """Insert M_Hip between M_Root and everything below the waist.
+
+        M_Root stays the whole-body control. M_Hip becomes the pelvis deform
+        bone and adopts all of M_Root's children except the first spine bone,
+        which keeps hanging off M_Root - that split is what lets the hips and
+        legs sway without dragging the spine along.
+
+        Skipped in first-person mode: an arms-only rig has no pelvis, and
+        _ensure_first_person_root parents the arms straight to M_Root.
+
+        Idempotent - on a re-apply M_Hip survives cleanup (no CTRL_/IK_/MCH_
+        prefix) and only its transform and parenting get refreshed. Runs in
+        EDIT mode."""
+        if hm2.hm2_first_person_mode:
+            return
+
+        eb   = arm.data.edit_bones
+        root = eb.get('M_Root')
+        if root is None:
+            return
+
+        # The one child that stays with M_Root. Falls back to the chest when the
+        # rig has no spine bones between root and chest.
+        count     = hm2.hm2_spine_count
+        keep_name = 'M_Spine' if count == 1 else 'M_Spine1'
+        if keep_name not in eb:
+            keep_name = 'M_Chest'
+
+        hip = eb.get('M_Hip')
+        if hip is None:
+            hip = eb.new('M_Hip')
+
+        # A bone pivots about its head, so the head is the whole point here: put
+        # it on the keeper's head - the junction with the one chain that stays
+        # behind on M_Root. Tilting the pelvis then rotates it about the joint it
+        # shares with the spine, instead of shearing away from it. The bone runs
+        # back down to the root head so it spans the pelvis it deforms.
+        keeper = eb.get(keep_name)
+        anchor = keeper.head.copy() if keeper else root.tail.copy()
+        if (root.head - anchor).length < 1e-5:
+            # Degenerate rig (root head and spine base coincide) - fall back to a
+            # short downward stub so the bone stays valid.
+            hip.head = anchor
+            hip.tail = anchor - Vector((0.0, 0.0, max(root.length, 1e-3)))
+        else:
+            hip.head = anchor
+            hip.tail = root.head.copy()
+        hip.use_connect = False
+        hip.parent      = root
+        # Matches what both _align_bone_rolls variants apply to M_Root/M_Hip;
+        # set here too so the bone is sane if the roll pass ever moves.
+        hip.align_roll(Vector((0.0, -1.0, 0.0)))
+
+        for child in list(root.children):
+            if child.name in ('M_Hip', keep_name):
+                continue
+            child.use_connect = False
+            child.parent      = hip
+
+    def _transfer_root_weights_to_hip(self, arm: Object) -> None:
+        """Move the pelvis weights off M_Root and onto M_Hip.
+
+        Blender renames vertex groups alongside bones, so after
+        _rename_core_bones the pelvis weights already sit in a group called
+        'M_Root'. Renaming that group is the entire transfer - no per-vertex
+        work in the common case. Idempotent: after the first run there is no
+        'M_Root' group left to move. Runs in OBJECT mode."""
+        if 'M_Hip' not in arm.data.bones:
+            return
+        # viewlayer_only=False: a mesh excluded from the view layer would
+        # silently keep weighting a bone that no longer deforms it.
+        for mesh in get_armature_meshes(arm, viewlayer_only=False):
+            vgs = mesh.vertex_groups
+            src = vgs.get('M_Root')
+            if src is None:
+                continue
+            dst = vgs.get('M_Hip')
+            if dst is None:
+                src.name = 'M_Hip'
+                continue
+            # Both groups exist (hand-made M_Hip): fold M_Root in, then drop it.
+            src_index = src.index
+            for v in mesh.data.vertices:
+                for g in v.groups:
+                    if g.group == src_index:
+                        dst.add([v.index], g.weight, 'ADD')
+                        break
+            vgs.remove(src)
+
     def _rename_fingers(self, arm: Object, hm2) -> None:
         eb = arm.data.edit_bones
         type_name_map = {
@@ -1062,22 +1181,10 @@ class HM2_OT_Process(Operator):
         # Spine column + head/neck point roughly up -> Z faces forward (-Y).
         count = hm2.hm2_spine_count
         spine_names = ['M_Spine'] if count == 1 else [f'M_Spine{i + 1}' for i in range(count)]
-        for name in ['M_Root', *spine_names, 'M_Chest', 'M_Neck', 'M_Head']:
+        for name in ['M_Root', 'M_Hip', *spine_names, 'M_Chest', 'M_Neck', 'M_Head']:
             align_axis(name, FORWARD, UP)
 
-        # Fingers: keep each finger's segments consistent with its first joint.
-        _ftype_map = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
-                      'RING': 'Ring', 'PINKY': 'Pinky'}
-        for finger in hm2.hm2_fingers:
-            base      = _ftype_map.get(finger.finger_type, finger.finger_type)
-            start_idx = 0 if finger.finger_type == 'THUMB' else 1
-            first_eb  = eb.get(f"{finger.side}_{base}Finger{start_idx}")
-            if not first_eb:
-                continue
-            for i in range(1, finger.joint_count):
-                joint_eb = eb.get(f"{finger.side}_{base}Finger{start_idx + i}")
-                if joint_eb:
-                    joint_eb.roll = first_eb.roll
+        # Fingers are handled by _align_finger_rolls, after tails are final.
 
     def _align_bone_rolls_legacy(self, arm: Object, hm2) -> None:
         eb = arm.data.edit_bones
@@ -1145,18 +1252,7 @@ class HM2_OT_Process(Operator):
         _canonicalize_limb_pair('L_Shoulder', 'L_Elbow', 'R_Shoulder', 'R_Elbow')
         _canonicalize_limb_pair('L_Hip',      'L_Knee',  'R_Hip',      'R_Knee')
 
-        _ftype_map = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
-                      'RING': 'Ring', 'PINKY': 'Pinky'}
-        for finger in hm2.hm2_fingers:
-            base      = _ftype_map.get(finger.finger_type, finger.finger_type)
-            start_idx = 0 if finger.finger_type == 'THUMB' else 1
-            first_eb  = eb.get(f"{finger.side}_{base}Finger{start_idx}")
-            if not first_eb:
-                continue
-            for i in range(1, finger.joint_count):
-                joint_eb = eb.get(f"{finger.side}_{base}Finger{start_idx + i}")
-                if joint_eb:
-                    joint_eb.roll = first_eb.roll
+        # Fingers are handled by _align_finger_rolls, after tails are final.
 
         count = hm2.hm2_spine_count
         spine_names = ['M_Spine'] if count == 1 else [f'M_Spine{i + 1}' for i in range(count)]
@@ -1177,9 +1273,10 @@ class HM2_OT_Process(Operator):
                 if b:
                     b.roll = top_spine.roll
 
-        root_eb = eb.get('M_Root')
-        if root_eb:
-            root_eb.align_roll(Vector((0, -1, 0)))
+        for name in ('M_Root', 'M_Hip'):
+            b = eb.get(name)
+            if b:
+                b.align_roll(Vector((0, -1, 0)))
 
         for name in ('L_Scapula', 'R_Scapula'):
             b = eb.get(name)
@@ -1213,6 +1310,118 @@ class HM2_OT_Process(Operator):
                 cur.tail = new_tail
                 cur.roll = saved_roll  # realign position only, keep roll
 
+    def _align_finger_rolls(self, arm: Object, hm2) -> None:
+        """Roll every finger joint so its local +Z faces the way the finger closes.
+
+        The curl driver built in _setup_ik_constraints rotates each MCH_Bend
+        around its local X, so a finger only reads as curling when +Z points at
+        the palm. Source rigs ship arbitrary finger rolls, so this derives one
+        curl direction per finger and align_roll's every joint to it.
+
+        Must run after _realign_finger_bones: align_roll is relative to the bone
+        direction, so moving tails afterwards would invalidate the result."""
+        eb = arm.data.edit_bones
+        _ftype_map = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
+                      'RING': 'Ring', 'PINKY': 'Pinky'}
+
+        # side -> [(finger_item, [joint edit_bones])]
+        hands: dict[str, list] = {}
+        for finger in hm2.hm2_fingers:
+            base      = _ftype_map.get(finger.finger_type, finger.finger_type)
+            start_idx = 0 if finger.finger_type == 'THUMB' else 1
+            joints    = []
+            for i in range(finger.joint_count):
+                j = eb.get(f"{finger.side}_{base}Finger{start_idx + i}")
+                if j is None:
+                    break
+                joints.append(j)
+            if joints:
+                hands.setdefault(finger.side, []).append((finger, joints))
+
+        def measure_curl(joints: list) -> Vector | None:
+            """The direction a finger already bends in its rest pose, from how far
+            the interior joints sit off the straight line between the chain ends.
+            None when the finger is too straight to give a reliable answer."""
+            if len(joints) < 2:
+                return None
+            chord = joints[-1].tail - joints[0].head
+            if chord.length < 1e-6:
+                return None
+            chord_n = chord.normalized()
+            bend    = Vector((0.0, 0.0, 0.0))
+            for j in joints[1:]:
+                off   = j.head - joints[0].head
+                bend += off - chord_n * off.dot(chord_n)
+            # Relative threshold, so the same rig at a different scale decides
+            # the same way. Under 2% of finger length counts as flat.
+            if bend.length < chord.length * 0.02:
+                return None
+            return bend.normalized()
+
+        def spread_curl(side: str, entries: list) -> Vector | None:
+            """Palm normal for a hand too flat to measure, from the knuckle line
+            crossed with the average finger direction."""
+            prox = [(f, js[0]) for f, js in entries if f.finger_type != 'THUMB']
+            if len(prox) < 2:
+                return None
+            spread = prox[-1][1].head - prox[0][1].head
+            if spread.length < 1e-6:
+                return None
+            fdir = Vector((0.0, 0.0, 0.0))
+            for _f, j in prox:
+                d = j.tail - j.head
+                if d.length > 1e-6:
+                    fdir += d.normalized()
+            if fdir.length < 1e-6:
+                return None
+            normal = spread.normalized().cross(fdir.normalized())
+            if normal.length < 1e-6:
+                return None
+            normal.normalize()
+
+            # The cross product leaves the sign ambiguous. The thumb sits on the
+            # palm side, so aim the normal at it - but a splayed thumb lying in
+            # the knuckle plane gives no usable signal, in which case fall back
+            # to the hand's -Z (its roll was set deterministically above).
+            ref   = None
+            thumb = next((js[0] for f, js in entries
+                          if f.finger_type == 'THUMB'), None)
+            if thumb is not None:
+                to_thumb = thumb.head - prox[0][1].head
+                if to_thumb.length > 1e-6 and \
+                        abs(normal.dot(to_thumb.normalized())) > 0.25:
+                    ref = to_thumb
+            if ref is None:
+                hand = eb.get(f'{side}_Hand')
+                if hand is not None:
+                    ref = -hand.z_axis
+            if ref is not None and normal.dot(ref) < 0.0:
+                normal = -normal
+            return normal
+
+        for side, entries in hands.items():
+            fallback = None  # shared by every flat finger on this hand
+            for _finger, joints in entries:
+                curl = measure_curl(joints)
+                if curl is None:
+                    if fallback is None:
+                        fallback = spread_curl(side, entries)
+                    curl = fallback
+                if curl is None:
+                    continue
+                for j in joints:
+                    y = j.tail - j.head
+                    if y.length < 1e-6:
+                        continue
+                    y.normalize()
+                    # Feed align_roll the curl direction made perpendicular to
+                    # this joint's own Y, so joints that fan out along the chain
+                    # still land on a common curl plane.
+                    z = curl - y * curl.dot(y)
+                    if z.length < 1e-5:
+                        continue
+                    j.align_roll(z)
+
     def _create_all_twist_bones(self, arm: Object, hm2) -> None:
         self._twist_bone_names = {}
         twist_joints = [
@@ -1225,12 +1434,63 @@ class HM2_OT_Process(Operator):
             ('L_Knee',     hm2.hm2_twist_knee),
             ('R_Knee',     hm2.hm2_twist_knee),
         ]
+        chained = getattr(hm2, 'hm2_twist_stretch', False)
         for bone_name, count in twist_joints:
-            names = create_twist_bones(arm, bone_name, count)
+            names = create_twist_bones(arm, bone_name, count, chained=chained)
             if names:
                 self._twist_bone_names[bone_name] = names
 
         self._reparent_children_to_twist(arm, hm2)
+
+    def _auto_weight_twist_bones(self, arm: Object, hm2) -> None:
+        """Split each twisting joint's weights across its own twist bones.
+
+        create_twist_bones tiles the parent bone with segments named
+        {joint}.001..{joint}.NNN, and subdivide_bone's weights_only mode splits
+        a vertex group across exactly that naming, with segment centres at the
+        same (i + 0.5) / N positions along the bone. The two line up with no
+        glue, so this is just a call with the operator's own defaults for
+        falloff and smoothness.
+
+        Opt-in via hm2_twist_auto_weights - it consumes the joint's vertex
+        group, which is right (the segments cover the whole bone) but not
+        something to do to someone's hand-painted weights uninvited.
+
+        Runs in EDIT mode: subdivide_bone bails out of any other mode."""
+        if not getattr(hm2, 'hm2_twist_auto_weights', False):
+            return
+        for joint_name, names in self._twist_bone_names.items():
+            if not names:
+                continue
+            # Redistribute from a clean source every time. Without this a second
+            # run is a silent no-op (the joint group is already consumed), and
+            # lowering the twist count would strand the extra segment groups on
+            # the mesh, weighting bones that no longer exist.
+            self._collapse_twist_weights(arm, joint_name)
+            subdivide_bone(joint_name, arm, subdivisions=len(names),
+                           weights_only=True, skip_original_bone=True)
+
+    @staticmethod
+    def _collapse_twist_weights(arm: Object, joint_name: str) -> None:
+        """Fold every {joint}.NNN vertex group back into {joint} and drop it.
+
+        Filtered the same way subdivide_bone filters, or a mesh could get its
+        segments collapsed here and then skipped by the re-split."""
+        pattern = re.compile(re.escape(joint_name) + r'\.\d{3}$')
+        visible_only = bpy.context.scene.kitsunetools.visible_mesh_only
+        for mesh in get_armature_meshes(arm, visible_only=visible_only):
+            vgs   = mesh.vertex_groups
+            stale = [vg for vg in vgs if pattern.match(vg.name)]
+            if not stale:
+                continue
+            dst       = vgs.get(joint_name) or vgs.new(name=joint_name)
+            stale_idx = {vg.index for vg in stale}
+            for v in mesh.data.vertices:
+                total = sum(g.weight for g in v.groups if g.group in stale_idx)
+                if total > 0.0:
+                    dst.add([v.index], total, 'ADD')
+            for vg in stale:
+                vgs.remove(vg)
 
     def _reparent_children_to_twist(self, arm: Object, hm2) -> None:
         """Re-parent user bones that hang off a twisting joint onto whichever
@@ -1483,6 +1743,30 @@ class HM2_OT_Process(Operator):
                     _lt = _lh + fwd * _bone_len
                     make_ik_bone(_name, _lh, tail=_lt, parent_name='IK_EyeTarget')
 
+        # Neck -> head stretch, built like one segment of a finger: an FK control
+        # at the neck, a head control at its tip, and an MCH copy spanning them.
+        #
+        # CTRL_Head hangs off FK_Neck, not M_Neck. M_Neck is driven by the MCH,
+        # which aims at CTRL_Head - parenting the target under M_Neck would close
+        # a dependency cycle. Same reason the finger tip control parents to the
+        # last FK rather than to a deform bone.
+        _neck_eb = eb.get('M_Neck')
+        _head_eb = eb.get('M_Head')
+        if _neck_eb and _head_eb:
+            _neck_parent = _neck_eb.parent.name if _neck_eb.parent else None
+            _fk = make_ik_bone('FK_Neck', _neck_eb.head, tail=_neck_eb.tail,
+                               parent_name=_neck_parent)
+            if _fk:
+                _fk.roll = _neck_eb.roll
+            _ch = make_ik_bone('CTRL_Head', _head_eb.head, tail=_head_eb.tail,
+                               parent_name='FK_Neck')
+            if _ch:
+                _ch.roll = _head_eb.roll
+            _ms = make_ik_bone('MCH_Stretch_Neck', _neck_eb.head, tail=_neck_eb.tail,
+                               parent_name=_neck_parent)
+            if _ms:
+                _ms.roll = _neck_eb.roll
+
         _ftype_map = {'THUMB': 'Thumb', 'INDEX': 'Index', 'MIDDLE': 'Middle',
                       'RING': 'Ring', 'PINKY': 'Pinky'}
         for finger in hm2.hm2_fingers:
@@ -1659,12 +1943,16 @@ class HM2_OT_Process(Operator):
                     cr.owner_space = 'LOCAL'
                     cr.target_space = 'LOCAL'
                 else:
-                    # Master Y-scale drives the curl: rot.x = (1 - scale_y) * pi.
+                    # Master Y-scale drives the curl around local X, which
+                    # _align_finger_rolls pointed across the finger. Distal
+                    # joints close further than proximal ones, so the factor
+                    # ramps from 0.6*pi to pi along the chain.
                     bend.rotation_mode = 'XYZ'
+                    factor = math.pi * (0.6 + 0.4 * i / (n - 1)) if n > 1 else math.pi
                     fcurve = bend.driver_add('rotation_euler', 0)
                     drv = fcurve.driver
                     drv.type = 'SCRIPTED'
-                    drv.expression = '(1 - sy) * pi'
+                    drv.expression = f'(1 - sy) * {factor:.6f}'
                     var = drv.variables.new()
                     var.name = 'sy'
                     var.type = 'TRANSFORMS'
@@ -1732,13 +2020,17 @@ class HM2_OT_Process(Operator):
             if not pb.get(subtarget):
                 subtarget = 'IK_EyeTarget'
             for c in list(bone.constraints):
-                if c.type == 'TRACK_TO':
+                if c.type in {'TRACK_TO', 'DAMPED_TRACK'}:
                     bone.constraints.remove(c)
-            tt = bone.constraints.new('TRACK_TO')
-            tt.target     = arm
-            tt.subtarget  = subtarget
-            tt.track_axis = 'TRACK_Y'
-            tt.up_axis    = 'UP_Z'
+            # Damped Track, not Track To: Track To needs an up-vector and only
+            # offers world/local axes, so with UP_Z the eye counter-rolls against
+            # any head tilt and flips when the aim nears the up axis. Damped Track
+            # has no up-vector - it applies the minimal swing from the bone's
+            # head-inherited orientation, so roll follows the head for free.
+            dt = bone.constraints.new('DAMPED_TRACK')
+            dt.target     = arm
+            dt.subtarget  = subtarget
+            dt.track_axis = 'TRACK_Y'
 
     def _setup_fk_controllers(self, arm: Object) -> None:
         pb = arm.pose.bones
@@ -1802,6 +2094,100 @@ class HM2_OT_Process(Operator):
                 cr.owner_space  = 'LOCAL'
                 cr.target_space = 'LOCAL'
 
+        # Neck stretch - the finger chain's constraint stack with one segment.
+        # The MCH takes the FK control's location and scale, then stretches to
+        # the head control; the deform bones only copy the result, so animating
+        # happens on FK_Neck (rotation) and CTRL_Head (rotation + translation).
+        _stretch_pb = pb.get('MCH_Stretch_Neck')
+        if _stretch_pb and pb.get('FK_Neck') and pb.get('CTRL_Head'):
+            for c in list(_stretch_pb.constraints):
+                _stretch_pb.constraints.remove(c)
+            cl = _stretch_pb.constraints.new('COPY_LOCATION')
+            cl.target    = arm
+            cl.subtarget = 'FK_Neck'
+            cs = _stretch_pb.constraints.new('COPY_SCALE')
+            cs.target    = arm
+            cs.subtarget = 'FK_Neck'
+            st = _stretch_pb.constraints.new('STRETCH_TO')
+            st.target    = arm
+            st.subtarget = 'CTRL_Head'
+            st.volume    = 'NO_VOLUME'
+            st.keep_axis = 'SWING_Y'
+
+            for _owner, _src in (('M_Neck', 'MCH_Stretch_Neck'),
+                                 ('M_Head', 'CTRL_Head')):
+                _b = pb.get(_owner)
+                if not _b:
+                    continue
+                for c in list(_b.constraints):
+                    if c.type == 'COPY_TRANSFORMS':
+                        _b.constraints.remove(c)
+                ct = _b.constraints.new('COPY_TRANSFORMS')
+                ct.target    = arm
+                ct.subtarget = _src
+
+    def _setup_twist_stretch(self, arm: Object, hm2) -> None:
+        """Let each twist bone stretch toward the next joint down the chain.
+
+        Twist segments only, never the joint itself: a STRETCH_TO on L_Elbow
+        would drag the whole forearm toward a dislocated wrist, where the point
+        is to deform across the gap. The twists carry the deform weights, so
+        stretching just them lets an animator pull a wrist or ankle off its
+        socket without the mesh tearing.
+
+        A no-op at rest - the twists are colinear with their joint and the
+        target sits at that joint's tail, so the aim direction is unchanged and
+        the scale ratio is 1. Runs in POSE mode.
+
+        Opt-in, and only meaningful alongside the chained parenting the same
+        flag switches on in create_twist_bones - with flat parenting every twist
+        head is pinned to the joint and nothing past the first could stretch."""
+        if not getattr(hm2, 'hm2_twist_stretch', False):
+            return
+        pb = arm.pose.bones
+        for joint_name, names in self._twist_bone_names.items():
+            target_name = self._TWIST_STRETCH_TARGETS.get(joint_name)
+            if not (target_name and names):
+                continue
+            target_pb = pb.get(target_name)
+            if target_pb is None:
+                continue
+            target_head = target_pb.bone.head_local
+            for name in names:
+                b = pb.get(name)
+                if b is None:
+                    continue
+                for c in list(b.constraints):
+                    if c.type == 'STRETCH_TO':
+                        b.constraints.remove(c)
+                # Every segment targets the joint's endpoint, NOT the next twist
+                # bone. Aiming at the next one reads its head, which - now that
+                # the twists are chained - depends on this bone's own stretch
+                # result. That is a dependency cycle and the depsgraph resolves
+                # it arbitrarily, throwing bones across the scene.
+                #
+                # The chained parenting is what distributes the stretch anyway:
+                # this segment extends, which carries the next segment's head
+                # along, which re-measures from there. Each link ends up scaling
+                # by the same ratio, so the stretch spreads evenly without any
+                # segment ever having to look at its neighbour.
+                rest_dist = (target_head - b.bone.head_local).length
+                if rest_dist < 1e-5:
+                    continue
+                st = b.constraints.new('STRETCH_TO')
+                st.target      = arm
+                st.subtarget   = target_name
+                # Must be the rest head-to-target distance, not the default. The
+                # default is the bone's OWN length, and a twist segment is 1/N of
+                # the joint - every one of them would stretch to span the whole
+                # limb segment on frame one. Posed length works out to
+                # bone_length * (dist / rest_length), so this reads 1.0 at rest.
+                st.rest_length = rest_dist
+                st.volume      = 'NO_VOLUME'
+                # Swing-only, so the Y-rotation twist drivers survive. A plane
+                # lock would recompute roll from scratch and cancel them.
+                st.keep_axis   = 'SWING_Y'
+
     def _setup_twist_drivers(self, arm: Object, hm2) -> None:
         pb = arm.pose.bones
 
@@ -1823,11 +2209,31 @@ class HM2_OT_Process(Operator):
                 twist_pb = pb.get(twist_name)
                 if not twist_pb:
                     continue
-                if invert:
-                    influence = (n - idx) / n
+                # Either way the chain should end up with these absolute shares:
+                #   FOLLOW  : +(idx + 1) / n  - ramps up away from the joint
+                #   AGAINST : -(n - idx) / n  - full at the joint, fading out
+                #
+                # Chained parenting makes each segment inherit whatever the ones
+                # above it rotated, so there the DELTA gets written rather than
+                # the share itself - otherwise the values accumulate and the far
+                # end overshoots several times over. Differencing gives a flat
+                # 1/n step, except the first AGAINST segment which carries the
+                # whole counter-twist and is then walked back toward zero. The
+                # segments are colinear and share a roll, so the local Y
+                # rotations sum cleanly down the chain.
+                if getattr(hm2, 'hm2_twist_stretch', False):
+                    if invert:
+                        step_influence = 1.0 if idx == 0 else 1.0 / n
+                        step_invert    = (idx == 0)
+                    else:
+                        step_influence = 1.0 / n
+                        step_invert    = False
                 else:
-                    influence = (idx + 1) / n
-                add_twist_driver(arm, twist_pb, resolved, influence, invert)
+                    # Flat parenting - nothing accumulates, so each segment
+                    # carries its own absolute share directly.
+                    step_influence = (n - idx) / n if invert else (idx + 1) / n
+                    step_invert    = invert
+                add_twist_driver(arm, twist_pb, resolved, step_influence, step_invert)
 
         setup_joint_twists('L_Shoulder', 'hm2_twist_shoulder_target_l', 'hm2_twist_shoulder_mode_l')
         setup_joint_twists('R_Shoulder', 'hm2_twist_shoulder_target_r', 'hm2_twist_shoulder_mode_r')
@@ -1924,6 +2330,34 @@ class HM2_OT_Process(Operator):
             _root_pb.use_custom_shape_bone_size = False
             _root_pb.custom_shape_translation   = Vector((0, _bl * 0.5, 0))
 
+        # M_Hip reuses the chest widget turned upside down. Both are pinned to
+        # world axes (the _bw.inverted() cancels the bone's own basis), so this
+        # does not depend on M_Hip pointing down.
+        #
+        # The flip has to be about Y, not Z: _create_shoulder_mesh is symmetric
+        # in both X and Y, so a 180-degree turn about Z maps the widget onto
+        # itself and shows no change at all. Z is the only asymmetric axis - the
+        # ring arcs toward +Z - so inverting Z is the only visible flip.
+        _hip_pb = pb.get('M_Hip')
+        if _hip_pb and 'shoulder' in shapes:
+            _bl = _hip_pb.bone.length
+            _sz = _hip_width if _hip_width > 0 else _bl * 1.8
+            _hip_pb.custom_shape                 = shapes['shoulder']
+            _hip_pb.custom_shape_scale_xyz       = (_sz, _sz, _sz)
+            _hip_pb.use_custom_shape_bone_size   = False
+            _bw = _arm_world_3x3 @ _hip_pb.bone.matrix_local.to_3x3()
+            _flipped = Matrix((Vector((-1.0, 0.0, 0.0)),
+                               Vector((0.0,  1.0, 0.0)),
+                               Vector((0.0,  0.0, -1.0)))).transposed()
+            _hip_pb.custom_shape_rotation_euler  = (_bw.inverted() @ _flipped).to_euler()
+            # The widget's ring is centred at y = 0.5, so pull it forward by half
+            # its size to sit on the bone - same cancellation the chest does. Then
+            # drop it half a bone length to centre it on the pelvis, since the
+            # head is up at the waist.
+            _world_off = (Vector((0.0, -1.0, 0.0)) * (_sz * 0.5)
+                          + Vector((0.0,  0.0, -1.0)) * (_bl * 0.5))
+            _hip_pb.custom_shape_translation     = _bw.inverted() @ _world_off
+
         for _sbn in ('M_Spine', 'M_Spine1', 'M_Spine2', 'M_Spine3',
                      'M_Spine4', 'M_Spine5', 'M_Spine6', 'M_Spine7', 'M_Spine8'):
             _spb = pb.get(_sbn)
@@ -1955,15 +2389,31 @@ class HM2_OT_Process(Operator):
 
         # Neck/head: Rigify uses create_circle_widget with bone-relative radii.
         # We keep absolute sizing here keyed to body ref.
+        #
+        # The widgets go on the controls, not the deform bones - M_Neck and
+        # M_Head are driven by COPY_TRANSFORMS once the neck stretch is built.
+        # Falls back to the deform bones if the controls are missing.
         _br = _body_ref or ref
-        for _bn, _mult, _ht in (('M_Neck', 1.0, 0.5), ('M_Head', 2.5, 1.0)):
-            _b = pb.get(_bn)
-            if _b and 'circle' in shapes:
-                _sz = _br * _mult
-                _b.custom_shape               = shapes['circle']
-                _b.custom_shape_scale_xyz     = (_sz, _sz, _sz)
-                _b.use_custom_shape_bone_size = False
-                _b.custom_shape_translation   = Vector((0, _b.bone.length * _ht, 0))
+        _neck_ctrl = 'FK_Neck'   if pb.get('FK_Neck')   else 'M_Neck'
+        _head_ctrl = 'CTRL_Head' if pb.get('CTRL_Head') else 'M_Head'
+
+        _b = pb.get(_neck_ctrl)
+        if _b and 'circle' in shapes:
+            _sz = _br * 1.0
+            _b.custom_shape               = shapes['circle']
+            _b.custom_shape_scale_xyz     = (_sz, _sz, _sz)
+            _b.use_custom_shape_bone_size = False
+            _b.custom_shape_translation   = Vector((0, _b.bone.length * 0.5, 0))
+
+        # Box rather than a ring, and 5.0 not 2.5: the box mesh is +/-0.5 while
+        # the circle has radius 1.0, so twice the scale to cover the same reach.
+        _b = pb.get(_head_ctrl)
+        if _b and 'box' in shapes:
+            _sz = _br * 5.0
+            _b.custom_shape               = shapes['box']
+            _b.custom_shape_scale_xyz     = (_sz, _sz, _sz)
+            _b.use_custom_shape_bone_size = False
+            _b.custom_shape_translation   = Vector((0, _b.bone.length * 0.5, 0))
 
         # Scale to roughly match the character's stance width.
         _ground_sz = max(_hip_width, _sho_width) * 0.9 if (_hip_width or _sho_width) else ref * 6.0
@@ -2106,12 +2556,13 @@ class HM2_OT_Process(Operator):
 
         for n in ('CTRL_Ground', 'M_Root'):
             color(n, 'THEME07')
-        for n in ('M_Chest', 'M_Spine', 'M_Spine1', 'M_Spine2', 'M_Spine3',
+        for n in ('M_Hip', 'M_Chest', 'M_Spine', 'M_Spine1', 'M_Spine2', 'M_Spine3',
                   'M_Spine4', 'M_Spine5', 'M_Spine6', 'M_Spine7', 'M_Spine8',
                   'CTRL_Toe_L', 'CTRL_Toe_R'):
             color(n, 'THEME05')
-        for n in ('IK_Hand_L', 'IK_Hand_R', 'IK_Ankle_L', 'IK_Ankle_R'):
+        for n in ('IK_Hand_L', 'IK_Hand_R', 'IK_Ankle_L', 'IK_Ankle_R', 'CTRL_Head'):
             color(n, 'THEME04')
+        color('FK_Neck', 'THEME05')
         for n in ('IK_EyeTarget', 'IK_EyeTarget_L', 'IK_EyeTarget_R'):
             color(n, 'THEME08')
         for n in ('IK_Elbow_L', 'IK_Elbow_R', 'IK_Knee_L', 'IK_Knee_R'):
@@ -2153,7 +2604,7 @@ class HM2_OT_Process(Operator):
         pb = arm.pose.bones
 
         _SINGLE = {
-            'Root': 'M_Root', 'Chest': 'M_Chest',
+            'Root': 'M_Root', 'Pelvis': 'M_Hip', 'Chest': 'M_Chest',
             'Neck': 'M_Neck', 'Head':  'M_Head',
         }
         _BILATERAL = {
@@ -2335,7 +2786,13 @@ class HM2_OT_Process(Operator):
                 target = mech_coll
             elif name.startswith('FK_') or name.startswith('CTRL_') or name.startswith('IK_'):
                 target = ctrl_coll
-            elif name in ('M_Root', 'M_Neck', 'M_Chest', 'M_Head') or name.startswith('M_Spine') or name == 'M_Spine':
+            # Driven by FK_Neck / CTRL_Head once the neck stretch is built, so
+            # they belong with the other hidden deform bones rather than sitting
+            # unwidgeted under the controls. Falls through to Spine if the
+            # controls were not created.
+            elif name in ('M_Neck', 'M_Head') and 'CTRL_Head' in arm.data.bones:
+                target = default_coll
+            elif name in ('M_Root', 'M_Hip', 'M_Neck', 'M_Chest', 'M_Head') or name.startswith('M_Spine') or name == 'M_Spine':
                 target = spine_coll
             elif 'Finger' in name:
                 target = finger_coll
@@ -2606,13 +3063,16 @@ class HM2_OT_Process(Operator):
         self._remove_intermediates(puppet_obj, puppet_hm2)
 
         bpy.ops.object.mode_set(mode='EDIT')
+        self._create_hip_bone(puppet_obj, puppet_hm2)
         self._create_all_twist_bones(puppet_obj, puppet_hm2)
 
         if mode == 'SELF':
             self._computed_pole_angles = {}
             self._create_ik_bones(puppet_obj, puppet_hm2)
+        self._auto_weight_twist_bones(puppet_obj, puppet_hm2)
 
         bpy.ops.object.mode_set(mode='OBJECT')
+        self._transfer_root_weights_to_hip(puppet_obj)
         bpy.ops.object.mode_set(mode='POSE')
         self._unlock_all_bones(puppet_obj)
 
@@ -2622,6 +3082,7 @@ class HM2_OT_Process(Operator):
                 self._setup_eye_constraints(puppet_obj)
             self._setup_fk_controllers(puppet_obj)
             self._setup_twist_drivers(puppet_obj, puppet_hm2)  # also calls _setup_twist_vs
+            self._setup_twist_stretch(puppet_obj, puppet_hm2)
             if puppet_hm2.hm2_generate_shapes:
                 shapes = ensure_hm2_shapes(context)
                 self._assign_custom_shapes(puppet_obj, puppet_hm2, shapes)
@@ -2773,7 +3234,7 @@ class HM2_OT_Process(Operator):
     def _hm2_deform_names(self, hm2) -> set[str]:
         """Return the explicit set of HM2 deform bone names for a given hm2 config."""
         names: set[str] = {
-            'M_Root', 'M_Chest', 'M_Neck', 'M_Head',
+            'M_Root', 'M_Hip', 'M_Chest', 'M_Neck', 'M_Head',
             'L_Eye', 'R_Eye',
             'L_Scapula', 'R_Scapula',
             'L_Shoulder', 'R_Shoulder',
@@ -2837,7 +3298,7 @@ class HM2_OT_Process(Operator):
             if name in allowed:
                 if name in twist_names:
                     target = twist_coll
-                elif name in ('M_Root', 'M_Neck', 'M_Chest', 'M_Head') \
+                elif name in ('M_Root', 'M_Hip', 'M_Neck', 'M_Chest', 'M_Head') \
                         or name.startswith('M_Spine') or name == 'M_Spine':
                     target = spine_coll
                 elif 'Finger' in name:

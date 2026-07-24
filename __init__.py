@@ -309,6 +309,29 @@ class KitsuneTool_HM2Properties(PropertyGroup):
     hm2_twist_hip:      IntProperty(name="Hip Twists",      default=4, min=0, max=6)
     hm2_twist_knee:     IntProperty(name="Knee Twists",     default=2, min=0, max=6)
 
+    hm2_twist_stretch: BoolProperty(
+        name="Stretchy Twist Chain",
+        default=False,
+        description=(
+            "Chain each joint's twist bones together and let them stretch "
+            "toward the next joint, so translating a wrist or ankle off its "
+            "socket deforms the limb instead of tearing it. Aimed at stylised "
+            "or exaggerated animation. Leave off for realistic characters - "
+            "the default parents every twist bone straight to its joint with "
+            "no stretching"
+        ),
+    )
+
+    hm2_twist_auto_weights: BoolProperty(
+        name="Auto Weight Twist Bones",
+        default=True,
+        description=(
+            "Split each twisting joint's weights across its twist bones. "
+            "The joint's own vertex group is consumed - the twist segments "
+            "cover the whole bone. Leave off to weight them yourself"
+        ),
+    )
+
     # Twist driver config - per joint per side
     hm2_twist_shoulder_target_l: StringProperty(name="Shoulder Twist Target L", default="L_Shoulder")
     hm2_twist_shoulder_target_r: StringProperty(name="Shoulder Twist Target R", default="R_Shoulder")

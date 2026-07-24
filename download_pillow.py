@@ -4,15 +4,21 @@ from pathlib import Path
 
 def download_pillow_wheels():
     addon_dir = Path(__file__).parent
-    wheels_dir = addon_dir / "io_scene_valvesource" / "wheels"
+    wheels_dir = addon_dir / "wheels"
     wheels_dir.mkdir(exist_ok=True)
-    
+
+    # cp311 -> Blender 4.5 / 5.0 (Python 3.11); cp313 -> Blender 5.1+ (Python 3.13)
     platforms = [
         ("cp311", "win_amd64"),
         ("cp311", "macosx_11_0_arm64"),
         ("cp311", "macosx_10_10_x86_64"),
         ("cp311", "manylinux_2_28_x86_64"),
         ("cp311", "manylinux_2_27_x86_64"),
+        ("cp313", "win_amd64"),
+        ("cp313", "macosx_11_0_arm64"),
+        ("cp313", "macosx_10_13_x86_64"),
+        ("cp313", "manylinux_2_28_x86_64"),
+        ("cp313", "manylinux_2_27_x86_64"),
     ]
     
     print("Fetching Pillow releases from PyPI...")

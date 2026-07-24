@@ -448,11 +448,17 @@ class NODE_OT_node_bake_run(Operator):
     def _merge_with_pil(self, col_path, alpha_path, export_dir, filename, fmt):
         with Image.open(col_path).convert("RGBA") as base_img:
             with Image.open(alpha_path).convert("L") as alpha_mask:
-                r, g, b, _ = base_img.split()
-                final_rgba = Image.merge("RGBA", (r, g, b, alpha_mask))
                 ext = ".png" if fmt == 'PNG' else ".tga"
                 save_path = os.path.normpath(os.path.join(export_dir, filename + ext))
-                final_rgba.save(save_path)
+
+                # A fully opaque alpha carries no information - drop it and save RGB.
+                if alpha_mask.getextrema()[0] == 255:
+                    print("        note: alpha is fully opaque - saved as RGB")
+                    base_img.convert("RGB").save(save_path)
+                    return
+
+                r, g, b, _ = base_img.split()
+                Image.merge("RGBA", (r, g, b, alpha_mask)).save(save_path)
 
 
 class NODE_OT_node_bake_all_materials(Operator):
@@ -773,7 +779,7 @@ class NODE_OT_set_copy_input(Operator):
 class NODE_OT_node_bake_auto_resolution(Operator):
     bl_idname = "node.node_bake_auto_resolution"
     bl_label = "Auto Resolution"
-    bl_description = "Set resolution from the average of all connected Image Texture nodes"
+    bl_description = "Set resolution from the largest of all connected Image Texture nodes"
 
     material_name: StringProperty(default="")
 
@@ -804,7 +810,7 @@ class NODE_OT_node_bake_auto_resolution(Operator):
 
     reducer: bpy.props.IntProperty(
         name="Reducer",
-        description="Divide the averaged resolution before snapping. 1 = no reduction, 2 = half, etc.",
+        description="Divide the resolution before snapping. 1 = no reduction, 2 = half, etc.",
         default=1,
         min=1,
     )
@@ -893,10 +899,10 @@ class NODE_OT_node_bake_auto_resolution(Operator):
                 if not sizes:
                     continue
 
-                avg_x = (sum(w for w, _ in sizes) / len(sizes)) / self.reducer
-                avg_y = (sum(h for _, h in sizes) / len(sizes)) / self.reducer
-                snapped_x = str(min(resolutions, key=lambda r: abs(r - avg_x)))
-                snapped_y = str(min(resolutions, key=lambda r: abs(r - avg_y)))
+                target_x = max(w for w, _ in sizes) / self.reducer
+                target_y = max(h for _, h in sizes) / self.reducer
+                snapped_x = str(min(resolutions, key=lambda r: abs(r - target_x)))
+                snapped_y = str(min(resolutions, key=lambda r: abs(r - target_y)))
 
                 item.resolution_x = snapped_x
                 if snapped_x != snapped_y:

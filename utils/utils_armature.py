@@ -1,7 +1,7 @@
 import bpy, re
 from mathutils import Matrix, Vector, Quaternion
 from bpy.types import Object, Bone, PoseBone, EditBone
-from .utils_object import get_armature_meshes, is_armature
+from .utils_object import get_armature_meshes, is_armature, is_bone_selected
 from .utils_contextmanagers import selfreport, preserve_armature_state, preserve_context_mode, unhide_all_objects, report, copy_property_group, copy_addon_properties
 from .utils_object import op_override, apply_armature_to_mesh_without_shape_keys, apply_armature_to_mesh_with_shapekeys, reevaluate_bone_parented_empty_matrix
 from .utils_vertexgroup import get_used_vertexgroups
@@ -82,7 +82,8 @@ def get_selected_bones(armature : Object | None, bone_type : str = 'BONE', sort_
         
         for bone in armatureBones:
             if not select_all:
-                if bone.hide_select or not bone.select:
+                pbone = armature.pose.bones.get(bone.name)
+                if bone.hide_select or pbone is None or not is_bone_selected(pbone):
                     continue
                     
                 if armatureBoneCollections and bone.collections:
@@ -230,13 +231,16 @@ def apply_current_pose_as_restpose(armature: Object | None, only_selected : bool
 
 
 @selfreport
-def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = ""):
+def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "", debug : bool = False):
     if not is_armature(armature): return
+
+    dbg = (lambda *a: print('[KitsuneTools][PoseShapekey]', *a)) if debug else (lambda *a: None)
 
     with unhide_all_objects(), preserve_armature_state(armature, reset_pose=False):
         meshes = get_armature_meshes(armature)
+        dbg(f"armature={armature.name} meshes={[m.name for m in meshes]}")
         if not meshes: return
-        
+
         success_count = 0
 
         # Evaluate constraints/drivers/parenting before measuring what actually moved.
@@ -253,6 +257,8 @@ def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "
             if sum(abs(val) for row in (delta - identity) for val in row) > 1e-4:
                 posebones.add(pbone.name)
 
+        dbg(f"bones evaluating away from rest ({len(posebones)}): {sorted(posebones)}")
+
         bpy.ops.object.select_all(action='DESELECT')
 
         for mesh in meshes:
@@ -260,14 +266,19 @@ def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "
             
             if not arm_mod:
                 report('WARNING', f"Mesh {mesh.name} has no Armature modifier for {armature.name}")
+                dbg(f"  {mesh.name}: SKIP - no armature modifier")
                 continue
-            
+
             used_vgroup_names = get_used_vertexgroups(mesh, return_names=True)
 
             # If none of the posed bones weight this mesh it cannot deform, so skip it
             # entirely instead of applying the modifier and adding an empty shapekey.
-            if posebones.isdisjoint(used_vgroup_names):
+            overlap = posebones.intersection(used_vgroup_names)
+            if not overlap:
+                dbg(f"  {mesh.name}: SKIP - none of its {len(set(used_vgroup_names))} used vertex groups are posed")
                 continue
+
+            dbg(f"  {mesh.name}: posed groups weighting it -> {sorted(overlap)}")
 
             original_shapekey_values = {}
             if mesh.data.shape_keys and mesh.data.shape_keys.key_blocks:
@@ -293,15 +304,21 @@ def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "
                         )
                         
                         if not has_deformation:
+                            dbg(f"  {mesh.name}: DROP - shapekey came out identical to basis")
                             mesh.shape_key_remove(new_key)
                             if len(mesh.data.shape_keys.key_blocks) <= 1:
                                 mesh.shape_key_remove(mesh.data.shape_keys.key_blocks[0])
                         else:
                             success_count += 1
                             new_key.name = shapekey_name if shapekey_name else 'Pose_Shape'
-                        
+                            dbg(f"  {mesh.name}: OK - created '{new_key.name}'")
+
+                    else:
+                        dbg(f"  {mesh.name}: DROP - modifier applied but no shape_keys exist")
+
                 else:
                     report('ERROR', f"Failed to apply modifier for {mesh.name}")
+                    dbg(f"  {mesh.name}: FAIL - modifier_apply_as_shapekey returned {ret}")
 
                 mesh.select_set(False)
                 

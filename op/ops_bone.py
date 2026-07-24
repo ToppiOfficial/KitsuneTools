@@ -2,7 +2,7 @@ import bpy
 from bpy.types import Operator
 from bpy.props import EnumProperty, BoolProperty, FloatProperty, IntProperty, StringProperty
 from mathutils import Matrix, Vector
-from ..utils.utils_object import is_armature, is_mesh, get_armature
+from ..utils.utils_object import is_armature, is_mesh, get_armature, is_bone_selected
 from ..utils.utils_armature import get_armature_meshes, preserve_context_mode, get_selected_bones, get_visible_bones
 from ..utils.utils_bone import merge_bones, remove_bone, centralize_bone_pairs, subdivide_bone
 from ..utils.utils_pose import _find_mirror_bone, _copy_mirrored_pose
@@ -332,9 +332,9 @@ class BONE_OT_SubdivideBone(Operator):
         
         if context.mode in {'POSE', 'EDIT_ARMATURE'}:
             has_selection = any(
-                b for arm in selected_arms
-                for b in (arm.data.bones if context.mode == 'POSE' else arm.data.edit_bones)
-                if b.select
+                is_bone_selected(b) if context.mode == 'POSE' else b.select
+                for arm in selected_arms
+                for b in (arm.pose.bones if context.mode == 'POSE' else arm.data.edit_bones)
             )
             if has_selection:
                 return context.window_manager.invoke_props_dialog(self)
@@ -383,8 +383,9 @@ class BONE_OT_MergeBones(Operator):
         if arm is None or arm.mode not in ['WEIGHT_PAINT', 'POSE', 'EDIT']:
             return False
 
-        bones = (arm.data.edit_bones if arm.mode == 'EDIT' else arm.data.bones)
-        return any(b.select and not b.hide for b in bones)
+        if arm.mode == 'EDIT':
+            return any(b.select and not b.hide for b in arm.data.edit_bones)
+        return any(is_bone_selected(pb) and not pb.bone.hide for pb in arm.pose.bones)
     
     def execute(self, context) -> set:
         if context.mode == 'PAINT_WEIGHT':
@@ -571,7 +572,7 @@ class BONE_OT_CreateCenterBone(Operator):
             selected_bones = [b for b in armature.data.edit_bones if b.select]
             all_bones = armature.data.edit_bones
         else:
-            selected_bones = [armature.data.bones[pb.name] for pb in armature.pose.bones if pb.bone.select]
+            selected_bones = [armature.data.bones[pb.name] for pb in armature.pose.bones if is_bone_selected(pb)]
             all_bones = armature.data.bones
         
         if len(selected_bones) != 2:
@@ -796,7 +797,7 @@ class BONE_OT_parent_bone_in_pose(Operator):
         if not is_armature(ob): return False
         if ob.mode != 'POSE': return False
 
-        selected_bones = [pb for pb in ob.pose.bones if pb.bone.select and not pb.bone.hide]
+        selected_bones = [pb for pb in ob.pose.bones if is_bone_selected(pb) and not pb.bone.hide]
         return len(selected_bones) > 1 and context.active_pose_bone is not None
     
     def execute(self, context) -> set:
