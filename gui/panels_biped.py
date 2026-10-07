@@ -2,13 +2,15 @@ from bpy.types import Panel, UIList, UILayout, Context
 from typing import Any
 
 from ..utils.utils_object import is_armature
-from ..op.ops_humanoidmapper2 import (
+from ..op.ops_biped import (
     HM2_OT_AddFinger,
     HM2_OT_RemoveFinger,
     HM2_OT_MirrorFingers,
     HM2_OT_MirrorBodyMapping,
     HM2_OT_CopyMappingToSelected,
     HM2_OT_ValidateMapping,
+    HM2_OT_AddTwistDriver,
+    HM2_OT_FKTwist,
     HM2_OT_Process,
     HM2_OT_JsonFormatHelp,
     HM2_OT_FirstPersonArms,
@@ -93,7 +95,7 @@ def _draw_bone_single(layout: UILayout, data, prop: str, label: str, arm) -> Non
 
 class TOOLS_PT_KitsuneTool_HM2(_HM2PanelBase):
     bl_idname = 'TOOLS_PT_KitsuneTool_HM2'
-    bl_label = 'Humanoid Mapper 2'
+    bl_label = 'Biped Mapping'
     bl_parent_id = 'TOOLS_PT_KitsuneTool_HumanoidMapping'
 
     def draw(self, context: Context) -> None:
@@ -132,6 +134,7 @@ class TOOLS_PT_KitsuneTool_HM2_Core(_HM2PanelBase):
 
         col.separator()
         col.label(text="Optional:")
+        _draw_bone_single(col, hm2, 'hm2_map_pelvis', 'Pelvis (auto if empty)', arm)
         _draw_bone_pair(col, hm2, 'hm2_map_eye_l', 'hm2_map_eye_r', 'Eyes', arm)
         col.operator(HM2_OT_MirrorBodyMapping.bl_idname, icon='MOD_MIRROR', text="Mirror Eyes").scope = 'EYES'
 
@@ -306,6 +309,23 @@ class TOOLS_PT_KitsuneTool_HM2_Export(_HM2PanelBase):
         row.prop(hm2, 'hm2_json_filepath', text="")
         row.operator(HM2_OT_JsonFormatHelp.bl_idname, text="", icon='QUESTION')
 
+
+
+class TOOLS_PT_KitsuneTool_HM2_TwistDriver(_HM2PanelBase):
+    bl_idname = 'TOOLS_PT_KitsuneTool_HM2_TwistDriver'
+    bl_label = 'Twist Driver'
+    bl_parent_id = 'TOOLS_PT_KitsuneTool_HumanoidMapping'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context: Context) -> None:
+        layout = self.layout
+        col = layout.column(align=True)
+        col.label(text="Adapt an existing rig to the twist system:", icon='DRIVER')
+        col.label(text="Select twist bone(s), then the driver bone.")
+        col.separator()
+        col.operator(HM2_OT_AddTwistDriver.bl_idname, icon='CON_ROTLIKE')
+        col.separator()
+        col.operator(HM2_OT_FKTwist.bl_idname, icon='BONE_DATA')
 
 
 class TOOLS_PT_KitsuneTool_HM2_FirstPersonArms(_HM2PanelBase):

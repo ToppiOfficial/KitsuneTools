@@ -1,6 +1,7 @@
 import bpy, re, fnmatch
-from bpy.types import Object, Operator, Context, PoseBone
-from bpy.props import BoolProperty, StringProperty, EnumProperty, FloatProperty, IntProperty
+from bpy.types import Object, Operator, Context, PoseBone, PropertyGroup
+from bpy.props import BoolProperty, StringProperty, EnumProperty, FloatProperty, IntProperty, CollectionProperty
+from mathutils import Matrix
 from ..utils.utils_armature import apply_current_pose_as_restpose, apply_current_pose_shapekey, get_selected_bones, copy_armature_visual_pose, fit_armature_pose_to_reference, merge_armatures, transfer_armature_bonedata
 from ..utils.utils_contextmanagers import preserve_context_mode
 from ..utils.utils_object import get_armature, is_armature, get_armature_meshes
@@ -146,7 +147,7 @@ class _apply_pose:
                         dbg(f"  muted ({len(muted)}): {muted}")
 
                     if as_shapekey:
-                        apply_current_pose_shapekey(armature=armature, shapekey_name=self.shapekey_name.strip(), debug=self.debug)
+                        apply_current_pose_shapekey(armature=armature, shapekey_name=self.shapekey_name.strip(), add_to_existing=self.add_to_existing, debug=self.debug)
                     else:
                         apply_current_pose_as_restpose(armature=armature)
 
@@ -195,7 +196,9 @@ class ARMATURE_OT_ApplyPoseAsShapekey(_apply_pose, Operator):
     
     as_shapekey : BoolProperty(default=True)
     shapekey_name : StringProperty(name='Shapekey Name', default='Pose_Shape')
-    
+    add_to_existing : BoolProperty(name='Add to Existing', default=False,
+        description='Add the pose deformation onto the shapekey with this name if the mesh has it, otherwise create it')
+
     @classmethod
     def poll(cls, context : Context) -> bool:
         return bool(is_armature(context.active_object) and context.mode in {'POSE', 'OBJECT'}) and not context.active_object.hide_get()
@@ -207,6 +210,7 @@ class ARMATURE_OT_ApplyPoseAsShapekey(_apply_pose, Operator):
         layout = self.layout
         layout.prop(self, 'selected_only')
         layout.prop(self, 'shapekey_name')
+        layout.prop(self, 'add_to_existing')
         layout.prop(self, 'debug')
 
 
@@ -265,14 +269,17 @@ class ARMATURE_OT_MergeArmatures(Operator):
             try:
                 for arm in armatures_to_merge:
                     try:
-                        if self.clean_bones:
-                            bpy.ops.object.select_all(action='DESELECT')
-                            context.view_layer.objects.active = arm
-                            arm.select_set(True)
-                            bpy.ops.kitsunetools.clean_unweighted_bones('EXEC_DEFAULT', cleaning_mode='FULL_CLEAN', remove_empty_vertex_groups=True)
-                    
+                        # Clean after merging so constraint/IK bones still drive the visual pose during the copy
+                        bones_before = {b.name for b in active_object.data.bones}
                         merge_armatures(active_object, arm, match_posture=self.match_posture, anchor_bone=resolved_anchor, apply_pose=self.apply_pose, group_bone_collections=self.group_bone_collections)
                         success_count += 1
+
+                        incoming_bones = [{'name': b.name} for b in active_object.data.bones if b.name not in bones_before]
+                        if self.clean_bones and incoming_bones:
+                            bpy.ops.object.select_all(action='DESELECT')
+                            context.view_layer.objects.active = active_object
+                            active_object.select_set(True)
+                            bpy.ops.kitsunetools.clean_unweighted_bones('EXEC_DEFAULT', cleaning_mode='FULL_CLEAN', remove_empty_vertex_groups=True, restrict_bones=incoming_bones)
                     except Exception as e:
                         self.report({'ERROR'}, f"Failed to merge '{arm.name}': {str(e)}")
                         continue
@@ -314,6 +321,33 @@ class ARMATURE_OT_CopyVisPosture(Operator):
             copy_armature_visual_pose(base_armature=currArm,target_armature=otherArm,copy_type=self.copy_type,)
         
         return {'FINISHED'} if copiedcount > 0 else {'CANCELLED'}
+
+
+class ARMATURE_OT_ResetPose(Operator):
+    """Reset every pose bone of the selected armatures back to its rest transform"""
+    bl_idname = "kitsunetools.reset_armature_pose"
+    bl_label = "Reset Armature Pose"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        return context.mode == 'OBJECT' and any(is_armature(ob) for ob in context.selected_objects)
+
+    def execute(self, context: Context) -> set:
+        identity = Matrix()
+        count = 0
+
+        for ob in context.selected_objects:
+            if not is_armature(ob):
+                continue
+            for pbone in ob.pose.bones:
+                pbone.matrix_basis = identity
+            ob.data.update_tag()
+            count += 1
+
+        context.view_layer.update()
+        self.report({'INFO'}, f"Reset pose on {count} armature(s)")
+        return {'FINISHED'}
 
 
 class ARMATURE_OT_FitPoseToActive(Operator):
@@ -442,7 +476,10 @@ class ARMATURE_OT_CleanUnWeightedBones(Operator):
     remove_unused_bonecollections : BoolProperty(name='Remove Unused Bone Collections', default=True)
 
     respect_mirror : BoolProperty(name='Respect Mirror', default=True)
-    
+
+    # Limits cleaning to these bone names when set, used by Merge Armatures for the incoming bones only
+    restrict_bones : CollectionProperty(type=PropertyGroup, options={'HIDDEN', 'SKIP_SAVE'})
+
     @classmethod
     def poll(cls, context: Context) -> bool:
         return bool(is_armature(context.active_object) and context.mode in {'POSE', 'OBJECT'})
@@ -487,7 +524,8 @@ class ARMATURE_OT_CleanUnWeightedBones(Operator):
 
     def execute(self, context: Context) -> set:
         armatures: set[Object | None] = {get_armature(ob) for ob in context.selected_objects}
-        
+        restrict = {item.name for item in self.restrict_bones} or None
+
         total_vgroups_removed = 0
         total_bones_removed = 0
         total_collection_removed = 0
@@ -507,8 +545,8 @@ class ARMATURE_OT_CleanUnWeightedBones(Operator):
 
             if self.remove_empty_vertex_groups and meshes:
                 removed_vgroups = remove_unused_vertexgroups(
-                    armature, 
-                    armature.data.bones,
+                    armature,
+                    [b for b in armature.data.bones if b.name in restrict] if restrict else armature.data.bones,
                     weight_limit=self.weight_threshold,
                     respect_mirror=self.respect_mirror
                 )
@@ -525,6 +563,8 @@ class ARMATURE_OT_CleanUnWeightedBones(Operator):
             while True:
                 bones_to_remove = set()
                 for b in bones:
+                    if restrict is not None and b.name not in restrict:
+                        continue
                     if self.should_preserve_bone(
                         armature, b, meshes, remaining_vgroups, 
                         constraint_targets, constraint_owners, bones_with_children

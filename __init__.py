@@ -5,14 +5,13 @@ from bpy.props import EnumProperty, BoolProperty, StringProperty, IntProperty, C
 from .gui import (
     panels_view3d,
     panels_nodeeditor,
-    panels_humanoidmapper2,
+    panels_biped,
 )
 from .op import (
     ops_armature,
     ops_object,
     ops_bone,
-    # ops_humanoidmapper,  # HM1 disabled
-    ops_humanoidmapper2,
+    ops_biped,
     ops_nodeeditor,
     ops_vertexgroup,
     ops_mesh,
@@ -56,28 +55,37 @@ def draw_node_menu_items(self, context):
         return
     self.layout.separator()
     self.layout.operator(ops_nodeeditor.NODE_OT_copy_node_values.bl_idname, icon='COPYDOWN')
+    self.layout.operator(ops_nodeeditor.NODE_OT_replace_with_group.bl_idname, icon='NODETREE')
 
 def draw_add_menu_items(self, context):
     if context.space_data.tree_type != 'ShaderNodeTree':
         return
     self.layout.separator()
     self.layout.operator(ops_nodeeditor.NODE_OT_import_custom_nodes.bl_idname, icon='IMPORT')
+    self.layout.operator(ops_nodeeditor.NODE_OT_open_custom_nodes_file.bl_idname, icon='FILE_BLEND')
 
 def draw_vertex_group_menu_items(self, context):
     self.layout.separator(type='LINE')
     self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_unlock_all_vertexgroups.bl_idname, icon='UNLOCKED')
     self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_TransferSelectedGroup.bl_idname)
     self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_JoinWeights.bl_idname)
+    self.layout.operator(ops_vertexgroup.VERTEXGROUP_OT_InvertWeights.bl_idname)
 
 def draw_shapekey_menu_items(self, context):
     self.layout.separator(type='LINE')
     self.layout.operator(ops_mesh.MESH_OT_SelectShapekeyVerts.bl_idname, icon='SELECT_SET')
     self.layout.operator(ops_mesh.MESH_OT_transfer_topology_shapekeys.bl_idname, icon='MOD_DATA_TRANSFER')
+    self.layout.operator(ops_mesh.MESH_OT_ShapeKeysToBones.bl_idname, icon='BONE_DATA')
 
 def draw_edit_mesh_menu_items(self, context):
     self.layout.separator(type='LINE')
     self.layout.operator(ops_mesh.MESH_OT_convex_hull_selection.bl_idname)
+    self.layout.operator(ops_mesh.MESH_OT_CreateHairShadow.bl_idname, icon='MOD_SHRINKWRAP')
     self.layout.operator(ops_mesh.MESH_OT_Delete_Faces_by_ImageMask.bl_idname, icon='UV_FACESEL')
+
+def draw_view_menu_items(self, context):
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_mesh.MESH_OT_AlignViewToFaceNormals.bl_idname, icon='AXIS_FRONT')
 
 def draw_select_edit_mesh_menu_items(self, context):
     self.layout.separator(type='LINE')
@@ -87,7 +95,12 @@ def draw_select_edit_mesh_menu_items(self, context):
 def draw_object_menu_items(self, context):
     self.layout.separator(type='LINE')
     self.layout.operator(ops_armature.ARMATURE_OT_MergeArmatures.bl_idname)
-    # self.layout.operator(ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected.bl_idname)  # HM1 disabled
+
+def draw_object_context_menu_items(self, context):
+    if not any(ob.type == 'ARMATURE' for ob in context.selected_objects):
+        return
+    self.layout.separator(type='LINE')
+    self.layout.operator(ops_armature.ARMATURE_OT_ResetPose.bl_idname, icon='POSE_HLT')
 
 def draw_object_apply_menu_items(self, context):
     self.layout.separator()
@@ -162,7 +175,7 @@ class BakeNodeItem(PropertyGroup):
     )
     has_alpha_channel: BoolProperty(
         name="Has Alpha Channel",
-        description="Bake a second pass for the alpha channel and merge it into the final image using PIL",
+        description="Bake a second pass for the alpha channel and merge it into the final image",
         default=False,
     )
     alpha_socket_index: EnumProperty(
@@ -196,6 +209,11 @@ class BakeNodeItem(PropertyGroup):
     bypass_texture_mapping: BoolProperty(
         name="Bypass Texture Mapping",
         description="Temporarily disconnect the Vector input on all upstream texture nodes before baking, so textures use their default UV coordinates instead of any Mapping or vector node chain",
+        default=False,
+    )
+    bake_on_mesh: BoolProperty(
+        name="Bake on Mesh UV",
+        description="Bake onto the UVs of the mesh using this material instead of a flat plane. Needed for procedural setups driven by Generated or Object coordinates",
         default=False,
     )
 
@@ -247,7 +265,15 @@ _HM2_TWIST_MODE_ITEMS = [
 
 class KitsuneTool_HM2Properties(PropertyGroup):
     # Core body
-    hm2_map_root:  StringProperty(name="Root")
+    hm2_map_root:   StringProperty(name="Root")
+    hm2_map_pelvis: StringProperty(
+        name="Pelvis",
+        description=(
+            "Optional existing pelvis bone to use as M_Hip. When set, this bone "
+            "keeps its own position - only its rotation and the M_Root copy target "
+            "are applied. Leave empty to auto-generate M_Hip from M_Root"
+        ),
+    )
     hm2_map_chest: StringProperty(name="Chest")
     hm2_map_neck:  StringProperty(name="Neck")
     hm2_map_head:  StringProperty(name="Head")
@@ -405,30 +431,6 @@ class KitsuneTool_HM2Properties(PropertyGroup):
     fpa_bisect_offset: FloatProperty(name="Bisect Offset", default=0.0, subtype='DISTANCE')
 
 
-class Humanoidmapper(PropertyGroup):
-    boneExportName : StringProperty(
-        name='Bone',
-        description="The original bone name in the source armature. Used when writing JSON for retargeting."
-    )
-
-    boneName : StringProperty(
-        name='Target Name',
-        description="The target name that this bone should be mapped to during retargeting. When loading JSON, any bone matching this name will be treated as the original bone."
-    )
-    
-    writeRotation : EnumProperty(name='Write Rotation', items=[
-        ('NONE', 'Do Not Write', ''),
-        ('ROTATION', 'Rotation', ''),
-        ('ROLL', 'Roll Only', '')
-    ], default='ROLL')
-    
-    writeTwistBone : BoolProperty(name='Write TwistBone', default=False)
-    twistBoneTarget : StringProperty(name='TwistBone Target Bone')
-    twistBoneCount : IntProperty(name='TwistBone Count', default=1, min=1, soft_max=5)
-    writeExportRotationOffset : BoolProperty(name='Write Export Rotation Offset', default=True)
-    parentBone : StringProperty(name='Parent Bone', default='', description='Overwrite Parent bone on JSON parse')
-
-
 class KitsuneTool_SceneProperties(PropertyGroup):
     _bone_merging_options_base = [
         ('DEFAULT', 'Default', 'Merge bones and remove target bone and weights', 'NONE', 0),
@@ -443,54 +445,20 @@ class KitsuneTool_SceneProperties(PropertyGroup):
     visible_mesh_only : BoolProperty(name='Visible Meshes Only', default=False)
 
     node_baker_export_dir: StringProperty(name="Export Dir", default="//textures\\", subtype='DIR_PATH', options={'PATH_SUPPORTS_BLEND_RELATIVE'})
+    node_baker_name_filters: StringProperty(name="Name Filters", description="Comma-separated regex patterns stripped from the material name in exported filenames (the per-export suffix is untouched). Example: _uber", default="")
     node_baker_file_format: EnumProperty(name="Format",items=[('PNG', 'PNG', ''), ('TARGA', 'TGA', '')],default='TARGA')
+    node_baker_device: EnumProperty(name="Bake Device", items=[
+        ('CPU', 'CPU', 'Bake on the CPU. Usually faster for 1-sample emission bakes, since GPU startup costs more than the bake'),
+        ('GPU', 'GPU', 'Bake on the GPU set in Preferences > System > Cycles Render Devices. Falls back to CPU if none is enabled'),
+    ], default='CPU')
     node_baker_material_listmode : EnumProperty(name='Material List Mode',items=[
         ('ALL', 'All', 'All materials available within the BLEND file'),
         ('ACTIVE', 'Active', 'All materials in the active object'),
     ], default='ACTIVE')
     node_baker_material_list_index : IntProperty(default=-1)
 
-    humanoid_armature_map_menu : EnumProperty(name='Define Armature Category',items=[('LOAD', 'Load', ''),('WRITE', 'Write', ''),])
-
 
 class KitsuneTool_ObjectProperties(PropertyGroup):
-    humanoid_armature_map_bonecollections : CollectionProperty(name='JSON Bone Collection',type=Humanoidmapper)
-    humanoid_armature_map_bonecollections_index : IntProperty()
-    
-    armature_map_pelvis : StringProperty(name="Pelvis")
-    armature_map_chest  : StringProperty(name="Chest")
-    armature_map_spine  : StringProperty(name="Spine")
-    armature_map_head   : StringProperty(name="Head")
-    armature_map_thigh_l : StringProperty(name="Left Thigh")
-    armature_map_ankle_l : StringProperty(name="Left Ankle")
-    armature_map_toe_l   : StringProperty(name="Left Toe")
-    armature_map_thigh_r : StringProperty(name="Right Thigh")
-    armature_map_ankle_r : StringProperty(name="Right Ankle")
-    armature_map_toe_r   : StringProperty(name="Right Toe")
-    armature_map_shoulder_l : StringProperty(name="Left Shoulder")
-    armature_map_wrist_l    : StringProperty(name="Left Wrist")
-    armature_map_index_f_l  : StringProperty(name="Left Index Finger")
-    armature_map_middle_f_l : StringProperty(name="Left Middle Finger")
-    armature_map_ring_f_l   : StringProperty(name="Left Ring Finger")
-    armature_map_pinky_f_l  : StringProperty(name="Left Pinky Finger")
-    armature_map_thumb_f_l  : StringProperty(name="Left Thumb Finger")
-    armature_map_shoulder_r : StringProperty(name="Right Shoulder")
-    armature_map_wrist_r    : StringProperty(name="Right Wrist")
-    armature_map_index_f_r  : StringProperty(name="Right Index Finger")
-    armature_map_middle_f_r : StringProperty(name="Right Middle Finger")
-    armature_map_ring_f_r   : StringProperty(name="Right Ring Finger")
-    armature_map_pinky_f_r  : StringProperty(name="Right Pinky Finger")
-    armature_map_thumb_f_r  : StringProperty(name="Right Thumb Finger")
-    armature_map_eye_l  : StringProperty(name="Left Eye")
-    armature_map_eye_r  : StringProperty(name="Right Eye")
-    
-    armature_map_upperarm_l: StringProperty(name="Left Upper Arm",)
-    armature_map_upperarm_r: StringProperty(name="Right Upper Arm",)
-    armature_map_forearm_l: StringProperty(name="Left Fore Arm",)
-    armature_map_forearm_r: StringProperty(name="Right Fore Arm",)
-    armature_map_knee_l: StringProperty(name="Left Knee",)
-    armature_map_knee_r: StringProperty(name="Right Knee",)
-
     hm2: PointerProperty(type=KitsuneTool_HM2Properties)
 
 
@@ -515,7 +483,7 @@ class KitsuneTool_ArmatureProperties(PropertyGroup):
 _classes = (
     # PROPERTIES
     BakeNodeItem,
-    Humanoidmapper,
+    ops_nodeeditor.NodeReplaceSocketMap,
     HM2_FingerItem,
     HM2_PuppetEntry,
     KitsuneTool_HM2Properties,
@@ -526,9 +494,8 @@ _classes = (
     KitsuneTool_ArmatureProperties,
 
     # List
-    # panels_view3d.HUMANOIDMAPPER_UL_ConfigList,  # HM1 disabled
-    panels_humanoidmapper2.HM2_UL_FingerList,
-    panels_humanoidmapper2.HM2_UL_PuppetList,
+    panels_biped.HM2_UL_FingerList,
+    panels_biped.HM2_UL_PuppetList,
 
     # MENU
     panels_view3d.TOOLS_MT_KitsuneTool_PoseBoneTools,
@@ -537,19 +504,19 @@ _classes = (
     panels_view3d.TOOLS_PT_KitsuneTool_Armature,
     panels_view3d.TOOLS_PT_KitsuneTool_Bone,
     panels_view3d.TOOLS_PT_KitsuneTool_VertexGroup,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HumanoidMapping,
-    # panels_view3d.TOOLS_PT_KitsuneTool_Humanoidmapper,  # HM1 disabled
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_FirstPersonArms,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Core,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Arms,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Legs,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Fingers,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Twist,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_IK,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Export,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Puppets,
-    panels_humanoidmapper2.TOOLS_PT_KitsuneTool_HM2_Actions,
+    panels_biped.TOOLS_PT_KitsuneTool_HumanoidMapping,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_FirstPersonArms,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_TwistDriver,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_Core,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_Arms,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_Legs,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_Fingers,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_Twist,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_IK,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_Export,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_Puppets,
+    panels_biped.TOOLS_PT_KitsuneTool_HM2_Actions,
 
     panels_nodeeditor.NODE_UL_nodes_to_bake,
     panels_nodeeditor.NODE_UL_material_list,
@@ -559,6 +526,7 @@ _classes = (
     ops_armature.ARMATURE_OT_ApplyPoseAsRestPose,
     ops_armature.ARMATURE_OT_ApplyPoseAsShapekey,
     ops_armature.ARMATURE_OT_CopyVisPosture,
+    ops_armature.ARMATURE_OT_ResetPose,
     ops_armature.ARMATURE_OT_FitPoseToActive,
     ops_armature.ARMATURE_OT_MergeArmatures,
     ops_armature.ARMATURE_OT_CleanUnWeightedBones,
@@ -586,10 +554,14 @@ _classes = (
     ops_mesh.MESH_OT_SelectLinkedMergeDistance,
     ops_mesh.MESH_OT_transfer_topology_shapekeys,
     ops_mesh.MESH_OT_convex_hull_selection,
+    ops_mesh.MESH_OT_AlignViewToFaceNormals,
     ops_mesh.MESH_OT_replace_verts_with_spheres,
+    ops_mesh.MESH_OT_ShapeKeysToBones,
+    ops_mesh.MESH_OT_CreateHairShadow,
 
     ops_vertexgroup.VERTEXGROUP_OT_WeightMath,
     ops_vertexgroup.VERTEXGROUP_OT_SwapVertexGroups,
+    ops_vertexgroup.VERTEXGROUP_OT_InvertWeights,
     ops_vertexgroup.VERTEXGROUP_OT_curve_ramp_weights,
     ops_vertexgroup.VERTEXGROUP_OT_multi_weight_paint_start,
     ops_vertexgroup.VERTEXGROUP_OT_multi_weight_paint_finish,
@@ -608,39 +580,38 @@ _classes = (
     ops_action.ACTION_OT_delete_action_slot,
 
     ops_nodeeditor.NODE_OT_import_custom_nodes,
+    ops_nodeeditor.NODE_OT_open_custom_nodes_file,
     ops_nodeeditor.NODE_OT_node_bake_add,
     ops_nodeeditor.NODE_OT_node_bake_all_materials,
     ops_nodeeditor.NODE_OT_node_bake_remove,
     ops_nodeeditor.NODE_OT_node_bake_run,
     ops_nodeeditor.NODE_OT_copy_node_values,
     ops_nodeeditor.NODE_OT_set_copy_input,
+    ops_nodeeditor.NODE_OT_replace_with_group,
     ops_nodeeditor.NODE_OT_node_bake_auto_resolution,
     ops_nodeeditor.NODE_OT_node_bake_auto_colorspace,
+    ops_nodeeditor.NODE_OT_node_bake_rename_suffix,
+    ops_nodeeditor.NODE_OT_node_bake_swap_output,
+    ops_nodeeditor.NODE_OT_node_bake_set_alpha,
     ops_nodeeditor.NODE_OT_node_bake_copy,
     ops_nodeeditor.NODE_OT_node_bake_paste,
 
-    # ops_humanoidmapper.HUMANOIDMAPPER_OT_CopyToSelected,  # HM1 disabled
-    # ops_humanoidmapper.HUMANOIDMAPPER_OT_LoadPreset,
-    # ops_humanoidmapper.HUMANOIDMAPPER_OT_LoadConfig,
-    # ops_humanoidmapper.HUMANOIDMAPPER_OT_RemoveItem,
-    # ops_humanoidmapper.HUMANOIDMAPPER_OT_AddItem,
-    # ops_humanoidmapper.HUMANOIDMAPPER_OT_MirrorBoneNames,
-    # ops_humanoidmapper.HUMANOIDMAPPER_OT_WriteConfig,
-
-    ops_humanoidmapper2.HM2_OT_AddFinger,
-    ops_humanoidmapper2.HM2_OT_RemoveFinger,
-    ops_humanoidmapper2.HM2_OT_MirrorFingers,
-    ops_humanoidmapper2.HM2_OT_MirrorBodyMapping,
-    ops_humanoidmapper2.HM2_OT_CopyMappingToSelected,
-    ops_humanoidmapper2.HM2_OT_ValidateMapping,
-    ops_humanoidmapper2.HM2_OT_Process,
-    ops_humanoidmapper2.HM2_OT_JsonFormatHelp,
-    ops_humanoidmapper2.HM2_OT_AddPuppet,
-    ops_humanoidmapper2.HM2_OT_RemovePuppet,
-    ops_humanoidmapper2.HM2_OT_ProcessPuppet,
-    ops_humanoidmapper2.HM2_OT_DisconnectPuppet,
-    ops_humanoidmapper2.HM2_OT_SyncPuppetExportConfig,
-    ops_humanoidmapper2.HM2_OT_FirstPersonArms,
+    ops_biped.HM2_OT_AddFinger,
+    ops_biped.HM2_OT_RemoveFinger,
+    ops_biped.HM2_OT_MirrorFingers,
+    ops_biped.HM2_OT_MirrorBodyMapping,
+    ops_biped.HM2_OT_CopyMappingToSelected,
+    ops_biped.HM2_OT_ValidateMapping,
+    ops_biped.HM2_OT_AddTwistDriver,
+    ops_biped.HM2_OT_FKTwist,
+    ops_biped.HM2_OT_Process,
+    ops_biped.HM2_OT_JsonFormatHelp,
+    ops_biped.HM2_OT_AddPuppet,
+    ops_biped.HM2_OT_RemovePuppet,
+    ops_biped.HM2_OT_ProcessPuppet,
+    ops_biped.HM2_OT_DisconnectPuppet,
+    ops_biped.HM2_OT_SyncPuppetExportConfig,
+    ops_biped.HM2_OT_FirstPersonArms,
 )
 
 def register():
@@ -658,9 +629,11 @@ def register():
     bpy.types.NODE_MT_add.append(draw_add_menu_items)
     bpy.types.MESH_MT_vertex_group_context_menu.append(draw_vertex_group_menu_items)
     bpy.types.MESH_MT_shape_key_context_menu.append(draw_shapekey_menu_items)
+    bpy.types.VIEW3D_MT_view.append(draw_view_menu_items)
     bpy.types.VIEW3D_MT_edit_mesh.append(draw_edit_mesh_menu_items)
     bpy.types.VIEW3D_MT_select_edit_mesh.append(draw_select_edit_mesh_menu_items)
     bpy.types.VIEW3D_MT_object.append(draw_object_menu_items)
+    bpy.types.VIEW3D_MT_object_context_menu.append(draw_object_context_menu_items)
     bpy.types.VIEW3D_MT_object_apply.append(draw_object_apply_menu_items)
     bpy.types.VIEW3D_MT_object_cleanup.append(draw_object_cleanup_menu_items)
     bpy.types.VIEW3D_MT_pose.append(draw_edit_bone_menu_items)
@@ -687,9 +660,11 @@ def unregister():
     bpy.types.NODE_MT_add.remove(draw_add_menu_items)
     bpy.types.MESH_MT_vertex_group_context_menu.remove(draw_vertex_group_menu_items)
     bpy.types.MESH_MT_shape_key_context_menu.remove(draw_shapekey_menu_items)
+    bpy.types.VIEW3D_MT_view.remove(draw_view_menu_items)
     bpy.types.VIEW3D_MT_edit_mesh.remove(draw_edit_mesh_menu_items)
     bpy.types.VIEW3D_MT_select_edit_mesh.remove(draw_select_edit_mesh_menu_items)
     bpy.types.VIEW3D_MT_object.remove(draw_object_menu_items)
+    bpy.types.VIEW3D_MT_object_context_menu.remove(draw_object_context_menu_items)
     bpy.types.VIEW3D_MT_object_apply.remove(draw_object_apply_menu_items)
     bpy.types.VIEW3D_MT_object_cleanup.remove(draw_object_cleanup_menu_items)
     bpy.types.VIEW3D_MT_pose.remove(draw_edit_bone_menu_items)

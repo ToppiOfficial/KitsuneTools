@@ -9,6 +9,9 @@ from ..op.ops_nodeeditor import (
     NODE_OT_node_bake_run,
     NODE_OT_node_bake_auto_resolution,
     NODE_OT_node_bake_auto_colorspace,
+    NODE_OT_node_bake_rename_suffix,
+    NODE_OT_node_bake_swap_output,
+    NODE_OT_node_bake_set_alpha,
     NODE_OT_node_bake_copy,
     NODE_OT_node_bake_paste
 )
@@ -170,11 +173,15 @@ class NODE_PT_KitsuneTool_NodeBaker(TOOLS_PT_KitsuneTool_Panel):
 
             col.separator()
             col.prop(item, "bypass_texture_mapping")
+            col.prop(item, "bake_on_mesh")
 
-            # Batch helpers for resolution / color space across items
-            tools = box.row(align=True)
+            # Batch helpers across items, two per row to avoid crowding
+            tools = box.grid_flow(row_major=True, columns=2, align=True)
             tools.operator(NODE_OT_node_bake_auto_resolution.bl_idname, text="Auto Resolution", icon='FIXED_SIZE').material_name = mat.name
             tools.operator(NODE_OT_node_bake_auto_colorspace.bl_idname, text="Set Color Space", icon='IMAGE_RGB').material_name = mat.name
+            tools.operator(NODE_OT_node_bake_rename_suffix.bl_idname, text="Rename Suffix", icon='SORTALPHA').material_name = mat.name
+            tools.operator(NODE_OT_node_bake_swap_output.bl_idname, text="Swap Output", icon='NODE_SEL').material_name = mat.name
+            tools.operator(NODE_OT_node_bake_set_alpha.bl_idname, text="Set Alpha", icon='IMAGE_ALPHA').material_name = mat.name
 
         # --- Output & bake ---
         layout.separator()
@@ -183,7 +190,9 @@ class NODE_PT_KitsuneTool_NodeBaker(TOOLS_PT_KitsuneTool_Panel):
         out.use_property_split = True
         out.use_property_decorate = False
         out.prop(kt, "node_baker_export_dir")
+        out.prop(kt, "node_baker_name_filters")
         out.prop(kt, "node_baker_file_format")
+        out.prop(kt, "node_baker_device")
 
         bake_row = box.row(align=True)
         bake_row.scale_y = 1.4

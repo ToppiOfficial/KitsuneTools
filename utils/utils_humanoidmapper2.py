@@ -105,7 +105,7 @@ def create_twist_bones(arm: Object, bone_name: str, count: int,
     return names
 
 
-# -- Y-rotation drivers (same approach as HM1) ---------------------------------
+# -- Y-rotation drivers -------------------------------------------------------
 
 def add_twist_driver(arm: Object, pb, target_bone_name: str, influence: float, invert: bool = False) -> None:
     pb.rotation_mode = 'XYZ'
@@ -175,6 +175,7 @@ _SHAPE_NAMES = {
     'hand':     'HM2Shape_Hand',
     'foot':     'HM2Shape_Foot',
     'finger_master': 'HM2Shape_FingerMaster',
+    'fk_dome':  'HM2Shape_FKDome',
 }
 
 
@@ -581,6 +582,29 @@ def _create_finger_master_mesh(name: str) -> Object:
     return _mesh_from_pydata(name, verts, edges)
 
 
+def _create_fk_dome_mesh(name: str) -> Object:
+    """Ball-joint cage for shoulder/hip FK : a unit ring in the XZ plane with two
+    crossing arcs rising to an apex at +Y. Symmetric about Y, so bone roll doesn't matter."""
+    steps = 32
+    verts = [(math.sin(2 * math.pi * i / steps), 0.0, math.cos(2 * math.pi * i / steps))
+             for i in range(steps)]
+    edges = [(i, (i + 1) % steps) for i in range(steps)]
+
+    apex = len(verts)
+    verts.append((0.0, 1.0, 0.0))
+    arc_steps = 8
+    for ring_idx in (0, steps // 4, steps // 2, 3 * steps // 4):
+        dx, _, dz = verts[ring_idx]
+        prev = ring_idx
+        for j in range(1, arc_steps):
+            t = (math.pi / 2) * j / arc_steps
+            verts.append((dx * math.cos(t), math.sin(t), dz * math.cos(t)))
+            edges.append((prev, len(verts) - 1))
+            prev = len(verts) - 1
+        edges.append((prev, apex))
+    return _mesh_from_pydata(name, verts, edges)
+
+
 def ensure_hm2_shapes(context) -> dict[str, Object]:
     shapes = {}
     scene = context.scene
@@ -608,6 +632,7 @@ def ensure_hm2_shapes(context) -> dict[str, Object]:
         'hand':     _create_hand_mesh,
         'foot':     _create_foot_mesh,
         'finger_master': _create_finger_master_mesh,
+        'fk_dome':  _create_fk_dome_mesh,
     }
 
     for key, shape_name in _SHAPE_NAMES.items():
@@ -750,7 +775,7 @@ def compute_fpa_kept_bones(arm: Object, start_l: str, start_r: str,
     On an HM2 rig:
       * preserve_ik=True  -> additionally keep arm IK / pole / visualization
         controllers (which live under the root, not under the arm) by following
-        constraint references to/from the kept bones, plus their ancestor chain.
+        constraint references to/from the kept bones, plus controller ancestors.
       * preserve_ik=False -> drop every controller-prefixed bone, leaving plain
         FK deform bones (twist bones are kept since they carry no controller prefix).
     """
@@ -777,6 +802,8 @@ def compute_fpa_kept_bones(arm: Object, start_l: str, start_r: str,
         cur = bones.get(bone_name)
         added = False
         while cur is not None and cur.name not in kept:
+            if not cur.name.startswith(HM2_CONTROLLER_PREFIXES):
+                break
             kept.add(cur.name)
             added = True
             cur = cur.parent

@@ -231,7 +231,34 @@ def apply_current_pose_as_restpose(armature: Object | None, only_selected : bool
 
 
 @selfreport
-def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "", debug : bool = False):
+def add_pose_to_shapekey(mesh: Object, arm_mod, target) -> bool:
+    # Pose delta is measured with shapekey values as the user set them, so the key keeps
+    # its own shape and only gains what the armature adds on top of the visible result.
+    def eval_coords():
+        bpy.context.view_layer.update()
+        mesh_eval = mesh.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        me = mesh_eval.to_mesh()
+        coords = [v.co.copy() for v in me.vertices]
+        mesh_eval.to_mesh_clear()
+        return coords
+
+    was_shown = arm_mod.show_viewport
+    arm_mod.show_viewport = True
+    posed = eval_coords()
+    arm_mod.show_viewport = False
+    unposed = eval_coords()
+    arm_mod.show_viewport = was_shown
+
+    if not (len(posed) == len(unposed) == len(target.data)):
+        return False
+
+    scale = 1.0 / target.value if target.value > 1e-4 else 1.0
+    for point, p, u in zip(target.data, posed, unposed):
+        point.co += (p - u) * scale
+    return True
+
+
+def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "", add_to_existing : bool = False, debug : bool = False):
     if not is_armature(armature): return
 
     dbg = (lambda *a: print('[KitsuneTools][PoseShapekey]', *a)) if debug else (lambda *a: None)
@@ -279,6 +306,14 @@ def apply_current_pose_shapekey(armature: Object | None, shapekey_name : str = "
                 continue
 
             dbg(f"  {mesh.name}: posed groups weighting it -> {sorted(overlap)}")
+
+            if add_to_existing and mesh.data.shape_keys and shapekey_name in mesh.data.shape_keys.key_blocks:
+                if add_pose_to_shapekey(mesh, arm_mod, mesh.data.shape_keys.key_blocks[shapekey_name]):
+                    success_count += 1
+                    dbg(f"  {mesh.name}: OK - added pose to '{shapekey_name}'")
+                else:
+                    report('WARNING', f"{mesh.name}: modifiers after Armature change vertex count, cannot add to '{shapekey_name}'")
+                continue
 
             original_shapekey_values = {}
             if mesh.data.shape_keys and mesh.data.shape_keys.key_blocks:
@@ -622,9 +657,9 @@ def merge_armatures( source_arm: Object, target_arm: Object, match_posture: bool
 
             source_bone_names = {b.name for b in source_arm.data.bones}
             source_export_map = {
-                get_bone_exportname(b): b.name
+                export: b.name
                 for b in source_arm.data.bones
-                if get_bone_exportname(b)
+                if (export := get_bone_exportname(b, for_write=True))
             }
 
             target_root_bones = {b.name for b in target_arm.data.bones if not b.parent}
@@ -641,7 +676,7 @@ def merge_armatures( source_arm: Object, target_arm: Object, match_posture: bool
                     renamed_count += 1
                     continue
                 
-                target_export = get_bone_exportname(target_bone)
+                target_export = get_bone_exportname(target_bone, for_write=True)
                 matched_source = source_export_map.get(target_export)
                 if matched_source:
                     target_bone.name = matched_source + ".temp_merge"
@@ -884,9 +919,9 @@ def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, 
 
     with preserve_armature_state(source_arm, reset_pose=True), unhide_all_objects():
         source_export_map = {
-            get_bone_exportname(b): b.name
+            export: b.name
             for b in source_arm.data.bones
-            if get_bone_exportname(b)
+            if (export := get_bone_exportname(b, for_write=True))
         }
 
         for target_arm in targets:
@@ -898,7 +933,7 @@ def transfer_armature_bonedata(source_arm: bpy.types.Object, target_arms: list, 
                     if target_bone.name in source_arm.data.bones:
                         source_name = target_bone.name
                     else:
-                        export_name = get_bone_exportname(target_bone)
+                        export_name = get_bone_exportname(target_bone, for_write=True)
                         source_name = source_export_map.get(export_name)
 
                     if not source_name:

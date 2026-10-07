@@ -1,8 +1,10 @@
-import bpy, os, re
-from bpy.types import Operator
-from PIL import Image
+import bpy, os, re, subprocess
+import numpy as np
+from time import perf_counter
+from contextlib import contextmanager
+from bpy.types import Operator, PropertyGroup
 from ..utils.utils_object import is_mesh
-from bpy.props import EnumProperty, StringProperty, BoolProperty
+from bpy.props import EnumProperty, StringProperty, BoolProperty, CollectionProperty
 
 # Module-level clipboard: list of dicts, one per copied item
 _clipboard: list[dict] = []
@@ -18,6 +20,7 @@ _FIELDS = (
     "has_alpha_channel",
     "alpha_socket_index",
     "bypass_texture_mapping",
+    "bake_on_mesh",
 )
  
  
@@ -70,11 +73,30 @@ def _log_header(title, subtitle=""):
     print("=" * _LOG_W)
 
 
-def _log_footer(summary):
+def _log_footer(summary, details=()):
     print("-" * _LOG_W)
     print(f"  {summary}")
+    for line in details:
+        print(f"  {line}")
     print("=" * _LOG_W)
     print()
+
+
+_PHASES = ("setup", "color", "alpha", "save")
+
+
+def _fmt_times(times):
+    """'setup 0.12s  color 1.23s  ...  =  2.75s', skipping phases that did not run."""
+    parts = [f"{p} {times[p]:.2f}s" for p in _PHASES if times.get(p)]
+    return "  ".join(parts) + f"  =  {sum(times.get(p, 0.0) for p in _PHASES):.2f}s"
+
+
+def _timing_details(totals, elapsed, device):
+    return [
+        f"Device: {device}",
+        f"Phases: {_fmt_times(totals)}",
+        f"Wall time: {elapsed:.2f}s",
+    ]
 
 
 def _item_summary(item, node, socket):
@@ -120,27 +142,87 @@ class NODE_OT_node_bake_remove(Operator):
         return {'FINISHED'}
 
 
-def _setup_temp_plane(context, mat):
-    prev_active = context.view_layer.objects.active
-    prev_selected = [o for o in context.selected_objects]
-
-    bpy.ops.object.select_all(action='DESELECT')
-    bpy.ops.mesh.primitive_plane_add()
-    temp_plane = context.view_layer.objects.active
-
-    # Ensure it's in a selectable collection by moving it to the scene master collection
-    for col in temp_plane.users_collection:
-        col.objects.unlink(temp_plane)
-    context.scene.collection.objects.link(temp_plane)
-
-    temp_plane.data.materials.append(mat)
-    return temp_plane, prev_active, prev_selected
+def _setup_temp_plane(bscene, mat):
+    me = bpy.data.meshes.new("_kt_bake_plane")
+    me.from_pydata([(-1, -1, 0), (1, -1, 0), (1, 1, 0), (-1, 1, 0)], [], [(0, 1, 2, 3)])
+    me.uv_layers.new(name="UVMap").data.foreach_set("uv", (0, 0, 1, 0, 1, 1, 0, 1))
+    me.update()
+    me.materials.append(mat)
+    obj = bpy.data.objects.new("_kt_bake_plane", me)
+    bscene.collection.objects.link(obj)
+    return obj
 
 
-def _restore_after_plane(context, temp_plane, prev_active, prev_selected):
-    bpy.data.objects.remove(temp_plane, do_unlink=True)
-    for o in prev_selected: o.select_set(True)
-    context.view_layer.objects.active = prev_active
+def _find_mesh_with_material(context, mat):
+    candidates = [context.active_object] + list(context.scene.objects)
+    return next((o for o in candidates if o and o.type == 'MESH' and mat.name in o.data.materials), None)
+
+
+def _setup_temp_mesh_copy(bscene, mat, src):
+    """Copy of src holding only the faces using mat, so procedural coordinates
+    (Generated/Object) bake onto its UVs. Texture space is pinned to the source."""
+    import bmesh
+
+    obj = src.copy()
+    obj.data = src.data.copy()
+    bscene.collection.objects.link(obj)
+    me = obj.data
+    me.use_auto_texspace = False
+    me.texspace_location = src.data.texspace_location
+    me.texspace_size = src.data.texspace_size
+
+    slot_idx = [i for i, m in enumerate(src.data.materials) if m == mat]
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bmesh.ops.delete(bm, geom=[f for f in bm.faces if f.material_index not in slot_idx], context='FACES')
+    for f in bm.faces:
+        f.material_index = 0
+    bm.to_mesh(me)
+    bm.free()
+    me.materials.clear()
+    me.materials.append(mat)
+    obj.material_slots[0].link = 'DATA'
+    return obj
+
+
+def _setup_bake_object(context, bscene, mat, item):
+    if item.bake_on_mesh:
+        src = _find_mesh_with_material(context, mat)
+        if src:
+            return _setup_temp_mesh_copy(bscene, mat, src)
+        print(f"        note: no mesh uses '{mat.name}' - falling back to plane")
+    return _setup_temp_plane(bscene, mat)
+
+
+def _remove_temp_object(obj):
+    me = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if me.users == 0:
+        bpy.data.meshes.remove(me)
+
+
+@contextmanager
+def _bake_session(context):
+    """Yield (bake scene, device label). Bakes run in a temporary scene holding only the
+    bake objects, so each bake's render depsgraph and Cycles sync skip the user's scene."""
+    src = context.scene
+    cycles_addon = context.preferences.addons.get('cycles')
+    cprefs = cycles_addon.preferences if cycles_addon else None
+    has_gpu = src.kitsunetools.node_baker_device == 'GPU' and bool(cprefs) and cprefs.compute_device_type != 'NONE' and any(
+        d.use and d.type == cprefs.compute_device_type for d in cprefs.devices)
+
+    bscene = bpy.data.scenes.new("_kt_bake_scene")
+    try:
+        bscene.render.engine = 'CYCLES'
+        bscene.view_settings.view_transform = 'Standard'
+        bscene.cycles.device = 'GPU' if has_gpu else 'CPU'
+        bscene.cycles.samples = 1
+        bscene.cycles.bake_type = 'EMIT'
+        bscene.render.bake.margin = src.render.bake.margin
+        bscene.render.bake.margin_type = src.render.bake.margin_type
+        yield bscene, f"GPU ({cprefs.compute_device_type})" if has_gpu else "CPU"
+    finally:
+        bpy.data.scenes.remove(bscene)
 
 
 def _collect_tex_nodes_upstream(start_node):
@@ -185,57 +267,292 @@ def _collect_channel_packed_tex_nodes(start_node):
     return packed
 
 
-def _run_bake_for_material(operator, context, obj, mat, export_path):
-    """Bake every item on `mat`. Returns (baked, skipped) counts."""
-    items = list(mat.kitsunetools.node_baker_list)
-    total = len(items)
-    fmt = context.scene.kitsunetools.node_baker_file_format
-    ext = ".png" if fmt == 'PNG' else ".tga"
+def _export_basename(mat_name, filters_str):
+    """Strip each comma-separated regex in filters_str from mat_name, then tidy
+    leftover separators. Only touches the material name, never the per-export
+    suffix. Longest patterns run first so '_ubertrans' wins over 'uber'.
+    Invalid patterns are skipped; empty result falls back to mat_name."""
+    name = mat_name
+    patterns = [p.strip() for p in filters_str.split(",") if p.strip()]
+    for pat in sorted(patterns, key=len, reverse=True):
+        try:
+            name = re.sub(pat, "", name)
+        except re.error:
+            pass
+    name = re.sub(r"[_\-.]{2,}", "_", name).strip("_-. ")
+    return name or mat_name
 
+
+# Luminance weights for reducing a color alpha output to one value
+_LUMA = (0.299, 0.587, 0.114)
+
+
+def _read_pixels(img):
+    buf = np.empty(len(img.pixels), dtype=np.float32)
+    img.pixels.foreach_get(buf)
+    return buf
+
+
+def _save_image(img, path, fmt):
+    img.filepath_raw = path
+    img.file_format = 'PNG' if fmt == 'PNG' else 'TARGA'
+    img.save()
+
+
+def _bake_pass(context, bscene, obj, mat, sources, item, colorspace, use_alpha=False, pack=False):
+    """Emit-bake (node, socket_idx) sources onto obj's UVs and return the image, or None
+    if the material has no active output. With pack, up to 3 sources fill R, G, B in order,
+    color sources reduced to luminance. Caller removes the image."""
+    ntree = mat.node_tree
+    mat_out = next((n for n in ntree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+    if not mat_out:
+        print(f"        ERROR: no active Material Output node in '{mat.name}'")
+        return None
+
+    res_x = int(item.resolution_x)
+    res_y = res_x if item.sync_y_with_x else int(item.resolution_y)
+    bake_img = bpy.data.images.new("_temp_bake", width=res_x, height=res_y, alpha=use_alpha)
+    bake_img.colorspace_settings.name = colorspace
+
+    temp_nodes = []
+    img_node = ntree.nodes.new('ShaderNodeTexImage')
+    img_node.image = bake_img
+    temp_nodes.append(img_node)
+    ntree.nodes.active = img_node
+
+    emit = ntree.nodes.new('ShaderNodeEmission')
+    temp_nodes.append(emit)
+
+    old_links = []
+    surf_in = mat_out.inputs['Surface']
+    for link in surf_in.links:
+        old_links.append((link.from_socket, link.to_socket))
+        ntree.links.remove(link)
+
+    ntree.links.new(emit.outputs[0], surf_in)
+
+    nodes = list({n.as_pointer(): n for n, _ in sources}.values())
+    socket = sources[0][0].outputs[sources[0][1]]
+    if pack:
+        comb = ntree.nodes.new('ShaderNodeCombineXYZ')
+        temp_nodes.append(comb)
+        for ch, (n, idx) in enumerate(sources):
+            out = n.outputs[idx]
+            if out.type == 'RGBA':
+                dot = ntree.nodes.new('ShaderNodeVectorMath')
+                dot.operation = 'DOT_PRODUCT'
+                dot.inputs[1].default_value = _LUMA
+                temp_nodes.append(dot)
+                ntree.links.new(out, dot.inputs[0])
+                out = dot.outputs['Value']
+            ntree.links.new(out, comb.inputs[ch])
+        ntree.links.new(comb.outputs[0], emit.inputs['Color'])
+    elif socket.type == 'VECTOR':
+        print("        note: vector socket - inserting SeparateXYZ + CombineRGB")
+        sep = ntree.nodes.new('ShaderNodeSeparateXYZ')
+        comb = ntree.nodes.new('ShaderNodeCombineRGB')
+        temp_nodes.extend([sep, comb])
+        ntree.links.new(socket, sep.inputs[0])
+        ntree.links.new(sep.outputs[0], comb.inputs[0])
+        ntree.links.new(sep.outputs[1], comb.inputs[1])
+        ntree.links.new(sep.outputs[2], comb.inputs[2])
+        ntree.links.new(comb.outputs[0], emit.inputs['Color'])
+    else:
+        ntree.links.new(socket, emit.inputs['Color'])
+
+    if not obj.data.uv_layers:
+        obj.data.uv_layers.new(name="UVMap")
+
+    vector_links = []
+    if item.bypass_texture_mapping:
+        tex_nodes = {t.as_pointer(): t for n in nodes for t in _collect_tex_nodes_upstream(n)}
+        for tex_node in tex_nodes.values():
+            vec_input = tex_node.inputs.get('Vector')
+            if vec_input and vec_input.links:
+                for link in list(vec_input.links):
+                    vector_links.append((link.from_socket, link.to_socket))
+                    ntree.links.remove(link)
+        if vector_links:
+            print(f"        note: bypass mapping - disconnected {len(vector_links)} vector link(s)")
+
+    # Force upstream textures whose Alpha output is connected to Channel Packed
+    # so the color pass isn't premultiplied by the alpha. Restored after bake.
+    alpha_mode_overrides = {}
+    for tex_node in (t for n in nodes for t in _collect_channel_packed_tex_nodes(n)):
+        img = tex_node.image
+        if img.name not in alpha_mode_overrides and img.alpha_mode != 'CHANNEL_PACKED':
+            alpha_mode_overrides[img.name] = (img, img.alpha_mode)
+            img.alpha_mode = 'CHANNEL_PACKED'
+    if alpha_mode_overrides:
+        print(f"        note: alpha connection - forced channel-packed on {len(alpha_mode_overrides)} image(s)")
+
+    vl = bscene.view_layers[0]
+    for o in bscene.objects:
+        o.select_set(o == obj, view_layer=vl)
+    vl.objects.active = obj
+
+    try:
+        with context.temp_override(scene=bscene, view_layer=vl, active_object=obj, object=obj,
+                                   selected_objects=[obj], selected_editable_objects=[obj]):
+            bpy.ops.object.bake(type='EMIT')
+    except Exception:
+        bpy.data.images.remove(bake_img)
+        raise
+    finally:
+        for img, mode in alpha_mode_overrides.values():
+            img.alpha_mode = mode
+        for f, t in vector_links:
+            ntree.links.new(f, t)
+        for n in temp_nodes:
+            ntree.nodes.remove(n)
+        for f, t in old_links:
+            ntree.links.new(f, t)
+
+    return bake_img
+
+
+def _bake_item(context, bscene, obj, mat, node, item, final_path, fmt, times, alpha=None):
+    """Bake the color pass and the alpha pass (unless alpha is given from a packed bake),
+    merge them in memory and save once to final_path. Phase durations go into times.
+    Returns False if nothing could be baked."""
+    t = perf_counter()
+    col_img = _bake_pass(context, bscene, obj, mat, [(node, int(item.socket_index))], item, item.color_space, use_alpha=item.has_alpha_channel)
+    times["color"] = perf_counter() - t
+    if not col_img:
+        return False
+
+    alpha_img = out_img = None
+    try:
+        if item.has_alpha_channel and alpha is None:
+            t = perf_counter()
+            alpha_img = _bake_pass(context, bscene, obj, mat, [(node, int(item.alpha_socket_index))], item, 'Non-Color')
+            a = _read_pixels(alpha_img).reshape(-1, 4)
+            alpha = a[:, :3] @ np.asarray(_LUMA, dtype=np.float32)
+            times["alpha"] = perf_counter() - t
+
+        t = perf_counter()
+        col = _read_pixels(col_img)
+        out_img = col_img
+        col[3::4] = 1.0
+
+        if alpha is not None:
+            # A fully opaque alpha carries no information - drop it and save RGB.
+            if alpha.min() >= 254.5 / 255:
+                print("        note: alpha is fully opaque - saved as RGB")
+                out_img = bpy.data.images.new("_temp_bake_rgb", width=col_img.size[0], height=col_img.size[1], alpha=False)
+                out_img.colorspace_settings.name = col_img.colorspace_settings.name
+            else:
+                col[3::4] = alpha
+
+        out_img.pixels.foreach_set(col)
+        _save_image(out_img, final_path, fmt)
+        times["save"] = perf_counter() - t
+    finally:
+        for img in {col_img, alpha_img, out_img} - {None}:
+            bpy.data.images.remove(img)
+    return True
+
+
+def _plan_packed_alpha(mat, items):
+    """Map item index -> (chunk, channel). Float/color alpha outputs sharing bake object,
+    resolution and mapping bypass are baked 3 per pass, one per RGB channel."""
+    groups = {}
+    for idx, item in enumerate(items):
+        node = mat.node_tree.nodes.get(item.node_name)
+        if not item.has_alpha_channel or not node:
+            continue
+        if node.outputs[int(item.alpha_socket_index)].type not in {'VALUE', 'RGBA'}:
+            continue
+        res_x = int(item.resolution_x)
+        res_y = res_x if item.sync_y_with_x else int(item.resolution_y)
+        key = (bool(item.bake_on_mesh), res_x, res_y, bool(item.bypass_texture_mapping))
+        groups.setdefault(key, []).append(idx)
+
+    plan = {}
+    for idxs in groups.values():
+        for start in range(0, len(idxs), 3):
+            chunk = tuple(idxs[start:start + 3])
+            for ch, idx in enumerate(chunk):
+                plan[idx] = (chunk, ch)
+    return plan
+
+
+def _bake_packed_alpha(context, bscene, obj, mat, chunk_items):
+    """Bake the alpha outputs of up to 3 items in one pass. Returns (N, 4) pixel rows or None."""
+    sources = [(mat.node_tree.nodes[i.node_name], int(i.alpha_socket_index)) for i in chunk_items]
+    img = _bake_pass(context, bscene, obj, mat, sources, chunk_items[0], 'Non-Color', pack=True)
+    if not img:
+        return None
+    try:
+        return _read_pixels(img).reshape(-1, 4)
+    finally:
+        bpy.data.images.remove(img)
+
+
+def _bake_items(context, bscene, mat, items, export_path, pad, totals):
+    """Bake items of mat into export_path. Returns (baked, skipped) counts and
+    adds phase durations to totals. Bake objects are built once per material."""
+    total = len(items)
     if total == 0:
-        print("    (no items)")
+        print(f"{pad}(no items)")
         return 0, 0
 
+    fmt = context.scene.kitsunetools.node_baker_file_format
+    ext = ".png" if fmt == 'PNG' else ".tga"
+    base = _export_basename(mat.name, context.scene.kitsunetools.node_baker_name_filters)
+
     baked = skipped = 0
-    for item_idx, item in enumerate(items):
-        node = mat.node_tree.nodes.get(item.node_name)
-        if not node:
-            print(f"    [{item_idx + 1}/{total}] SKIP  node '{item.node_name}' not found")
-            skipped += 1
-            continue
+    bake_objs = {}
+    plan = _plan_packed_alpha(mat, items)
+    packed = {}
+    try:
+        for item_idx, item in enumerate(items):
+            node = mat.node_tree.nodes.get(item.node_name)
+            if not node:
+                print(f"{pad}[{item_idx + 1}/{total}] SKIP  node '{item.node_name}' not found")
+                skipped += 1
+                continue
 
-        socket = node.outputs[int(item.socket_index)]
-        suffix = item.name if item.name else socket.name
-        filename = f"{mat.name}_{suffix}"
+            socket = node.outputs[int(item.socket_index)]
+            suffix = item.name if item.name else socket.name
+            filename = f"{base}_{suffix}"
 
-        print(f"    [{item_idx + 1}/{total}] {filename}{ext}")
-        print(f"          {_item_summary(item, node, socket)}")
+            print(f"{pad}[{item_idx + 1}/{total}] {filename}{ext}")
+            print(f"{pad}      {_item_summary(item, node, socket)}")
 
-        temp_col = os.path.join(export_path, f"_temp_col_{mat.name}.tga")
-        temp_alpha = os.path.join(export_path, f"_temp_alpha_{mat.name}.tga")
+            times = {}
+            key = bool(item.bake_on_mesh)
+            if key not in bake_objs:
+                t = perf_counter()
+                bake_objs[key] = _setup_bake_object(context, bscene, mat, item)
+                times["setup"] = perf_counter() - t
 
-        temp_plane, prev_active, prev_selected = _setup_temp_plane(context, mat)
-        bake_obj = temp_plane
+            alpha = None
+            if item_idx in plan:
+                chunk, ch = plan[item_idx]
+                if chunk not in packed:
+                    if len(chunk) > 1:
+                        print(f"{pad}      note: alpha packed - {len(chunk)} items share one alpha bake")
+                    t = perf_counter()
+                    packed[chunk] = _bake_packed_alpha(context, bscene, bake_objs[key], mat, [items[i] for i in chunk])
+                    times["alpha"] = perf_counter() - t
+                rows = packed[chunk]
+                alpha = rows[:, ch] if rows is not None else None
+                if item_idx == chunk[-1]:
+                    del packed[chunk]
 
-        try:
-            operator._process_bake(context, bake_obj, mat, node, int(item.socket_index), item, temp_col, save_alpha=item.has_alpha_channel)
-
-            if item.has_alpha_channel:
-                operator._process_bake(context, bake_obj, mat, node, int(item.alpha_socket_index), item, temp_alpha, force_colorspace='Non-Color')
-                operator._merge_with_pil(temp_col, temp_alpha, export_path, filename, fmt)
+            final_path = os.path.normpath(os.path.join(export_path, filename + ext))
+            if _bake_item(context, bscene, bake_objs[key], mat, node, item, final_path, fmt, times, alpha):
+                baked += 1
             else:
-                final_path = os.path.normpath(os.path.join(export_path, filename + ext))
-                if os.path.exists(final_path): os.remove(final_path)
-                os.rename(temp_col, final_path)
+                skipped += 1
 
-        finally:
-            for p in [temp_col, temp_alpha]:
-                if os.path.exists(p):
-                    try: os.remove(p)
-                    except: pass
-            _restore_after_plane(context, temp_plane, prev_active, prev_selected)
-
-        baked += 1
+            print(f"{pad}      time: {_fmt_times(times)}")
+            for p, v in times.items():
+                totals[p] = totals.get(p, 0.0) + v
+    finally:
+        for obj in bake_objs.values():
+            _remove_temp_object(obj)
 
     return baked, skipped
 
@@ -255,7 +572,7 @@ class NODE_OT_node_bake_run(Operator):
             return {'CANCELLED'}
 
         kt = mat.kitsunetools
-        
+
         if self.all_items:
             items = list(kt.node_baker_list)
         else:
@@ -268,197 +585,20 @@ class NODE_OT_node_bake_run(Operator):
             self.report({'WARNING'}, "Node Baker list is empty.")
             return {'CANCELLED'}
 
-        total = len(items)
-        fmt = context.scene.kitsunetools.node_baker_file_format
-        ext = ".png" if fmt == 'PNG' else ".tga"
-
         raw_path = bpy.path.abspath(context.scene.kitsunetools.node_baker_export_dir)
         export_path = os.path.normpath(raw_path)
         os.makedirs(export_path, exist_ok=True)
 
-        _log_header(f"Node Baker  -  {mat.name}", f"{total} item(s)  ->  {export_path}")
+        _log_header(f"Node Baker  -  {mat.name}", f"{len(items)} item(s)  ->  {export_path}")
 
-        baked = skipped = 0
-        for item_idx, item in enumerate(items):
-            node = mat.node_tree.nodes.get(item.node_name)
-            if not node:
-                print(f"  [{item_idx + 1}/{total}] SKIP  node '{item.node_name}' not found")
-                skipped += 1
-                continue
+        totals = {}
+        start = perf_counter()
+        with _bake_session(context) as (bscene, device):
+            baked, skipped = _bake_items(context, bscene, mat, items, export_path, "  ", totals)
 
-            socket = node.outputs[int(item.socket_index)]
-            suffix = item.name if item.name else socket.name
-            filename = f"{mat.name}_{suffix}"
-
-            print(f"  [{item_idx + 1}/{total}] {filename}{ext}")
-            print(f"        {_item_summary(item, node, socket)}")
-
-            temp_col = os.path.join(export_path, f"_temp_col_{mat.name}.tga")
-            temp_alpha = os.path.join(export_path, f"_temp_alpha_{mat.name}.tga")
-
-            temp_plane, prev_active, prev_selected = _setup_temp_plane(context, mat)
-            bake_obj = temp_plane
-
-            try:
-                self._process_bake(context, bake_obj, mat, node, int(item.socket_index), item, temp_col, save_alpha=item.has_alpha_channel)
-
-                if item.has_alpha_channel:
-                    self._process_bake(context, bake_obj, mat, node, int(item.alpha_socket_index), item, temp_alpha, force_colorspace='Non-Color')
-                    self._merge_with_pil(temp_col, temp_alpha, export_path, filename, fmt)
-                else:
-                    final_path = os.path.normpath(os.path.join(export_path, filename + ext))
-                    if os.path.exists(final_path): os.remove(final_path)
-                    os.rename(temp_col, final_path)
-
-            finally:
-                for p in [temp_col, temp_alpha]:
-                    if os.path.exists(p):
-                        try: os.remove(p)
-                        except: pass
-                _restore_after_plane(context, temp_plane, prev_active, prev_selected)
-
-            baked += 1
-
-        _log_footer(f"Done  -  {baked} baked, {skipped} skipped")
+        _log_footer(f"Done  -  {baked} baked, {skipped} skipped", _timing_details(totals, perf_counter() - start, device))
         self.report({'INFO'}, f"Baked {baked} item(s) from '{mat.name}'")
         return {'FINISHED'}
-
-    def _process_bake(self, context, obj, mat, node, socket_idx, item, filepath, force_colorspace=None, save_alpha=False):
-        ntree = mat.node_tree
-        res_x = int(item.resolution_x)
-        res_y = int(item.resolution_y) if not item.sync_y_with_x else res_x
-        colorspace = force_colorspace if force_colorspace else item.color_space
-
-        bake_img = bpy.data.images.new("_temp_bake", width=res_x, height=res_y, alpha=save_alpha)
-        bake_img.colorspace_settings.name = colorspace
-
-        mat_out = next((n for n in ntree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-        if not mat_out:
-            print(f"        ERROR: no active Material Output node in '{mat.name}'")
-            bpy.data.images.remove(bake_img)
-            return
-
-        temp_nodes = []
-        img_node = ntree.nodes.new('ShaderNodeTexImage')
-        img_node.image = bake_img
-        temp_nodes.append(img_node)
-        ntree.nodes.active = img_node
-
-        emit = ntree.nodes.new('ShaderNodeEmission')
-        temp_nodes.append(emit)
-
-        old_links = []
-        surf_in = mat_out.inputs['Surface']
-        for link in surf_in.links:
-            old_links.append((link.from_socket, link.to_socket))
-            ntree.links.remove(link)
-
-        ntree.links.new(emit.outputs[0], surf_in)
-
-        socket = node.outputs[socket_idx]
-        if socket.type == 'VECTOR':
-            print("        note: vector socket - inserting SeparateXYZ + CombineRGB")
-            sep = ntree.nodes.new('ShaderNodeSeparateXYZ')
-            comb = ntree.nodes.new('ShaderNodeCombineRGB')
-            temp_nodes.extend([sep, comb])
-            ntree.links.new(socket, sep.inputs[0])
-            ntree.links.new(sep.outputs[0], comb.inputs[0])
-            ntree.links.new(sep.outputs[1], comb.inputs[1])
-            ntree.links.new(sep.outputs[2], comb.inputs[2])
-            ntree.links.new(comb.outputs[0], emit.inputs['Color'])
-        else:
-            ntree.links.new(socket, emit.inputs['Color'])
-
-        scene = context.scene
-        old_engine = scene.render.engine
-        old_transform = scene.view_settings.view_transform
-        old_format = scene.render.image_settings.file_format
-        old_cycles_device = scene.cycles.device
-        old_samples = scene.cycles.samples
-
-        scene.render.engine = 'CYCLES'
-        scene.cycles.bake_type = 'EMIT'
-        scene.cycles.samples = 1
-        scene.view_settings.view_transform = 'Standard'
-
-        cycles_addon = bpy.context.preferences.addons.get('cycles')
-        if cycles_addon:
-            cprefs = cycles_addon.preferences
-            has_gpu = any(d.use and d.type != 'CPU' for d in cprefs.devices)
-            scene.cycles.device = 'GPU' if has_gpu else 'CPU'
-        else:
-            scene.cycles.device = 'CPU'
-
-        if not obj.data.uv_layers:
-            obj.data.uv_layers.new(name="UVMap")
-
-        vector_links = []
-        if item.bypass_texture_mapping:
-            for tex_node in _collect_tex_nodes_upstream(node):
-                vec_input = tex_node.inputs.get('Vector')
-                if vec_input and vec_input.links:
-                    for link in list(vec_input.links):
-                        vector_links.append((link.from_socket, link.to_socket))
-                        ntree.links.remove(link)
-            if vector_links:
-                print(f"        note: bypass mapping - disconnected {len(vector_links)} vector link(s)")
-
-        # Force upstream textures whose Alpha output is connected to Channel Packed
-        # so the color pass isn't premultiplied by the alpha. Restored after bake.
-        alpha_mode_overrides = {}
-        for tex_node in _collect_channel_packed_tex_nodes(node):
-            img = tex_node.image
-            if img.name not in alpha_mode_overrides and img.alpha_mode != 'CHANNEL_PACKED':
-                alpha_mode_overrides[img.name] = (img, img.alpha_mode)
-                img.alpha_mode = 'CHANNEL_PACKED'
-        if alpha_mode_overrides:
-            print(f"        note: alpha connection - forced channel-packed on {len(alpha_mode_overrides)} image(s)")
-
-        bpy.ops.object.select_all(action='DESELECT')
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-        bpy.ops.object.bake(type='EMIT')
-
-        for img, mode in alpha_mode_overrides.values():
-            img.alpha_mode = mode
-
-        for f, t in vector_links:
-            ntree.links.new(f, t)
-
-        if not save_alpha:
-            pixels = list(bake_img.pixels)
-            for i in range(3, len(pixels), 4):
-                pixels[i] = 1.0
-            bake_img.pixels = pixels
-
-        bake_img.filepath_raw = os.path.normpath(filepath)
-        bake_img.file_format = 'TARGA'
-        bake_img.save()
-
-        for n in temp_nodes: ntree.nodes.remove(n)
-        for f, t in old_links: ntree.links.new(f, t)
-        bpy.data.images.remove(bake_img)
-
-        scene.render.engine = old_engine
-        scene.cycles.device = old_cycles_device
-        scene.cycles.samples = old_samples
-        scene.view_settings.view_transform = old_transform
-        scene.render.image_settings.file_format = old_format
-
-    def _merge_with_pil(self, col_path, alpha_path, export_dir, filename, fmt):
-        with Image.open(col_path).convert("RGBA") as base_img:
-            with Image.open(alpha_path).convert("L") as alpha_mask:
-                ext = ".png" if fmt == 'PNG' else ".tga"
-                save_path = os.path.normpath(os.path.join(export_dir, filename + ext))
-
-                # A fully opaque alpha carries no information - drop it and save RGB.
-                if alpha_mask.getextrema()[0] == 255:
-                    print("        note: alpha is fully opaque - saved as RGB")
-                    base_img.convert("RGB").save(save_path)
-                    return
-
-                r, g, b, _ = base_img.split()
-                Image.merge("RGBA", (r, g, b, alpha_mask)).save(save_path)
 
 
 class NODE_OT_node_bake_all_materials(Operator):
@@ -486,7 +626,7 @@ class NODE_OT_node_bake_all_materials(Operator):
             ]
         else:
             material_slots = [slot for slot in obj.material_slots if slot.material and slot.material.use_nodes]
-            
+
         total_mats = len(material_slots)
 
         if total_mats == 0:
@@ -500,25 +640,23 @@ class NODE_OT_node_bake_all_materials(Operator):
         _log_header(f"Node Baker  -  Bake All Materials", f"'{obj.name}'  |  {total_mats} material(s)  ->  {export_path}")
 
         tot_baked = tot_skipped = 0
-        for mat_idx, slot in enumerate(material_slots):
-            mat = slot.material
-            total_items = len(mat.kitsunetools.node_baker_list)
-            print(f"\n  Material [{mat_idx + 1}/{total_mats}]  {mat.name}  ({total_items} item(s))")
-            obj.active_material_index = mat_idx
-            b, s = _run_bake_for_material(self, context, obj, mat, export_path)
-            tot_baked += b
-            tot_skipped += s
+        totals = {}
+        start = perf_counter()
+        with _bake_session(context) as (bscene, device):
+            for mat_idx, slot in enumerate(material_slots):
+                mat = slot.material
+                items = list(mat.kitsunetools.node_baker_list)
+                print(f"\n  Material [{mat_idx + 1}/{total_mats}]  {mat.name}  ({len(items)} item(s))")
+                obj.active_material_index = mat_idx
+                b, s = _bake_items(context, bscene, mat, items, export_path, "    ", totals)
+                tot_baked += b
+                tot_skipped += s
 
-        _log_footer(f"All done  -  {tot_baked} baked, {tot_skipped} skipped, {total_mats} material(s)")
+        _log_footer(f"All done  -  {tot_baked} baked, {tot_skipped} skipped, {total_mats} material(s)",
+                    _timing_details(totals, perf_counter() - start, device))
         self.report({'INFO'}, f"Baked {tot_baked} item(s) across {total_mats} material(s) on '{obj.name}'")
         return {'FINISHED'}
 
-    def _process_bake(self, context, obj, mat, node, socket_idx, item, filepath, force_colorspace=None, save_alpha=False):
-        return NODE_OT_node_bake_run._process_bake(self, context, obj, mat, node, socket_idx, item, filepath, force_colorspace, save_alpha)
-
-    def _merge_with_pil(self, col_path, alpha_path, export_dir, filename, fmt):
-        return NODE_OT_node_bake_run._merge_with_pil(self, col_path, alpha_path, export_dir, filename, fmt)
-    
 
 class NODE_OT_import_custom_nodes(Operator):
     bl_idname = "kitsunetools.import_custom_nodes"
@@ -554,15 +692,27 @@ class NODE_OT_import_custom_nodes(Operator):
 
     def _import_nodes(self, blend_path):
         old_groups = {name: bpy.data.node_groups.get(name) for name in self._conflicts}
+        before = set(bpy.data.node_groups)
 
         with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
-            data_to.node_groups = data_from.node_groups
+            if self.overwrite:
+                data_to.node_groups = data_from.node_groups
+            else:
+                data_to.node_groups = [n for n in data_from.node_groups if n not in self._conflicts]
 
         for ng in data_to.node_groups:
             if ng:
                 ng.use_fake_user = True
 
-        if self.overwrite:
+        if not self.overwrite:
+            # Nested dependencies get appended as "Name.001" copies; point them back to the existing groups
+            for ng in [ng for ng in bpy.data.node_groups if ng not in before]:
+                base, _, suffix = ng.name.rpartition(".")
+                existing = old_groups.get(base) if suffix.isdigit() else None
+                if existing:
+                    ng.user_remap(existing)
+                    bpy.data.node_groups.remove(ng)
+        else:
             for name, old_ng in old_groups.items():
                 new_ng = next(
                     (ng for ng in bpy.data.node_groups if ng.name.startswith(name) and ng != old_ng),
@@ -608,17 +758,43 @@ class NODE_OT_import_custom_nodes(Operator):
             self.report({'ERROR'}, f"Shader nodes file not found: {blend_path}")
             return {'CANCELLED'}
 
-        if self._conflicts and not self.overwrite:
-            self.report({'INFO'}, "Import cancelled - existing nodes were not overwritten.")
-            return {'CANCELLED'}
+        self._conflicts = self._get_conflicting_names(blend_path)
+
+        if not self.overwrite:
+            with bpy.data.libraries.load(blend_path, link=False) as (data_from, _):
+                missing = [n for n in data_from.node_groups if n not in self._conflicts]
+            if not missing:
+                self.report({'INFO'}, "All shader nodes already exist - nothing imported.")
+                return {'CANCELLED'}
 
         self._import_nodes(blend_path)
 
         for area in context.screen.areas:
             area.tag_redraw()
 
-        action = "imported and updated" if self.overwrite else "imported"
+        action = "imported and updated" if self.overwrite else "imported (existing nodes kept)"
         self.report({'INFO'}, f"Shader nodes {action} successfully.")
+        return {'FINISHED'}
+
+
+class NODE_OT_open_custom_nodes_file(Operator):
+    bl_idname = "kitsunetools.open_custom_nodes_file"
+    bl_label = "Open Kitsune Shader Nodes File"
+    bl_description = "Open the bundled shader nodes .blend in a new Blender instance"
+
+    def execute(self, context) -> set:
+        blend_path = NODE_OT_import_custom_nodes._get_blend_path()
+
+        if not os.path.exists(blend_path):
+            self.report({'ERROR'}, f"Shader nodes file not found: {blend_path}")
+            return {'CANCELLED'}
+
+        try:
+            subprocess.Popen([bpy.app.binary_path, blend_path])
+        except OSError as e:
+            self.report({'ERROR'}, f"Failed to launch Blender: {e}")
+            return {'CANCELLED'}
+
         return {'FINISHED'}
     
 
@@ -776,10 +952,307 @@ class NODE_OT_set_copy_input(Operator):
         context.window_manager['_copy_node_selected_input'] = self.input_name #pyright: ignore
         return {'FINISHED'}
 
+
+# Dynamic enum strings must stay referenced or Blender shows garbage labels
+_replace_items_cache: dict = {}
+
+_SOCKET_TYPE_MAP = {
+    'NodeSocketFloat': 'VALUE',
+    'NodeSocketInt': 'INT',
+    'NodeSocketBool': 'BOOLEAN',
+    'NodeSocketVector': 'VECTOR',
+    'NodeSocketColor': 'RGBA',
+    'NodeSocketShader': 'SHADER',
+}
+
+
+def _shader_group(name):
+    group = bpy.data.node_groups.get(name) if name else None
+    return group if group and group.bl_idname == 'ShaderNodeTree' else None
+
+
+def _group_sockets(group, is_output):
+    if not group:
+        return []
+    in_out = 'OUTPUT' if is_output else 'INPUT'
+    return [
+        item for item in group.interface.items_tree
+        if item.item_type == 'SOCKET' and item.in_out == in_out
+    ]
+
+
+def _replace_target_items(self, context):
+    items = [('NONE', "None (disconnect)", "Drop links on this socket")]
+    for item in _group_sockets(_shader_group(self.group_name), self.is_output):
+        short = _SOCKET_TYPE_MAP.get(item.socket_type, item.socket_type)
+        items.append((item.identifier, f"{item.name} [{short}]", ""))
+    _replace_items_cache[(self.group_name, self.is_output)] = items
+    return items
+
+
+def _socket_by_identifier(sockets, identifier):
+    return next((s for s in sockets if s.identifier == identifier), None)
+
+
+def _transfer_default(src, dst):
+    if not hasattr(src, 'default_value') or not hasattr(dst, 'default_value'):
+        return
+    value = src.default_value
+    try:
+        dst.default_value = value
+        return
+    except (TypeError, ValueError, AttributeError):
+        pass
+    # Mismatched shapes: copy overlapping channels, or spread a scalar across RGB/XYZ
+    src_is_seq = hasattr(value, '__len__')
+    if not hasattr(dst.default_value, '__len__'):
+        return
+    target = list(dst.default_value)
+    try:
+        if src_is_seq:
+            for i in range(min(len(target), len(value))):
+                target[i] = value[i]
+        else:
+            for i in range(min(3, len(target))):
+                target[i] = value
+        dst.default_value = target
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+
+class NodeReplaceSocketMap(PropertyGroup):
+    source_id: StringProperty()
+    source_name: StringProperty()
+    source_type: StringProperty()
+    group_name: StringProperty()
+    is_output: BoolProperty()
+    target: EnumProperty(name="Target", items=_replace_target_items)
+
+
+class NODE_OT_replace_with_group(Operator):
+    bl_idname = "node.replace_with_group"
+    bl_label = "Replace Node with Group"
+    bl_description = "Replace the active shader node with a node group, remapping links, unlinked values and Node Baker items"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    scope: EnumProperty(
+        name="Scope",
+        items=[
+            ('ACTIVE_MATERIAL', "Active Material Only", "Replace only in the material being edited"),
+            ('ALL', "All Materials in File", "Replace every matching node in every material"),
+        ],
+        default='ACTIVE_MATERIAL',
+    )
+    target_group: StringProperty(name="Replace With", description="Shader node group to replace the node with")
+    synced_group: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    input_map: CollectionProperty(type=NodeReplaceSocketMap, options={'SKIP_SAVE'})
+    output_map: CollectionProperty(type=NodeReplaceSocketMap, options={'SKIP_SAVE'})
+
+    def _active_node(self, context):
+        space = context.space_data
+        if space and space.type == 'NODE_EDITOR' and space.tree_type == 'ShaderNodeTree':
+            return space.node_tree.nodes.active if space.node_tree else None
+        return None
+
+    def _sync_rows(self, source):
+        if self.synced_group == self.target_group:
+            return
+        self.synced_group = self.target_group
+        self.input_map.clear()
+        self.output_map.clear()
+        group = _shader_group(self.target_group)
+        if not group:
+            return
+
+        for coll, sockets, is_output in (
+            (self.input_map, source.inputs, False),
+            (self.output_map, source.outputs, True),
+        ):
+            candidates = _group_sockets(group, is_output)
+            used = set()
+            for sock in sockets:
+                if not getattr(sock, 'enabled', True):
+                    continue
+                row = coll.add()
+                row.source_id = sock.identifier
+                row.source_name = sock.name
+                row.source_type = sock.type
+                row.group_name = group.name
+                row.is_output = is_output
+                match = next(
+                    (c for c in candidates
+                     if c.identifier not in used and c.name.casefold() == sock.name.casefold()),
+                    None,
+                )
+                if match:
+                    used.add(match.identifier)
+                    row.target = match.identifier
+
+    def _node_matches(self, source, candidate):
+        if candidate.bl_idname != source.bl_idname:
+            return False
+        if source.type == 'GROUP' and candidate.node_tree != source.node_tree:
+            return False
+        return True
+
+    def _target_trees(self, context):
+        if self.scope == 'ACTIVE_MATERIAL':
+            space = context.space_data
+            return [(space.id, space.node_tree)]
+        return [(mat, mat.node_tree) for mat in bpy.data.materials if mat.node_tree]
+
+    def _shader_mismatch(self, row):
+        target_item = _socket_by_identifier(
+            _group_sockets(_shader_group(row.group_name), row.is_output), row.target)
+        target_type = _SOCKET_TYPE_MAP.get(target_item.socket_type) if target_item else None
+        return (row.source_type == 'SHADER') != (target_type == 'SHADER')
+
+    def invoke(self, context, event) -> set:
+        source = self._active_node(context)
+        if not source:
+            self.report({'WARNING'}, "No active shader node selected in the Shader Editor.")
+            return {'CANCELLED'}
+        self.synced_group = ""
+        self._sync_rows(source)
+        return context.window_manager.invoke_props_dialog(self, width=440)
+
+    def draw(self, context):
+        layout = self.layout
+        source = self._active_node(context)
+        if not source:
+            return
+
+        layout.label(text=f"Source Node: {source.name}", icon='NODE')
+        layout.prop(self, "scope")
+        layout.prop_search(self, "target_group", bpy.data, "node_groups", icon='NODETREE')
+        self._sync_rows(source)
+
+        if not _shader_group(self.target_group):
+            if self.target_group:
+                layout.label(text="Not a shader node group", icon='ERROR')
+            return
+
+        for title, rows in (("Inputs", self.input_map), ("Outputs", self.output_map)):
+            if not rows:
+                continue
+            box = layout.box()
+            box.label(text=title)
+            for row in rows:
+                split = box.split(factor=0.4)
+                split.label(text=row.source_name)
+                sub = split.row(align=True)
+                sub.prop(row, "target", text="")
+                if row.target != 'NONE' and self._shader_mismatch(row):
+                    sub.label(text="", icon='ERROR')
+
+        layout.label(text="Sockets set to None are disconnected", icon='INFO')
+
+    def _replace_node(self, tree, old, group, in_map, out_map):
+        new = tree.nodes.new('ShaderNodeGroup')
+        new.node_tree = group
+        new.parent = old.parent
+        new.location = old.location
+        new.width = old.width
+        new.label = old.label
+        new.hide = old.hide
+        new.use_custom_color = old.use_custom_color
+        new.color = old.color
+
+        for old_sock in old.inputs:
+            new_sock = _socket_by_identifier(new.inputs, in_map.get(old_sock.identifier, ''))
+            if not new_sock:
+                continue
+            if old_sock.is_linked:
+                for link in old_sock.links:
+                    tree.links.new(link.from_socket, new_sock)
+            else:
+                _transfer_default(old_sock, new_sock)
+
+        for old_sock in old.outputs:
+            new_sock = _socket_by_identifier(new.outputs, out_map.get(old_sock.identifier, ''))
+            if not new_sock:
+                continue
+            for link in list(old_sock.links):
+                tree.links.new(new_sock, link.to_socket)
+
+        name = old.name
+        tree.nodes.remove(old)
+        new.name = name
+        return new
+
+    def _snapshot_bake_items(self, mat, node):
+        # Stores socket identifiers since the stored enum index is meaningless once the node changes
+        if not isinstance(mat, bpy.types.Material):
+            return []
+        outputs = list(node.outputs)
+
+        def identifier_at(index):
+            return outputs[int(index)].identifier if index.isdigit() and int(index) < len(outputs) else None
+
+        return [
+            (item, identifier_at(item.socket_index),
+             identifier_at(item.alpha_socket_index) if item.has_alpha_channel else None)
+            for item in mat.kitsunetools.node_baker_list
+            if item.node_name == node.name
+        ]
+
+    def _remap_bake_items(self, snapshot, new, out_map):
+        outputs = list(new.outputs)
+        unresolved = 0
+        for item, main_id, alpha_id in snapshot:
+            pairs = [("socket_index", main_id)]
+            if item.has_alpha_channel:
+                pairs.append(("alpha_socket_index", alpha_id))
+            for attr, old_id in pairs:
+                new_sock = _socket_by_identifier(outputs, out_map.get(old_id or '', ''))
+                if new_sock:
+                    setattr(item, attr, str(outputs.index(new_sock)))
+                else:
+                    unresolved += 1
+        return unresolved
+
+    def execute(self, context) -> set:
+        source = self._active_node(context)
+        if not source:
+            self.report({'ERROR'}, "No active shader node.")
+            return {'CANCELLED'}
+        self._sync_rows(source)
+        group = _shader_group(self.target_group)
+        if not group:
+            self.report({'ERROR'}, "Pick a shader node group to replace with.")
+            return {'CANCELLED'}
+        if source.type == 'GROUP' and source.node_tree == group:
+            self.report({'WARNING'}, "Node already uses that group.")
+            return {'CANCELLED'}
+
+        in_map = {r.source_id: r.target for r in self.input_map if r.target != 'NONE'}
+        out_map = {r.source_id: r.target for r in self.output_map if r.target != 'NONE'}
+        source_tree = context.space_data.node_tree
+        source_name = source.name
+
+        replaced = unresolved = 0
+        for mat, tree in self._target_trees(context):
+            for node in [n for n in tree.nodes if self._node_matches(source, n)]:
+                snapshot = self._snapshot_bake_items(mat, node)
+                new = self._replace_node(tree, node, group, in_map, out_map)
+                unresolved += self._remap_bake_items(snapshot, new, out_map)
+                replaced += 1
+                if tree == source_tree and new.name == source_name:
+                    tree.nodes.active = new
+                    new.select = True
+
+        msg = f"Replaced {replaced} node(s) with '{group.name}'."
+        if unresolved:
+            self.report({'WARNING'}, f"{msg} {unresolved} bake output(s) had no mapping - check Node Baker items.")
+        else:
+            self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
 class NODE_OT_node_bake_auto_resolution(Operator):
     bl_idname = "node.node_bake_auto_resolution"
     bl_label = "Auto Resolution"
-    bl_description = "Set resolution from the largest of all connected Image Texture nodes"
+    bl_description = "Set resolution from the largest of all connected Image Texture nodes, or 32x32 if the output is a solid color"
 
     material_name: StringProperty(default="")
 
@@ -883,26 +1356,34 @@ class NODE_OT_node_bake_auto_resolution(Operator):
 
                 visited = set()
                 sizes = []
+                has_texture = False
                 stack = [node]
                 while stack:
                     current = stack.pop()
-                    if current.name in visited:
+                    key = current.as_pointer()
+                    if key in visited:
                         continue
-                    visited.add(current.name)
+                    visited.add(key)
+                    if current.type.startswith('TEX_'):
+                        has_texture = True
                     if current.type == 'TEX_IMAGE' and current.image and current.image.size[0] > 0:
                         sizes.append((current.image.size[0], current.image.size[1]))
+                    if current.type == 'GROUP' and current.node_tree:
+                        stack.extend(current.node_tree.nodes)
                     for inp in current.inputs:
                         for link in inp.links:  # pyright: ignore
-                            if link.from_node.name not in visited:
-                                stack.append(link.from_node)
+                            stack.append(link.from_node)
 
-                if not sizes:
+                if sizes:
+                    target_x = max(w for w, _ in sizes) / self.reducer
+                    target_y = max(h for _, h in sizes) / self.reducer
+                    snapped_x = str(min(resolutions, key=lambda r: abs(r - target_x)))
+                    snapped_y = str(min(resolutions, key=lambda r: abs(r - target_y)))
+                elif not has_texture:
+                    # No texture nodes upstream or inside groups, output is a solid color
+                    snapped_x = snapped_y = "32"
+                else:
                     continue
-
-                target_x = max(w for w, _ in sizes) / self.reducer
-                target_y = max(h for _, h in sizes) / self.reducer
-                snapped_x = str(min(resolutions, key=lambda r: abs(r - target_x)))
-                snapped_y = str(min(resolutions, key=lambda r: abs(r - target_y)))
 
                 item.resolution_x = snapped_x
                 if snapped_x != snapped_y:
@@ -1027,8 +1508,250 @@ class NODE_OT_node_bake_auto_colorspace(Operator):
 
         self.report({'INFO'}, f"Color space set to '{self.color_space}' on {applied} item(s)")
         return {'FINISHED'}
-    
- 
+
+
+class NODE_OT_node_bake_rename_suffix(Operator):
+    bl_idname = "node.node_bake_rename_suffix"
+    bl_label = "Rename Suffix"
+    bl_description = "Regex find/replace on baker item suffixes, e.g. rmao -> rm"
+    bl_options = {'UNDO'}
+
+    material_name: StringProperty(default="")
+
+    mode: bpy.props.EnumProperty(
+        items=[
+            ('ACTIVE',         "Active Item",            "Only the active item in the active material"),
+            ('ALL_ACTIVE_MAT', "All in Active Material", "All items in the active material"),
+            ('ALL_MATERIALS',  "All Materials",          "All items across all materials"),
+        ],
+        default='ALL_ACTIVE_MAT',
+    )
+
+    find: StringProperty(
+        name="Find",
+        description="Regex pattern to match in the suffix",
+        default="",
+    )
+
+    replace: StringProperty(
+        name="Replace",
+        description="Replacement string. Supports backreferences like \\1",
+        default="",
+    )
+
+    def _get_materials(self, context):
+        if self.mode == 'ALL_MATERIALS':
+            return [m for m in bpy.data.materials if m.use_nodes and m.kitsunetools.node_baker_list]
+        if self.material_name:
+            mat = bpy.data.materials.get(self.material_name)
+        else:
+            obj = context.active_object
+            mat = obj.active_material if obj else None
+        return [mat] if mat and mat.use_nodes else []
+
+    def _get_items(self, mat):
+        kt = mat.kitsunetools
+        if self.mode == 'ACTIVE':
+            if not kt.node_baker_list or kt.node_baker_list_index >= len(kt.node_baker_list):
+                return []
+            return [kt.node_baker_list[kt.node_baker_list_index]]
+        return list(kt.node_baker_list)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=300)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "mode")
+        layout.prop(self, "find")
+        layout.prop(self, "replace")
+
+    def execute(self, context) -> set:
+        if not self.find:
+            self.report({'WARNING'}, "Find pattern is empty")
+            return {'CANCELLED'}
+        try:
+            pattern = re.compile(self.find)
+        except re.error as e:
+            self.report({'ERROR'}, f"Invalid regex: {e}")
+            return {'CANCELLED'}
+
+        materials = self._get_materials(context)
+        if not materials:
+            self.report({'WARNING'}, "No valid material(s) found")
+            return {'CANCELLED'}
+
+        renamed = 0
+        for mat in materials:
+            for item in self._get_items(mat):
+                new_name, count = pattern.subn(self.replace, item.name)
+                if count and new_name != item.name:
+                    item.name = new_name
+                    renamed += 1
+
+        if renamed == 0:
+            self.report({'WARNING'}, "No suffixes matched")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Renamed {renamed} suffix(es)")
+        return {'FINISHED'}
+
+
+def _swap_socket_items(self, context):
+    """Output sockets of the active item's node, keyed by name so the same
+    choice maps onto every item sharing that node type."""
+    mat = _resolve_material(context, self.material_name)
+    if not mat:
+        return [('NONE', 'None', '')]
+    kt = mat.kitsunetools
+    idx = kt.node_baker_list_index
+    if not (0 <= idx < len(kt.node_baker_list)):
+        return [('NONE', 'None', '')]
+    node = kt.node_baker_list[idx].get_node()
+    if not node or not getattr(node, "outputs", None):
+        return [('NONE', 'None', '')]
+    return [(o.name, f"{o.name} [{o.type}]", "") for o in node.outputs]
+
+
+class NODE_OT_node_bake_swap_output(Operator):
+    bl_idname = "node.node_bake_swap_output"
+    bl_label = "Swap Output"
+    bl_description = "Switch the selected output on every item sharing the active item's node type, e.g. MRAO -> Exponent"
+    bl_options = {'UNDO'}
+
+    material_name: StringProperty(default="")
+
+    all_materials: BoolProperty(
+        name="All Materials",
+        description="Apply across every material, not just the active one",
+        default=False,
+    )
+    from_socket: EnumProperty(name="From", items=_swap_socket_items)
+    to_socket: EnumProperty(name="To", items=_swap_socket_items)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=300)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "all_materials")
+        layout.prop(self, "from_socket")
+        layout.prop(self, "to_socket")
+
+    def execute(self, context) -> set:
+        if self.from_socket == 'NONE' or self.to_socket == 'NONE':
+            self.report({'WARNING'}, "No valid sockets to swap")
+            return {'CANCELLED'}
+        if self.from_socket == self.to_socket:
+            self.report({'WARNING'}, "From and To are the same")
+            return {'CANCELLED'}
+
+        if self.all_materials:
+            materials = [m for m in bpy.data.materials if m.use_nodes and m.kitsunetools.node_baker_list]
+        else:
+            mat = _resolve_material(context, self.material_name)
+            materials = [mat] if mat else []
+        if not materials:
+            self.report({'WARNING'}, "No valid material(s) found")
+            return {'CANCELLED'}
+
+        swapped = 0
+        for mat in materials:
+            for item in mat.kitsunetools.node_baker_list:
+                node = item.get_node()
+                if not node:
+                    continue
+                names = [o.name for o in node.outputs]
+                if self.to_socket not in names:
+                    continue
+                cur = int(item.socket_index) if item.socket_index.isdigit() else -1
+                if 0 <= cur < len(names) and names[cur] == self.from_socket:
+                    item.socket_index = str(names.index(self.to_socket))
+                    swapped += 1
+
+        if swapped == 0:
+            self.report({'WARNING'}, "No items matched")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Swapped output on {swapped} item(s)")
+        return {'FINISHED'}
+
+
+class NODE_OT_node_bake_set_alpha(Operator):
+    bl_idname = "node.node_bake_set_alpha"
+    bl_label = "Set Alpha Channel"
+    bl_description = "Enable or disable the alpha pass on items whose suffix matches, and choose which output feeds the alpha"
+    bl_options = {'UNDO'}
+
+    material_name: StringProperty(default="")
+
+    all_materials: BoolProperty(
+        name="All Materials",
+        description="Apply across every material, not just the active one",
+        default=False,
+    )
+    match: StringProperty(
+        name="Suffix Contains",
+        description="Only affect items whose suffix contains this text (case-insensitive). Empty matches all items",
+        default="",
+    )
+    action: EnumProperty(
+        name="Action",
+        items=[
+            ('ENABLE',  "Enable",  "Turn the alpha pass on and set its output socket"),
+            ('DISABLE', "Disable", "Turn the alpha pass off"),
+        ],
+        default='ENABLE',
+    )
+    alpha_socket: EnumProperty(name="Alpha Output", items=_swap_socket_items)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=300)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "all_materials")
+        layout.prop(self, "match")
+        layout.prop(self, "action")
+        if self.action == 'ENABLE':
+            layout.prop(self, "alpha_socket")
+
+    def execute(self, context) -> set:
+        if self.all_materials:
+            materials = [m for m in bpy.data.materials if m.use_nodes and m.kitsunetools.node_baker_list]
+        else:
+            mat = _resolve_material(context, self.material_name)
+            materials = [mat] if mat else []
+        if not materials:
+            self.report({'WARNING'}, "No valid material(s) found")
+            return {'CANCELLED'}
+
+        needle = self.match.lower()
+        enable = self.action == 'ENABLE'
+        changed = 0
+        for mat in materials:
+            for item in mat.kitsunetools.node_baker_list:
+                if needle and needle not in item.name.lower():
+                    continue
+                if enable:
+                    node = item.get_node()
+                    names = [o.name for o in node.outputs] if node else []
+                    if self.alpha_socket not in names:
+                        continue
+                    item.has_alpha_channel = True
+                    item.alpha_socket_index = str(names.index(self.alpha_socket))
+                else:
+                    item.has_alpha_channel = False
+                changed += 1
+
+        if changed == 0:
+            self.report({'WARNING'}, "No items matched")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Updated alpha on {changed} item(s)")
+        return {'FINISHED'}
+
+
 class NODE_OT_node_bake_copy(Operator):
     bl_idname = "node.node_bake_copy"
     bl_label = "Copy Node Bake Item(s)"
@@ -1087,11 +1810,26 @@ class NODE_OT_node_bake_paste(Operator):
             self.report({'WARNING'}, "No target material")
             return {'CANCELLED'}
         baker_list = mat.kitsunetools.node_baker_list
- 
+        nodes = mat.node_tree.nodes if mat.node_tree else None
+
+        pasted = skipped = 0
         for d in _clipboard:
+            # Socket enum items resolve from the item's node, so pasting an item
+            # whose node is absent on this material would fail to set the enum.
+            if not nodes or not nodes.get(d.get("node_name", "")):
+                skipped += 1
+                continue
             item = baker_list.add()
             _dict_to_item(d, item)
- 
+            pasted += 1
+
+        if pasted == 0:
+            self.report({'ERROR'}, f"Pasted nothing, {skipped} item(s) skipped (node not found on '{mat.name}')")
+            return {'CANCELLED'}
+
         mat.kitsunetools.node_baker_list_index = len(baker_list) - 1
-        self.report({'INFO'}, f"Pasted {len(_clipboard)} item(s)")
+        msg = f"Pasted {pasted} item(s)"
+        if skipped:
+            msg += f", skipped {skipped} (node not found)"
+        self.report({'WARNING'} if skipped else {'INFO'}, msg)
         return {'FINISHED'}

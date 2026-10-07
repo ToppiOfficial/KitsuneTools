@@ -15,20 +15,17 @@ exportname_shortcut_keywords = {
 
 # Only when KitsuneSrcTool is installed
 def get_bone_exportname(bone: Bone | PoseBone | None, for_write=False) -> str:
-    _EXPORTNAME_MODULES = (
-        "...kitsune_source_tools.utils",
-        "...io_scene_valvesource.utils",
-        "...pulse_src_ops.utils",
-    )
+    _EXPORTNAME_ADDONS = ("pulse_src_ops", "kitsune_source_tools", "io_scene_valvesource")
 
-    if is_addon_enabled("kitsune_source_tools"):
-        for module_path in _EXPORTNAME_MODULES:
-            try:
-                from importlib import import_module
-                mod = import_module(module_path, package=__package__)
-                return mod.get_bone_exportname(bone, for_write=for_write)
-            except (ModuleNotFoundError, ImportError, AttributeError):
-                continue
+    from importlib import import_module
+    for addon_id in _EXPORTNAME_ADDONS:
+        if not is_addon_enabled(addon_id):
+            continue
+        try:
+            mod = import_module(f"...{addon_id}.utils", package=__package__)
+            return mod.get_bone_exportname(bone, for_write=for_write)
+        except (ModuleNotFoundError, ImportError, AttributeError):
+            continue
 
     if bone is None:
         return "None"
@@ -523,9 +520,10 @@ def merge_bones(armature: Object, source: Bone, target: Bone | list[Bone], keep_
 
     # Handle multiple targets recursively
     if isinstance(target, list) and not isinstance(target, (str, Bone)):
+        # Skip every target, not just removed ones, so kept bones don't absorb their selected children
+        target_names = {b.name for b in target}
         for entry in target:
-            # Determine source for this entry, respecting prior merges in this run
-            entry_source = source or _find_valid_parent(entry, bones_to_remove)
+            entry_source = source or _find_valid_parent(entry, target_names)
             if not entry_source:
                 continue
 

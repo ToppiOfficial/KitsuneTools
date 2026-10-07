@@ -6,15 +6,17 @@ _prev_matrices: dict = {}
 _is_mirroring: bool = False
 
 
-def _find_mirror_bone(armature, source_bone, tolerance):
+def _find_mirror_bone(armature, source_bone, tolerance, claimed=()):
     src = source_bone.bone.head_local
     target = Vector((-src.x, src.y, src.z))
+    src_tail = source_bone.bone.tail_local
+    target_tail = Vector((-src_tail.x, src_tail.y, src_tail.z))
     best, best_dist = None, float("inf")
 
     solo_collections = [col for col in armature.data.collections_all if col.is_solo]
 
     for pb in armature.pose.bones:
-        if pb == source_bone:
+        if pb == source_bone or pb.name in claimed:
             continue
 
         bone = pb.bone
@@ -30,7 +32,11 @@ def _find_mirror_bone(armature, source_bone, tolerance):
                     continue
 
         dist = (bone.head_local - target).length
-        if dist < tolerance and dist < best_dist:
+        if dist >= tolerance:
+            continue
+        # Tail distance breaks ties between bones sharing the same head
+        dist += (bone.tail_local - target_tail).length
+        if dist < best_dist:
             best_dist = dist
             best = pb
 
@@ -141,9 +147,11 @@ def mirror_pose_handler(scene, depsgraph):
 
     _is_mirroring = True
     try:
+        claimed = set()
         for pb in moved:
-            mirror = _find_mirror_bone(obj, pb, props.x_mirror_tolerance)
+            mirror = _find_mirror_bone(obj, pb, props.x_mirror_tolerance, claimed)
             if mirror:
+                claimed.add(mirror.name)
                 _copy_mirrored_pose(pb, mirror)
                 _auto_keyframe(mirror)
     finally:

@@ -157,7 +157,59 @@ class VERTEXGROUP_OT_SwapVertexGroups(Operator):
         
         self.report({'INFO'}, f"{currBone.name} and {otherBone.name} vertex froup swapped")
         return {'FINISHED'}
-    
+
+
+class VERTEXGROUP_OT_InvertWeights(Operator):
+    bl_idname = 'kitsunetools.invert_weights'
+    bl_label = 'Invert Weights'
+    bl_description = "Invert the weights of the active vertex group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    include_unassigned: BoolProperty(
+        name='Include Unassigned',
+        description='Treat vertices outside the group as weight 0 so they become fully weighted',
+        default=True
+    )
+    remove_zero: BoolProperty(
+        name='Remove Zero Weights',
+        description='Remove vertices from the group when their inverted weight is 0',
+        default=True
+    )
+
+    @classmethod
+    def poll(cls, context) -> bool:
+        ob = context.active_object
+        return bool(is_mesh(ob) and ob.vertex_groups.active)
+
+    def execute(self, context) -> set:
+        ob = context.active_object
+
+        with preserve_context_mode(ob, 'OBJECT'):
+            vg = ob.vertex_groups.active
+            gi = vg.index
+            assigned = {}
+            for v in ob.data.vertices:
+                for g in v.groups:
+                    if g.group == gi:
+                        assigned[v.index] = g.weight
+                        break
+
+            indices = range(len(ob.data.vertices)) if self.include_unassigned else assigned.keys()
+            to_remove = []
+            for idx in indices:
+                new_w = 1.0 - assigned.get(idx, 0.0)
+                if self.remove_zero and new_w <= 0.0:
+                    if idx in assigned:
+                        to_remove.append(idx)
+                else:
+                    vg.add([idx], new_w, 'REPLACE')
+
+            if to_remove:
+                vg.remove(to_remove)
+
+        self.report({'INFO'}, f"Inverted '{vg.name}' weights")
+        return {'FINISHED'}
+
 
 class VERTEXGROUP_OT_curve_ramp_weights(Operator):
     bl_idname = 'kitsunetools.curve_ramp_weights'

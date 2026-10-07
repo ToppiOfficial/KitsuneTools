@@ -21,15 +21,29 @@ from ..utils.utils_humanoidmapper2 import (
     HM2_CONTROLLER_PREFIXES,
 )
 
-def _try_mirror_bone_name(bone_name: str) -> str | None:
-    infix_pairs = [
-        ('.L.', '.R.'), ('.R.', '.L.'),
-        ('_L_', '_R_'), ('_R_', '_L_'),
-    ]
-    for infix, replacement in infix_pairs:
-        if infix in bone_name:
-            return bone_name.replace(infix, replacement, 1)
+# Separators that can flank an L/R side marker (shoulder.l, l_shoulder, arm.L.001).
+_LR_SEPS = ('.', '_', ' ')
 
+
+def _swap_lr(ch: str) -> str | None:
+    """Swap an L/R side letter, preserving its case."""
+    return {'L': 'R', 'l': 'r', 'R': 'L', 'r': 'l'}.get(ch)
+
+
+def _try_mirror_bone_name(bone_name: str) -> str | None:
+    # Separator-flanked single-letter markers, case-insensitive (.l/.L, _r_, l_).
+    for i, ch in enumerate(bone_name):
+        swapped = _swap_lr(ch)
+        if swapped is None:
+            continue
+        prev_sep = i > 0 and bone_name[i - 1] in _LR_SEPS
+        next_sep = i < len(bone_name) - 1 and bone_name[i + 1] in _LR_SEPS
+        is_start = i == 0 and next_sep
+        is_end = i == len(bone_name) - 1 and prev_sep
+        if (prev_sep and next_sep) or is_start or is_end:
+            return bone_name[:i] + swapped + bone_name[i + 1:]
+
+    # Word forms (Left/Right).
     for suffix, replacement in bonename_direction_map.items():
         if bone_name.endswith(suffix):
             return bone_name[: -len(suffix)] + replacement
@@ -48,8 +62,16 @@ class HM2_OT_AddFinger(Operator):
     def poll(cls, context: Context) -> bool:
         return is_armature(context.active_object)
 
+    _cycle = ['THUMB', 'INDEX', 'MIDDLE', 'RING', 'PINKY']
+
     def execute(self, context: Context) -> set:
-        context.active_object.kitsunetools.hm2.hm2_fingers.add()
+        fingers = context.active_object.kitsunetools.hm2.hm2_fingers
+        new_f = fingers.add()
+        if len(fingers) > 1:
+            prev = fingers[-2].finger_type
+            new_f.finger_type = self._cycle[(self._cycle.index(prev) + 1) % len(self._cycle)]
+        else:
+            new_f.finger_type = self._cycle[0]
         return {'FINISHED'}
 
 
@@ -172,14 +194,14 @@ class HM2_OT_MirrorBodyMapping(Operator):
                     setattr(hm2, prop_r, mirrored_name)
                     mirrored += 1
                 else:
-                    missing.append(f"{prop_r}: could not mirror '{val_l}' → '{mirrored_name or '?'}'")
+                    missing.append(f"{prop_r}: could not mirror '{val_l}' -> '{mirrored_name or '?'}'")
             elif val_r and not val_l:
                 mirrored_name = _try_mirror_bone_name(val_r)
                 if mirrored_name and mirrored_name in bones:
                     setattr(hm2, prop_l, mirrored_name)
                     mirrored += 1
                 else:
-                    missing.append(f"{prop_l}: could not mirror '{val_r}' → '{mirrored_name or '?'}'")
+                    missing.append(f"{prop_l}: could not mirror '{val_r}' -> '{mirrored_name or '?'}'")
 
         for msg in missing:
             self.report({'WARNING'}, msg)
@@ -307,6 +329,202 @@ class HM2_OT_ValidateMapping(Operator):
         return {'FINISHED'}
 
 
+class HM2_OT_AddTwistDriver(Operator):
+    bl_idname = "kitsunetools.hm2_add_twist_driver"
+    bl_label = "Drive Twist From Active"
+    bl_description = (
+        "Add a Y-rotation twist driver to every selected bone, driven by the "
+        "active bone. Select the twist bone(s), then shift-select the driver "
+        "(hand, etc.) so it is active"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Mode",
+        items=[
+            ('FOLLOW',  'With',     'Twist rotates in the same direction as the driver bone'),
+            ('AGAINST', 'Against',  'Twist rotates opposite to the driver bone (upper-arm/thigh style)'),
+        ],
+        default='FOLLOW',
+    )
+    falloff: EnumProperty(
+        name="Falloff",
+        description="Which end of the selection twists the most",
+        items=[
+            ('NEAR', 'Strong Near Driver', 'Strongest at the bone closest to the driver (forearm style)'),
+            ('FAR',  'Strong Away',        'Strongest at the bone farthest from the driver (upper-arm style)'),
+            ('NONE', 'Uniform',            'Every selected bone gets the full influence'),
+        ],
+        default='NEAR',
+    )
+    influence: FloatProperty(
+        name="Influence",
+        description="Maximum share of the driver's twist (scales the falloff)",
+        default=1.0, min=0.0, max=1.0,
+    )
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        return (
+            context.mode == 'POSE'
+            and is_armature(context.active_object)
+            and context.active_pose_bone is not None
+            and len(context.selected_pose_bones) >= 2
+        )
+
+    def invoke(self, context: Context, event) -> set:
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context: Context) -> None:
+        driver = context.active_pose_bone
+        n = len(context.selected_pose_bones) - 1
+        col = self.layout.column()
+        col.label(text=f"Driver: {driver.name}", icon='BONE_DATA')
+        col.label(text=f"Twist bones: {n}", icon='CON_ROTLIKE')
+        col.separator()
+        col.prop(self, "mode")
+        col.prop(self, "falloff")
+        col.prop(self, "influence")
+
+    def execute(self, context: Context) -> set:
+        arm = context.active_object
+        driver = context.active_pose_bone
+        twists = [pb for pb in context.selected_pose_bones if pb != driver]
+        if not twists:
+            self.report({'ERROR'}, "Select twist bone(s), then shift-select the driver bone")
+            return {'CANCELLED'}
+
+        invert = (self.mode == 'AGAINST')
+
+        # Rank bones by head-to-driver distance, then step influence evenly by
+        # 1/n. n bones give shares n/n, (n-1)/n ... 1/n - never zero at the end.
+        # NEAR: closest ranks highest. FAR: farthest ranks highest.
+        n = len(twists)
+        order = sorted(range(n), key=lambda i:
+                       (twists[i].bone.head_local - driver.bone.head_local).length)
+
+        for rank, i in enumerate(order):
+            if self.falloff == 'NEAR':
+                weight = (n - rank) / n
+            elif self.falloff == 'FAR':
+                weight = (rank + 1) / n
+            else:
+                weight = 1.0
+            add_twist_driver(arm, twists[i], driver.name, weight * self.influence, invert)
+            twists[i].color.palette = 'THEME09'  # yellow, matching HM2 twist bones
+
+        self.report({'INFO'}, f"Driven {len(twists)} bone(s) from '{driver.name}'")
+        return {'FINISHED'}
+
+
+class HM2_OT_FKTwist(Operator):
+    bl_idname = "kitsunetools.hm2_fk_twist"
+    bl_label = "FK Twist"
+    bl_description = (
+        "Add FK controllers for the shoulders and hips, so the upper arm and thigh can be "
+        "posed directly (e.g. procedural trigger poses). A controller overrides the arm/leg "
+        "IK only while rotated away from rest"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # (deform joint, FK controller, IK chain tip holding the IK constraint)
+    _JOINTS = (
+        ('L_Shoulder', 'FK_Shoulder_L', 'L_Elbow'),
+        ('R_Shoulder', 'FK_Shoulder_R', 'R_Elbow'),
+        ('L_Hip',      'FK_Hip_L',      'L_Knee'),
+        ('R_Hip',      'FK_Hip_R',      'R_Knee'),
+    )
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        arm = context.active_object
+        return is_armature(arm) and any(arm.data.bones.get(j) for j, _, _ in cls._JOINTS)
+
+    @staticmethod
+    def _drive_influence(arm: Object, con, fk_name: str, invert: bool) -> None:
+        """FK is active while the controller's local rotation is off rest by more than
+        ~0.4 degrees (w^2 < 0.99999, sign-safe for q/-q). At rest IK keeps control."""
+        con.driver_remove('influence')
+        drv = con.driver_add('influence').driver
+        drv.type = 'SCRIPTED'
+        var = drv.variables.new()
+        var.name = 'w'
+        var.type = 'TRANSFORMS'
+        t = var.targets[0]
+        t.id              = arm
+        t.bone_target     = fk_name
+        t.transform_type  = 'ROT_W'
+        t.transform_space = 'LOCAL_SPACE'
+        t.rotation_mode   = 'QUATERNION'
+        drv.expression = 'w * w >= 0.99999' if invert else 'w * w < 0.99999'
+
+    def execute(self, context: Context) -> set:
+        arm = context.active_object
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        eb = arm.data.edit_bones
+        built = []
+        for joint, fk, tip in self._JOINTS:
+            src = eb.get(joint)
+            if src is None:
+                continue
+            b = eb.get(fk) or eb.new(fk)
+            b.head        = src.head.copy()
+            b.tail        = src.tail.copy()
+            b.roll        = src.roll
+            b.parent      = src.parent
+            b.use_connect = False
+            b.use_deform  = False
+            built.append((joint, fk, tip))
+
+        bpy.ops.object.mode_set(mode='POSE')
+        pb = arm.pose.bones
+        shape = get_hm2_shape('fk_dome') or ensure_hm2_shapes(context).get('fk_dome')
+        ctrl_coll = ensure_bone_collection(arm, 'Controllers')
+
+        for joint, fk, tip in built:
+            fk_pb, joint_pb = pb[fk], pb[joint]
+            fk_pb.lock_location = (True, True, True)
+            fk_pb.lock_scale    = (True, True, True)
+
+            for c in list(joint_pb.constraints):
+                if c.type == 'COPY_ROTATION' and c.subtarget == fk:
+                    joint_pb.constraints.remove(c)
+            cr = joint_pb.constraints.new('COPY_ROTATION')
+            cr.name         = 'FK Twist'
+            cr.target       = arm
+            cr.subtarget    = fk
+            cr.mix_mode     = 'REPLACE'
+            cr.owner_space  = 'LOCAL'
+            cr.target_space = 'LOCAL'
+            self._drive_influence(arm, cr, fk, invert=False)
+
+            # The IK solve overwrites the whole chain, so it has to fade out for FK to show.
+            tip_pb = pb.get(tip)
+            if tip_pb:
+                for c in tip_pb.constraints:
+                    if c.type == 'IK':
+                        self._drive_influence(arm, c, fk, invert=True)
+
+            if shape:
+                bl = fk_pb.bone.length
+                fk_pb.custom_shape               = shape
+                fk_pb.use_custom_shape_bone_size = False
+                fk_pb.custom_shape_scale_xyz     = (bl * 0.22, bl * 0.45, bl * 0.22)
+                fk_pb.custom_shape_translation   = Vector((0.0, bl * 0.15, 0.0))
+            fk_pb.color.palette = 'THEME01'
+
+            bone = fk_pb.bone
+            for c in list(bone.collections):
+                c.unassign(bone)
+            ctrl_coll.assign(bone)
+
+        if not built:
+            self.report({'WARNING'}, "No shoulder or hip bones found")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"FK Twist: {', '.join(fk for _, fk, _ in built)}")
+        return {'FINISHED'}
+
+
 class HM2_OT_Process(Operator):
     bl_idname = "kitsunetools.hm2_process"
     bl_label = "Run HM2 Setup"
@@ -319,6 +537,15 @@ class HM2_OT_Process(Operator):
         default=True,
     )
 
+    reorganize_misc: BoolProperty(
+        name="Reorganize Misc bones",
+        description=(
+            "Reassign non-HM2 bones (hair, cloth, physics) to the Misc/Hair "
+            "collections. Turn off to keep collections you sorted them into by hand"
+        ),
+        default=True,
+    )
+
     @classmethod
     def poll(cls, context: Context) -> bool:
         if not (context.mode == 'OBJECT' and is_armature(context.active_object)):
@@ -328,12 +555,18 @@ class HM2_OT_Process(Operator):
     def invoke(self, context: Context, event) -> set:
         arm = context.active_object
         hm2 = arm.kitsunetools.hm2
-        if self._is_hm2_applied(arm) and hm2.hm2_json_filepath.strip():
+        if self._is_hm2_applied(arm):
+            # Manual collection sorting survives a rebuild by default on re-apply.
+            self.reorganize_misc = False
             return context.window_manager.invoke_props_dialog(self, title="Re-apply HM2 Setup")
+        self.reorganize_misc = True
         return self.execute(context)
 
     def draw(self, context: Context) -> None:
-        self.layout.prop(self, "reapply_config")
+        arm = context.active_object
+        if arm.kitsunetools.hm2.hm2_json_filepath.strip():
+            self.layout.prop(self, "reapply_config")
+        self.layout.prop(self, "reorganize_misc")
 
     def execute(self, context: Context) -> set:
         arm = context.active_object
@@ -468,11 +701,11 @@ class HM2_OT_Process(Operator):
         the new bone at the same slot.
 
         Twist bones are identified by _twist_joint_of, the same helper
-        _cleanup_for_reapply uses. We build the joint→[twist_names_in_order] map
+        _cleanup_for_reapply uses. We build the joint->[twist_names_in_order] map
         from the armature's current state to resolve indices."""
         twist_children: dict[str, tuple[str, int]] = {}
 
-        # Build joint → ordered twist bone list from current bones.
+        # Build joint -> ordered twist bone list from current bones.
         # Twist bones sort by their suffix number to get stable ordering.
         joint_twists: dict[str, list[str]] = {}
         for bone in arm.data.bones:
@@ -482,7 +715,7 @@ class HM2_OT_Process(Operator):
         for names in joint_twists.values():
             names.sort()  # .001 < .002 < .003 — stable positional index
 
-        # Build reverse map: twist_bone_name → (joint, index)
+        # Build reverse map: twist_bone_name -> (joint, index)
         twist_to_slot: dict[str, tuple[str, int]] = {}
         for joint, names in joint_twists.items():
             for idx, name in enumerate(names):
@@ -505,13 +738,13 @@ class HM2_OT_Process(Operator):
         if not snapshot:
             return
 
-        # Build joint → new twist bone names from self._twist_bone_names
+        # Build joint -> new twist bone names from self._twist_bone_names
         # (populated by _create_all_twist_bones in _run).
         joint_twists = getattr(self, '_twist_bone_names', {})
         if not joint_twists:
             return
 
-        # child_name → new parent name
+        # child_name -> new parent name
         reparent: dict[str, str] = {}
         for child_name, (joint, idx) in snapshot.items():
             names = joint_twists.get(joint, [])
@@ -672,9 +905,21 @@ class HM2_OT_Process(Operator):
 
         bpy.ops.object.mode_set(mode='OBJECT')
 
+    @staticmethod
+    def _reset_preexisting_shapes(arm: Object) -> None:
+        """Wipe custom shapes when the incoming rig already carries one on every
+        bone, so HM2's own assignment is the sole source. A partially-shaped rig
+        is left untouched."""
+        pbs = arm.pose.bones
+        if pbs and all(pb.custom_shape for pb in pbs):
+            for pb in pbs:
+                pb.custom_shape = None
+
     def _run(self, context: Context, arm: Object, hm2) -> None:
         self._twist_bone_names = {}
         self._computed_pole_angles = {}
+
+        self._reset_preexisting_shapes(arm)
 
         bpy.context.view_layer.objects.active = arm
         bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
@@ -723,7 +968,7 @@ class HM2_OT_Process(Operator):
         self._assign_bone_colors(arm, hm2)
 
         bpy.ops.object.mode_set(mode='OBJECT')
-        self._organize_collections(arm, hm2)
+        self._organize_collections(arm, hm2, getattr(self, 'reorganize_misc', True))
 
 
         # NOTE: export config is no longer applied here: execute() handles it
@@ -741,6 +986,7 @@ class HM2_OT_Process(Operator):
         rename_pairs = []
         for src_attr, target_name in [
             ('hm2_map_root',       'M_Root'),
+            ('hm2_map_pelvis',     'M_Hip'),
             ('hm2_map_chest',      'M_Chest'),
             ('hm2_map_neck',       'M_Neck'),
             ('hm2_map_head',       'M_Head'),
@@ -792,7 +1038,8 @@ class HM2_OT_Process(Operator):
 
         # Update hm2 props to reflect new names
         for src_attr, target_name in [
-            ('hm2_map_root', 'M_Root'), ('hm2_map_chest', 'M_Chest'),
+            ('hm2_map_root', 'M_Root'), ('hm2_map_pelvis', 'M_Hip'),
+            ('hm2_map_chest', 'M_Chest'),
             ('hm2_map_neck', 'M_Neck'), ('hm2_map_head', 'M_Head'),
             ('hm2_map_eye_l', 'L_Eye'), ('hm2_map_eye_r', 'R_Eye'),
             ('hm2_map_scapula_l', 'L_Scapula'), ('hm2_map_scapula_r', 'R_Scapula'),
@@ -944,21 +1191,31 @@ class HM2_OT_Process(Operator):
         if hip is None:
             hip = eb.new('M_Hip')
 
-        # A bone pivots about its head, so the head is the whole point here: put
-        # it on the keeper's head - the junction with the one chain that stays
-        # behind on M_Root. Tilting the pelvis then rotates it about the joint it
-        # shares with the spine, instead of shearing away from it. The bone runs
-        # back down to the root head so it spans the pelvis it deforms.
+        # A user-mapped pelvis (recorded in _hm2_src_map) keeps its own head/tail;
+        # only its parenting, roll and copy target are applied below. Auto-generated
+        # M_Hip gets its transform computed here.
+        try:
+            _src_map = json.loads(arm.data.get("_hm2_src_map", "{}") or "{}")
+        except Exception:
+            _src_map = {}
+        user_mapped = 'M_Hip' in _src_map
+
+        # M_Hip points straight down from its head; length spans the pelvis
+        # (keeper spine-base head to root head).
+        down   = Vector((0.0, 0.0, -1.0))
         keeper = eb.get(keep_name)
         anchor = keeper.head.copy() if keeper else root.tail.copy()
-        if (root.head - anchor).length < 1e-5:
-            # Degenerate rig (root head and spine base coincide) - fall back to a
-            # short downward stub so the bone stays valid.
-            hip.head = anchor
-            hip.tail = anchor - Vector((0.0, 0.0, max(root.length, 1e-3)))
+        span   = (root.head - anchor).length
+
+        if user_mapped:
+            # Keep the user's head (its position/pivot), re-point the tail down.
+            length = hip.length if hip.length > 1e-5 else max(root.length, 1e-3)
+            hip.tail = hip.head + down * length
         else:
+            # Head at the keeper (spine base) so the pelvis pivots at the joint it
+            # shares with the spine; tail runs straight down by the pelvis span.
             hip.head = anchor
-            hip.tail = root.head.copy()
+            hip.tail = anchor + down * (span if span > 1e-5 else max(root.length, 1e-3))
         hip.use_connect = False
         hip.parent      = root
         # Matches what both _align_bone_rolls variants apply to M_Root/M_Hip;
@@ -1035,7 +1292,7 @@ class HM2_OT_Process(Operator):
             # which writes the new names back into the body mapping props).
             if cap > 0:
                 new_first = f"{side}_{base}Finger{start_idx}"
-                # Persist original source → HM2 name for puppet auto-mapping.
+                # Persist original source -> HM2 name for puppet auto-mapping.
                 try:
                     _sm = json.loads(arm.data.get("_hm2_src_map", "{}") or "{}")
                 except Exception:
@@ -1084,9 +1341,14 @@ class HM2_OT_Process(Operator):
             if parent and child:
                 # Only move tail if the child is actually further away than a minimum length,
                 # to avoid zero-length bones if two mapped bones share the same position.
-                new_tail = child.head.copy()
-                if (new_tail - parent.head).length > 1e-4:
-                    parent.tail = new_tail
+                span = (child.head - parent.head).length
+                if span > 1e-4:
+                    # M_Root points straight up from its head instead of leaning
+                    # toward the first spine; length keeps the spine-base distance.
+                    if parent_name == 'M_Root':
+                        parent.tail = parent.head + Vector((0.0, 0.0, span))
+                    else:
+                        parent.tail = child.head.copy()
 
     def _remove_intermediates(self, arm: Object, hm2) -> None:
         pairs = [
@@ -2248,7 +2510,8 @@ class HM2_OT_Process(Operator):
 
     def _setup_twist_vs(self, arm: Object) -> None:
         """Set rotation_copy_target on each twist bone's .vs to its parent joint name.
-        Uses direct dict assignment to avoid triggering the VS update callback during setup."""
+        Uses direct dict assignment to avoid triggering the VS update callback during setup.
+        M_Hip copies M_Root the same way so the pelvis exports with the root's rotation."""
         pb = arm.pose.bones
         for joint_name, names in self._twist_bone_names.items():
             for twist_name in names:
@@ -2259,6 +2522,13 @@ class HM2_OT_Process(Operator):
                     twist_pb.bone.vs['rotation_copy_target'] = joint_name
                 except Exception:
                     pass
+
+        hip_pb = pb.get('M_Hip')
+        if hip_pb:
+            try:
+                hip_pb.bone.vs['rotation_copy_target'] = 'M_Root'
+            except Exception:
+                pass
 
     def _assign_custom_shapes(self, arm: Object, hm2, shapes: dict) -> None:
         pb = arm.pose.bones
@@ -2283,7 +2553,7 @@ class HM2_OT_Process(Operator):
                 z = Vector((0.0, 0.0, 1.0))  # bone ~parallel to front; fall back to up
             z.normalize()
             x = by.cross(z).normalized()
-            # Columns map widget-local X/Y/Z → world right/along-bone/front.
+            # Columns map widget-local X/Y/Z -> world right/along-bone/front.
             world_basis = Matrix((x, by, z)).transposed()
             local_rot = bone_world.inverted() @ world_basis
             bone.custom_shape_rotation_euler = local_rot.to_euler()
@@ -2466,7 +2736,7 @@ class HM2_OT_Process(Operator):
                 fwd.normalize()
                 up    = Vector((0.0, 0.0, 1.0))
                 right = fwd.cross(up).normalized()
-                # Columns map widget-local X/Y/Z → world right/forward/up.
+                # Columns map widget-local X/Y/Z -> world right/forward/up.
                 world_basis = Matrix((right, fwd, up)).transposed()
                 # custom_shape_rotation is applied in bone-local space.
                 local_rot = bone_world.inverted() @ world_basis
@@ -2747,7 +3017,7 @@ class HM2_OT_Process(Operator):
             pb.lock_rotation_w = False
             pb.lock_scale = [False, False, False]
 
-    def _organize_collections(self, arm: Object, hm2) -> None:
+    def _organize_collections(self, arm: Object, hm2, reorganize_misc: bool = True) -> None:
         default_coll = ensure_bone_collection(arm, 'Default')
         twist_coll   = ensure_bone_collection(arm, 'Twist')
         if twist_coll.parent is not None:
@@ -2803,6 +3073,10 @@ class HM2_OT_Process(Operator):
             elif name in hm2_bone_names:
                 target = default_coll
             else:
+                # Non-HM2 bone: leave hand-sorted collections alone unless asked,
+                # but still catch bones that belong to no collection at all.
+                if not reorganize_misc and bone.collections:
+                    continue
                 if 'hair' in name.lower() or 'bangs' in name.lower():
                     target = hair_coll
                 else:
@@ -2813,6 +3087,8 @@ class HM2_OT_Process(Operator):
                     c.unassign(bone)
                 target.assign(bone)
 
+        self._assign_face_descendants(arm, face_coll, (default_coll, misc_coll, hair_coll))
+
         default_coll.is_visible = False
         face_coll.is_visible    = False
         misc_coll.is_visible    = False
@@ -2822,6 +3098,22 @@ class HM2_OT_Process(Operator):
         ctrl_coll.is_visible    = True
         spine_coll.is_visible   = True
         finger_coll.is_visible  = True
+
+    @staticmethod
+    def _assign_face_descendants(arm: Object, face_coll, movable_colls: tuple) -> None:
+        """Move descendants of Face bones into Face. Only bones sitting solely in
+        movable_colls are moved, so controls, twist and hand-sorted bones stay put."""
+        face_names = {b.name for b in face_coll.bones}
+        for bone in arm.data.bones:
+            if bone.name in face_names:
+                continue
+            if not any(p.name in face_names for p in bone.parent_recursive):
+                continue
+            if not all(c in movable_colls for c in bone.collections):
+                continue
+            for c in list(bone.collections):
+                c.unassign(bone)
+            face_coll.assign(bone)
 
     # ------------------------------------------------------------------
     # Puppet helpers
@@ -3093,10 +3385,11 @@ class HM2_OT_Process(Operator):
 
         bpy.ops.object.mode_set(mode='OBJECT')
 
+        reorganize_misc = getattr(self, 'reorganize_misc', True)
         if mode == 'SELF':
-            self._organize_collections(puppet_obj, puppet_hm2)
+            self._organize_collections(puppet_obj, puppet_hm2, reorganize_misc)
         else:
-            self._organize_puppet_collections(puppet_obj)
+            self._organize_puppet_collections(puppet_obj, reorganize_misc)
 
         # VS export config sync from master (both modes).
         puppet_hm2.hm2_json_filepath = master_hm2.hm2_json_filepath
@@ -3276,10 +3569,10 @@ class HM2_OT_Process(Operator):
             ct.owner_space = 'POSE'
         bpy.ops.object.mode_set(mode='OBJECT')
 
-    def _organize_puppet_collections(self, puppet_obj: Object) -> None:
+    def _organize_puppet_collections(self, puppet_obj: Object, reorganize_misc: bool = True) -> None:
         """Assign bones to the same collection structure as the master.
-        HM2 deform bones → Twist / Spine / Fingers / Face / Default.
-        Non-HM2 bones (hair, cloth, physics) → Hair or Misc."""
+        HM2 deform bones -> Twist / Spine / Fingers / Face / Default.
+        Non-HM2 bones (hair, cloth, physics) -> Hair or Misc."""
         hm2 = puppet_obj.kitsunetools.hm2
         allowed = self._hm2_deform_names(hm2)
 
@@ -3308,6 +3601,8 @@ class HM2_OT_Process(Operator):
                 else:
                     target = default_coll
             else:
+                if not reorganize_misc and bone.collections:
+                    continue
                 if 'hair' in name.lower() or 'bangs' in name.lower():
                     target = hair_coll
                 else:
@@ -3316,6 +3611,8 @@ class HM2_OT_Process(Operator):
             for c in list(bone.collections):
                 c.unassign(bone)
             target.assign(bone)
+
+        self._assign_face_descendants(puppet_obj, face_coll, (default_coll, misc_coll, hair_coll))
 
         default_coll.is_visible = False
         face_coll.is_visible    = False
@@ -3705,6 +4002,10 @@ class HM2_OT_FirstPersonArms(Operator):
         dup_arm.name = f"{src_arm.name}_FPArms"
         dup_meshes = list(get_armature_meshes(dup_arm))
 
+        # Replace duplicate suffixes (.001/.002/...) on the cloned meshes with _fp.
+        for ob in dup_meshes:
+            ob.name = re.sub(r'\.\d+$', '', ob.name) + '_fp'
+
         # Place all duplicated objects in the source armature's collection(s) so the
         # first-person-arms set stays grouped together regardless of where the
         # originals or the active collection were.
@@ -3723,8 +4024,16 @@ class HM2_OT_FirstPersonArms(Operator):
             self.report({'ERROR'}, "No bones matched the starting selection")
             return {'CANCELLED'}
 
-        # Deform bones that meshes are weighted to (controllers never deform).
-        kept_deform = {n for n in kept if not n.startswith(HM2_CONTROLLER_PREFIXES)}
+        # Mesh weights come only from the selected branches' deform bones.
+        arm_branch = compute_fpa_kept_bones(
+            dup_arm, hm2.fpa_starting_bone_l, hm2.fpa_starting_bone_r,
+            False, False,
+        )
+        kept_deform = {
+            n for n in arm_branch & kept
+            if dup_arm.data.bones[n].use_deform
+            and not n.startswith(HM2_CONTROLLER_PREFIXES)
+        }
 
         # --- Delete unwanted bones ----------------------------------------------
         context.view_layer.objects.active = dup_arm
@@ -3740,13 +4049,16 @@ class HM2_OT_FirstPersonArms(Operator):
         # sit between the starting bones for a natural first-person pivot. Its IK
         # children keep their own rest positions, so only the control origin moves.
         relocate_ground = is_hm2 and hm2.fpa_preserve_ik
+        ground_old = ground_new = None
         if relocate_ground:
             cg = eb.get('CTRL_Ground')
             heads = [eb[s].head.copy() for s in starts if s in eb]
             if cg and heads:
+                ground_old = cg.matrix.copy()
                 delta = (sum(heads, Vector()) / len(heads)) - cg.head
                 cg.head = cg.head + delta
                 cg.tail = cg.tail + delta
+                ground_new = cg.matrix.copy()
                 # Rig the starting bones to the ground controller so the whole arm
                 # assembly follows it as a single first-person root.
                 for s in starts:
@@ -3755,6 +4067,26 @@ class HM2_OT_FirstPersonArms(Operator):
                         sb.use_connect = False
                         sb.parent = cg
         bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Re-base Child Of inverses on the relocated controller (e.g. M_Root) so
+        # their owners stay at their rest positions.
+        if ground_old is not None:
+            rebase = ground_new.inverted() @ ground_old
+            for pb in dup_arm.pose.bones:
+                for con in pb.constraints:
+                    if (con.type == 'CHILD_OF' and con.target == dup_arm
+                            and con.subtarget == 'CTRL_Ground'):
+                        con.inverse_matrix = rebase @ con.inverse_matrix
+
+        # Drop bone collections left empty by the bone filtering. Loop bottom-up so
+        # a parent group empties only once its children are gone.
+        colls = dup_arm.data.collections
+        while True:
+            empty = [c for c in dup_arm.data.collections_all if not c.bones and not c.children]
+            if not empty:
+                break
+            for c in empty:
+                colls.remove(c)
 
         # --- Strip constraints/drivers referencing deleted bones ----------------
         bone_names = set(dup_arm.data.bones.keys())
@@ -3811,4 +4143,3 @@ class HM2_OT_FirstPersonArms(Operator):
             f"{deleted} empty mesh(es) deleted",
         )
         return {'FINISHED'}
-

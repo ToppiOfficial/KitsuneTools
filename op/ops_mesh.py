@@ -1,9 +1,12 @@
 import bpy, bmesh, mathutils, collections, math
 from bpy.types import Operator, Context, Object
-from bpy.props import StringProperty, EnumProperty, BoolProperty, IntProperty, FloatProperty
+from bpy.props import StringProperty, EnumProperty, BoolProperty, IntProperty, FloatProperty, FloatVectorProperty
 from bpy.props import EnumProperty, BoolProperty, FloatProperty, IntProperty
 from ..utils.utils_object import is_mesh, has_shapes
-from ..utils.utils_mesh import clean_unused_shapekeys
+import numpy as np
+from ..utils.utils_mesh import (clean_unused_shapekeys, read_shapekey_deltas, solve_shapekey_bones,
+                                assign_shapekey_bone_weights, write_shapekey_pose_action,
+                                create_hair_shadow_mesh, get_hair_shadow_material)
 from ..utils.utils_vertexgroup import remove_unused_vertexgroups
 from ..utils.utils_contextmanagers import preserve_context_mode
 
@@ -674,31 +677,43 @@ class MESH_OT_CleanDuplicateMaterials(Operator):
         return {'FINISHED'}
 
 
+_SIDE_PAIRS = [
+    ("_right", "_left"), ("_left", "_right"),
+    ("_Right", "_Left"), ("_Left", "_Right"),
+    ("_RIGHT", "_LEFT"), ("_LEFT", "_RIGHT"),
+    (".right", ".left"), (".left", ".right"),
+    (".Right", ".Left"), (".Left", ".Right"),
+    (".RIGHT", ".LEFT"), (".LEFT", ".RIGHT"),
+    ("_R", "_L"), ("_L", "_R"),
+    (".R", ".L"), (".L", ".R"),
+    ("_r", "_l"), ("_l", "_r"),
+    (".r", ".l"), (".l", ".r"),
+    ("right_", "left_"), ("left_", "right_"),
+    ("Right_", "Left_"), ("Left_", "Right_"),
+    ("RIGHT_", "LEFT_"), ("LEFT_", "RIGHT_"),
+    ("R_", "L_"), ("L_", "R_"),
+    ("r_", "l_"), ("l_", "r_"),
+]
+
+
 def _find_mirror_bone_name(name: str):
     """Return the opposite-side bone name for known side suffixes/prefixes, or None."""
-    pairs = [
-        ("_right", "_left"), ("_left", "_right"),
-        ("_Right", "_Left"), ("_Left", "_Right"),
-        ("_RIGHT", "_LEFT"), ("_LEFT", "_RIGHT"),
-        (".right", ".left"), (".left", ".right"),
-        (".Right", ".Left"), (".Left", ".Right"),
-        (".RIGHT", ".LEFT"), (".LEFT", ".RIGHT"),
-        ("_R", "_L"), ("_L", "_R"),
-        (".R", ".L"), (".L", ".R"),
-        ("_r", "_l"), ("_l", "_r"),
-        (".r", ".l"), (".l", ".r"),
-        ("right_", "left_"), ("left_", "right_"),
-        ("Right_", "Left_"), ("Left_", "Right_"),
-        ("RIGHT_", "LEFT_"), ("LEFT_", "RIGHT_"),
-        ("R_", "L_"), ("L_", "R_"),
-        ("r_", "l_"), ("l_", "r_"),
-    ]
-    for src, dst in pairs:
+    for src, dst in _SIDE_PAIRS:
         if name.endswith(src):
             return name[: -len(src)] + dst
         if name.startswith(src):
             return dst + name[len(src) :]
     return None
+
+
+def _strip_side_name(name: str) -> str:
+    """Return the name without its side suffix/prefix, matched the same way as _find_mirror_bone_name."""
+    for src, _dst in _SIDE_PAIRS:
+        if name.endswith(src):
+            return name[: -len(src)]
+        if name.startswith(src):
+            return name[len(src) :]
+    return name
 
 
 class MESH_OT_convex_hull_selection(bpy.types.Operator):
@@ -838,7 +853,10 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
             bpy.ops.mesh.separate(type='SELECTED')
             bpy.ops.object.mode_set(mode='OBJECT')
 
-            separated_objs = [obj for obj in context.selected_objects if obj not in edit_mode_objects]
+            separated_objs = [
+                obj for obj in context.selected_objects
+                if obj not in edit_mode_objects and obj.type == 'MESH'
+            ]
 
             if not separated_objs:
                 self.report({'WARNING'}, "No geometry was separated")
@@ -852,9 +870,25 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
             if len(separated_objs) > 1:
                 bpy.ops.object.join()
 
+            armature_obj = None
+            mirror_bone = None
+            has_valid_mirror = False
+            if self.rig_to_bone and self.bone_name:
+                for mod in active_obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.object:
+                        armature_obj = mod.object
+                        break
+                mirror_bone = _find_mirror_bone_name(self.bone_name)
+                # If an armature is present the mirror bone must exist in it,
+                # otherwise the name-based match is enough.
+                has_valid_mirror = mirror_bone is not None
+                if has_valid_mirror and armature_obj:
+                    has_valid_mirror = mirror_bone in armature_obj.data.bones
+
             new_obj = context.active_object
             if self.rig_to_bone and self.bone_name:
-                new_obj.name = f"{self.bone_name}_physicsmesh"
+                base_name = _strip_side_name(self.bone_name) if has_valid_mirror else self.bone_name
+                new_obj.name = f"{base_name}_physicsmesh"
             else:
                 new_obj.name = f"{active_obj.name}_physicsmesh"
             new_obj.data.materials.clear()
@@ -884,28 +918,18 @@ class MESH_OT_convex_hull_selection(bpy.types.Operator):
                 mod.ratio = self.decimation_factor
                 bpy.ops.object.modifier_apply(modifier=mod.name)
 
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.mesh.normals_tools(mode='RESET')
+                bpy.ops.object.mode_set(mode='OBJECT')
+
             bpy.ops.object.shade_smooth()
 
             if self.rig_to_bone and self.bone_name:
-                armature_obj = None
-                for mod in active_obj.modifiers:
-                    if mod.type == 'ARMATURE' and mod.object:
-                        armature_obj = mod.object
-                        break
-
                 vg = new_obj.vertex_groups.new(name=self.bone_name)
                 all_indices = [v.index for v in new_obj.data.vertices]
                 vg.add(all_indices, 1.0, 'REPLACE')
                 vg.lock_weight = True
-
-                mirror_bone = _find_mirror_bone_name(self.bone_name)
-                # Only treat as a mirror setup when a valid opposite bone exists.
-                # If an armature is present the mirror bone must actually exist in it;
-                # otherwise fall back to the name-based match. When invalid, this is
-                # processed as a non-mirror mesh (no mirror vertex group / modifier).
-                has_valid_mirror = mirror_bone is not None
-                if has_valid_mirror and armature_obj:
-                    has_valid_mirror = mirror_bone in armature_obj.data.bones
 
                 if has_valid_mirror:
                     vg_mirror = new_obj.vertex_groups.new(name=mirror_bone)
@@ -1103,3 +1127,351 @@ class MESH_OT_replace_verts_with_spheres(bpy.types.Operator):
                     loop[uv_layer].uv = mathutils.Vector(uv)
 
         return all_verts
+
+
+class MESH_OT_AlignViewToFaceNormals(bpy.types.Operator):
+    bl_idname = "kitsunetools.align_view_to_face_normals"
+    bl_label = "Align to Face Normals"
+    bl_description = "Point the viewport to face the selected faces along their averaged normal"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.active_object is not None
+            and context.active_object.type == 'MESH'
+            and context.mode == 'EDIT_MESH'
+            and context.space_data is not None
+            and context.space_data.type == 'VIEW_3D'
+        )
+
+    def execute(self, context) -> set:
+        obj = context.active_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        selected = [f for f in bm.faces if f.select]
+        if not selected:
+            self.report({'WARNING'}, "No faces selected")
+            return {'CANCELLED'}
+
+        mw = obj.matrix_world
+        normal_mat = mw.to_3x3().inverted_safe().transposed()
+        avg_normal = mathutils.Vector((0.0, 0.0, 0.0))
+        avg_center = mathutils.Vector((0.0, 0.0, 0.0))
+        for f in selected:
+            avg_normal += (normal_mat @ f.normal).normalized()
+            avg_center += mw @ f.calc_center_median()
+        avg_center /= len(selected)
+
+        if avg_normal.length < 1e-6:
+            self.report({'WARNING'}, "Selected normals cancel out; cannot align")
+            return {'CANCELLED'}
+        avg_normal.normalize()
+
+        rv3d = context.space_data.region_3d
+        rv3d.view_perspective = 'ORTHO'
+        rv3d.view_rotation = (-avg_normal).to_track_quat('Z', 'Y')
+        rv3d.view_location = avg_center
+        return {'FINISHED'}
+
+
+class MESH_OT_ShapeKeysToBones(Operator):
+    bl_idname = "kitsunetools.shapekeys_to_bones"
+    bl_label = "Shape Keys to Bones"
+    bl_description = ("Approximate the shape keys with translation-only bones and weights, "
+                      "with one pose per shape key stored in a new action")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bone_count: IntProperty(name="Bone Count", default=24, min=1, max=256)
+    max_influences: IntProperty(name="Max Influences", default=4, min=1, max=8)
+    motion_threshold: FloatProperty(name="Motion Threshold",
+        description="Vertices moving less than this fraction of a shape key's largest offset are ignored for that key",
+        default=0.05, min=0.001, max=0.5, subtype='FACTOR')
+    spatial_weight: FloatProperty(name="Spatial Weight",
+        description="How much vertex position, versus motion, decides which bone a vertex belongs to",
+        default=1.0, min=0.0, max=10.0)
+    smooth_iterations: IntProperty(name="Smooth", default=1, min=0, max=10)
+    solver_iterations: IntProperty(name="Iterations", default=3, min=1, max=10)
+    include_muted: BoolProperty(name="Include Muted Keys", default=False)
+    mute_shape_keys: BoolProperty(name="Mute Converted Keys",
+        description="Mute the converted shape keys so they don't stack on top of the bone poses", default=True)
+    bone_prefix: StringProperty(name="Prefix", default="FX_")
+    parent_bone: StringProperty(name="Parent Bone", description="Bone the face bones are parented to, usually the head")
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        ob = context.active_object
+        return bool(is_mesh(ob) and ob.mode == 'OBJECT' and ob.data.shape_keys and len(ob.data.shape_keys.key_blocks) > 1)
+
+    @staticmethod
+    def find_armature(ob: Object) -> Object | None:
+        return next((m.object for m in ob.modifiers if m.type == 'ARMATURE' and m.object), None)
+
+    def invoke(self, context, event):
+        arm = self.find_armature(context.active_object)
+        if arm and self.parent_bone not in arm.data.bones:
+            names = [b.name for b in arm.data.bones]
+            self.parent_bone = next((n for n in names if n.lower() == 'head'),
+                                    next((n for n in names if 'head' in n.lower()), ''))
+        return context.window_manager.invoke_props_dialog(self, width=340)
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
+        col.use_property_split = True
+        col.use_property_decorate = False
+
+        arm = self.find_armature(context.active_object)
+        if arm:
+            col.prop_search(self, 'parent_bone', arm.data, 'bones')
+        else:
+            col.label(text="No armature modifier, a new armature will be created", icon='INFO')
+        col.separator()
+        col.prop(self, 'bone_count')
+        col.prop(self, 'max_influences')
+        col.prop(self, 'motion_threshold', slider=True)
+        col.prop(self, 'spatial_weight')
+        col.prop(self, 'smooth_iterations')
+        col.prop(self, 'solver_iterations')
+        col.separator()
+        col.prop(self, 'bone_prefix')
+        col.prop(self, 'include_muted')
+        col.prop(self, 'mute_shape_keys')
+
+    def execute(self, context: Context) -> set:
+        ob = context.active_object
+        mesh = ob.data
+        arm = self.find_armature(ob)
+
+        if arm:
+            if self.parent_bone not in arm.data.bones:
+                self.report({'ERROR'}, "Pick a parent bone for the face bones")
+                return {'CANCELLED'}
+            if arm.library or not arm.visible_get():
+                self.report({'ERROR'}, f"Armature '{arm.name}' must be local and visible")
+                return {'CANCELLED'}
+            space = arm.matrix_world.inverted() @ ob.matrix_world
+        else:
+            space = None
+
+        rest, deltas, key_names = read_shapekey_deltas(ob, self.include_muted, space)
+        if not key_names:
+            self.report({'WARNING'}, "No shape keys to convert")
+            return {'CANCELLED'}
+
+        edges = np.empty(len(mesh.edges) * 2, dtype=np.int32)
+        mesh.edges.foreach_get('vertices', edges)
+
+        result = solve_shapekey_bones(
+            rest, deltas, edges.reshape(-1, 2).astype(np.int64),
+            bone_count=self.bone_count, max_influences=self.max_influences,
+            motion_threshold=self.motion_threshold, spatial_weight=self.spatial_weight,
+            smooth_iterations=self.smooth_iterations, solver_iterations=self.solver_iterations,
+        )
+        if result is None:
+            self.report({'WARNING'}, "Shape keys don't move any vertices")
+            return {'CANCELLED'}
+
+        indices, weights, heads = result['indices'], result['weights'], result['heads']
+
+        normals = np.empty(len(mesh.vertices) * 3)
+        mesh.vertex_normals.foreach_get('vector', normals)
+        normals = normals.reshape(-1, 3)[indices]
+        if space is not None:
+            normals = normals @ np.array(space.to_3x3()).T
+        bone_dirs = weights.T @ normals
+        bone_length = 0.04 * np.linalg.norm(np.ptp(rest[indices], axis=0))
+
+        new_root = arm is None
+        if new_root:
+            arm_data = bpy.data.armatures.new(f"{ob.name}_FaceRig")
+            arm = bpy.data.objects.new(arm_data.name, arm_data)
+            for coll in ob.users_collection:
+                coll.objects.link(arm)
+            arm.matrix_world = ob.matrix_world.copy()
+            arm.show_in_front = True
+
+            ob.modifiers.new(name=arm.name, type='ARMATURE').object = arm
+            if ob.parent is None:
+                ob.parent = arm
+                ob.matrix_parent_inverse = arm.matrix_world.inverted()
+
+        bone_collection = arm.data.collections.get("Face Shapes") or arm.data.collections.new("Face Shapes")
+        bone_names = []
+        with preserve_context_mode(arm, 'EDIT') as edit_bones:
+            if new_root:
+                root = edit_bones.new("FaceRoot")
+                root.head = mathutils.Vector(rest.mean(0))
+                root.tail = root.head + mathutils.Vector((0.0, 0.0, bone_length * 5.0))
+                self.parent_bone = root.name
+            parent = edit_bones[self.parent_bone]
+
+            for b, head in enumerate(heads):
+                direction = mathutils.Vector(bone_dirs[b])
+                if direction.length < 1e-8:
+                    direction = mathutils.Vector((0.0, 0.0, 1.0))
+                eb = edit_bones.new(f"{self.bone_prefix}{key_names[result['dominant_key'][b]]}")
+                eb.head = mathutils.Vector(head)
+                eb.tail = eb.head + direction.normalized() * bone_length
+                eb.parent = parent
+                eb.use_connect = False
+                eb.use_deform = True
+                bone_collection.assign(eb)
+                bone_names.append(eb.name)
+
+        # Pose location is in the bone's rest space, so armature-space offsets are rotated into it
+        translations = result['translations']
+        locations = np.empty_like(translations)
+        for b, name in enumerate(bone_names):
+            rot = np.array(arm.data.bones[name].matrix_local.to_3x3())
+            locations[:, b] = translations[:, b] @ rot
+
+        deform_groups = {bone.name for bone in arm.data.bones if bone.use_deform}
+        assign_shapekey_bone_weights(ob, indices, weights, bone_names, self.parent_bone, deform_groups)
+        action = write_shapekey_pose_action(arm, f"{ob.name}_ShapeKeyPoses", bone_names, key_names, locations)
+
+        if self.mute_shape_keys:
+            for name in key_names:
+                mesh.shape_keys.key_blocks[name].mute = True
+
+        assigned = arm.animation_data.action == action
+        self.report({'INFO'}, f"Created {len(bone_names)} bones ({result['fit'] * 100:.0f}% fit), poses in action "
+                              f"'{action.name}'" + ("" if assigned else " (not assigned, armature already has an action)"))
+        return {'FINISHED'}
+
+
+class MESH_OT_CreateHairShadow(Operator):
+    bl_idname = "kitsunetools.create_hair_shadow"
+    bl_label = "Create Hair Shadow Mesh"
+    bl_description = ("Flatten the selected faces (e.g. bangs) onto a target mesh (e.g. the face) "
+                      "as a baked anime/MMD-style hair shadow mesh")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    target: StringProperty(name="Target", description="Mesh the shadow is projected onto, usually the face")
+    projection: EnumProperty(
+        name="Projection",
+        items=[
+            ('FRONT', "Front Axis", "Project along the front view axis (+Y), toward a -Y facing character"),
+            ('VIEW', "View", "Project along the viewport direction at the time the tool was invoked"),
+            ('NEAREST', "Nearest Surface", "Snap each vertex to the closest point on the target"),
+        ],
+        default='FRONT'
+    )
+    view_direction: FloatVectorProperty(size=3, default=(0.0, 1.0, 0.0), options={'HIDDEN', 'SKIP_SAVE'})
+    drop: FloatProperty(
+        name="Drop",
+        description="Shift the shadow down (global -Z) before projecting, as if lit from above",
+        default=0.0, subtype='DISTANCE', precision=4
+    )
+    offset: FloatProperty(
+        name="Surface Offset",
+        description="Distance kept above the target surface to avoid clipping and z-fighting",
+        default=0.0005, min=0.0, subtype='DISTANCE', precision=4
+    )
+    search_back: FloatProperty(
+        name="Search Back",
+        description="Start each ray this far behind the vertex so hair clipping into the face still projects",
+        default=0.02, min=0.0, subtype='DISTANCE', precision=3
+    )
+    subdivisions: IntProperty(
+        name="Subdivisions",
+        description="Subdivide before projecting so the shadow follows the face curvature",
+        default=1, min=0, max=6
+    )
+    single_layer: BoolProperty(
+        name="Single Layer",
+        description="Keep only the hair faces pointing away from the target so double-sided strands do not stack",
+        default=True
+    )
+    rig_to_target: BoolProperty(
+        name="Rig to Target",
+        description="Copy the target's weights, armature modifiers and parent so the shadow follows the face",
+        default=True
+    )
+    add_material: BoolProperty(name="Add Material", default=True)
+    shadow_color: FloatVectorProperty(
+        name="Shadow Color", subtype='COLOR', size=4, min=0.0, max=1.0,
+        default=(0.55, 0.3, 0.3, 0.5)
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.active_object is not None
+            and context.active_object.type == 'MESH'
+            and context.mode == 'EDIT_MESH'
+        )
+
+    def invoke(self, context, event):
+        hair_ob = context.active_object
+        if not self.target or self.target == hair_ob.name:
+            other = next((ob for ob in context.selected_objects if ob != hair_ob and ob.type == 'MESH'), None)
+            self.target = other.name if other else ""
+        rv3d = context.region_data
+        if rv3d is not None and context.area and context.area.type == 'VIEW_3D':
+            self.view_direction = rv3d.view_rotation @ mathutils.Vector((0.0, 0.0, -1.0))
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop_search(self, "target", context.scene, "objects")
+        layout.prop(self, "projection")
+        layout.prop(self, "drop")
+        layout.prop(self, "offset")
+        if self.projection != 'NEAREST':
+            layout.prop(self, "search_back")
+        layout.prop(self, "subdivisions")
+        layout.prop(self, "single_layer")
+        layout.prop(self, "rig_to_target")
+        layout.prop(self, "add_material")
+        if self.add_material:
+            layout.prop(self, "shadow_color")
+
+    def execute(self, context):
+        hair_ob = context.active_object
+        target_ob = bpy.data.objects.get(self.target)
+        if target_ob is None or target_ob.type != 'MESH' or target_ob == hair_ob:
+            self.report({'ERROR'}, "Pick a target mesh other than the hair")
+            return {'CANCELLED'}
+
+        if self.projection == 'FRONT':
+            direction = mathutils.Vector((0.0, 1.0, 0.0))
+        elif self.projection == 'VIEW':
+            direction = mathutils.Vector(self.view_direction).normalized()
+        else:
+            direction = None
+
+        name = f"{hair_ob.name}_HairShadow"
+        mesh = create_hair_shadow_mesh(
+            hair_ob, target_ob, name, direction,
+            drop=self.drop, offset=self.offset, search_back=self.search_back,
+            subdivisions=self.subdivisions, single_layer=self.single_layer,
+            copy_weights=self.rig_to_target
+        )
+        if mesh is None:
+            self.report({'WARNING'}, "No faces selected")
+            return {'CANCELLED'}
+
+        new_ob = bpy.data.objects.new(name, mesh)
+        collections = target_ob.users_collection or (context.scene.collection,)
+        collections[0].objects.link(new_ob)
+
+        if self.rig_to_target:
+            new_ob.parent = target_ob.parent
+            new_ob.parent_type = target_ob.parent_type
+            new_ob.parent_bone = target_ob.parent_bone
+            new_ob.matrix_parent_inverse = target_ob.matrix_parent_inverse.copy()
+            new_ob.matrix_basis = target_ob.matrix_basis.copy()
+            for vg in target_ob.vertex_groups:
+                new_ob.vertex_groups.new(name=vg.name)
+            for mod in target_ob.modifiers:
+                if mod.type == 'ARMATURE':
+                    arm_mod = new_ob.modifiers.new(name=mod.name, type='ARMATURE')
+                    arm_mod.object = mod.object
+                    arm_mod.use_deform_preserve_volume = mod.use_deform_preserve_volume
+        else:
+            new_ob.matrix_world = target_ob.matrix_world.copy()
+
+        if self.add_material:
+            mesh.materials.append(get_hair_shadow_material("KitsuneTools_HairShadow", self.shadow_color))
+
+        self.report({'INFO'}, f"Hair shadow created: {new_ob.name}")
+        return {'FINISHED'}

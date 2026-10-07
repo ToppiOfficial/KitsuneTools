@@ -33,14 +33,14 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Build platform ZIPs
+      - name: Build addon ZIP
         run: python make_zip.py
 
-      - name: Collect artifacts
+      - name: Collect artifact
         run: |
           mkdir -p dist
-          # make_zip.py writes ZIPs to the parent directory.
-          mv ../kitsunetools_*.zip dist/
+          # make_zip.py writes the ZIP to the parent directory.
+          mv "../kitsunetools_${{ steps.version.outputs.version }}.zip" dist/
           ls -la dist
 
       - name: Remove previous dev release
@@ -60,4 +60,4 @@ jobs:
             > [!WARNING]
             > This is an untested rolling development build, not a stable release.
           prerelease: true
-          files: dist/*.zip
+          files: dist/kitsunetools_${{ steps.version.outputs.version }}.zip
